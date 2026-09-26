@@ -1,5 +1,5 @@
 export interface TrueForgeRuntimeConfig {
-  baseUrl: string;
+  baseUrl?: string;
   token?: string;
   modelName: string;
   modelProvider?: string;

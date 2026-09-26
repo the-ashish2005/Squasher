@@ -23,6 +23,7 @@
     "@byter/core": "workspace:*",
     "@byter/github": "workspace:*",
     "@byter/github-mcp": "workspace:*",
+    "@byter/harness": "workspace:*",
     "pg": "^8.13.1"
   },
   "devDependencies": {

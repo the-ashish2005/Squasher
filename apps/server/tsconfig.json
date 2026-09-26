@@ -9,12 +9,14 @@
       "@byter/agent": ["../../packages/agent/src/index.ts"],
       "@byter/core": ["../../packages/core/src/index.js"],
       "@byter/github-mcp": ["../github-mcp/src/index.ts"],
-      "@byter/github": ["../../packages/github/src/index.js"]
+      "@byter/github": ["../../packages/github/src/index.js"],
+      "@byter/harness": ["../../packages/harness/src/index.ts"]
     }
   },
   "references": [
     { "path": "../../packages/agent" },
     { "path": "../github-mcp" },
+    { "path": "../../packages/harness" },
     { "path": "../../packages/core" },
     { "path": "../../packages/github" }
   ],

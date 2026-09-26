@@ -48,8 +48,8 @@ describe("Byter production server", () => {
   beforeEach(async () => {
     process.env.GITHUB_WEBHOOK_SECRET = "webhook-secret";
     process.env.APPROVAL_TOKEN = "approval-token";
-    delete process.env.TRUEFORGE_URL;
-    delete process.env.TRUEFORGE_API_KEY;
+    delete process.env.DEEPSEEK_API_KEY;
+    delete process.env.E2B_API_KEY;
     delete process.env.MCP_AUTH_TOKEN;
     delete process.env.BYTER_REQUIRE_TRIGGER_LABEL;
     delete process.env.BYTER_TRIGGER_LABEL;
@@ -67,8 +67,8 @@ describe("Byter production server", () => {
   afterEach(async () => {
     delete process.env.GITHUB_WEBHOOK_SECRET;
     delete process.env.APPROVAL_TOKEN;
-    delete process.env.TRUEFORGE_URL;
-    delete process.env.TRUEFORGE_API_KEY;
+    delete process.env.DEEPSEEK_API_KEY;
+    delete process.env.E2B_API_KEY;
     delete process.env.MCP_AUTH_TOKEN;
     delete process.env.BYTER_REQUIRE_TRIGGER_LABEL;
     delete process.env.BYTER_TRIGGER_LABEL;

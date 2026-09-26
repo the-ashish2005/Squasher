@@ -1,5 +1,5 @@
 {
-  "name": "@byter/agent",
+  "name": "@byter/harness",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -18,9 +18,13 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@byter/core": "workspace:*"
+    "@byter/github-mcp": "workspace:*",
+    "e2b": "^2.51.0",
+    "openai": "^7.23.0"
   },
   "devDependencies": {
+    "@byter/agent": "workspace:*",
+    "@types/node": "^22.0.0",
     "typescript": "^5.5.4",
     "vitest": "^2.1.1"
   }

@@ -18,6 +18,7 @@ coverage/
 *.key
 
 # Local runtime state
+.live-runs/
 .byter/
 .agents/
 PROJECT.md

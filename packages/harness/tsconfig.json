@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "composite": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "paths": {
+      "@byter/github-mcp": ["../../apps/github-mcp/src/index.js"]
+    }
+  },
+  "references": [{ "path": "../../apps/github-mcp" }],
+  "include": ["src/**/*.ts"],
+  "exclude": ["dist", "test"]
+}

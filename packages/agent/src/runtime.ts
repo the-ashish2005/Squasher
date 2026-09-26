@@ -1,4 +1,3 @@
-import { TrueForge } from "@truefoundry/trueforge-sdk";
 import {
   buildInitialUserMessage,
   buildProofContractRecoveryMessage,
@@ -31,17 +30,9 @@ export class ByterTrueForgeRuntime {
   private readonly client: TrueForgeClientLike;
   private readonly config: TrueForgeRuntimeConfig;
 
-  constructor(config: TrueForgeRuntimeConfig, client?: TrueForgeClientLike) {
+  constructor(config: TrueForgeRuntimeConfig, client: TrueForgeClientLike) {
     this.config = config;
-    this.client =
-      client ??
-      (new TrueForge({
-        baseUrl: config.baseUrl,
-        ...(config.token ? { token: config.token } : {}),
-        headers: {
-          "User-Agent": "CLINE"
-        }
-      }) as unknown as TrueForgeClientLike);
+    this.client = client;
   }
 
   async startSession(input: StartByterSessionInput): Promise<StartByterSessionResult> {

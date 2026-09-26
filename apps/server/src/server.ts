@@ -18,6 +18,7 @@ import type {
   TrueForgeRuntimeEventListener,
   TrueForgeRuntimeEvent
 } from "@byter/agent";
+import { ByterHarness, defaultLlmModel } from "@byter/harness";
 import { canTransition, createRun, scanIssueText, transitionRun } from "@byter/core";
 import {
   GitHubRestClient,
@@ -159,8 +160,8 @@ export function createByterServer(options: ByterServerOptions = {}): Server {
       console.error("Failed to initialize PostgreSQL store:", err);
     });
   }
-  const trueForgeRuntime = options.trueForgeRuntime ?? trueForgeRuntimeFromEnv();
   const githubClient = options.githubClient ?? githubClientFromEnv();
+  const trueForgeRuntime = options.trueForgeRuntime ?? trueForgeRuntimeFromEnv(githubClient);
   const mcpHandler = options.mcpHandler ?? githubMcpHandlerFromEnv(githubClient);
   const activeIssueTriggers = new Set<string>();
 
@@ -820,7 +821,7 @@ async function startTrueForgeSessionForIssue(
       run,
       trueForge: {
         status: "not-configured",
-        reason: "TRUEFORGE_URL and TRUEFORGE_API_KEY are required before live orchestration can start"
+        reason: "GITHUB_TOKEN, DEEPSEEK_API_KEY and E2B_API_KEY are required before live orchestration can start"
       }
     };
   }
@@ -847,8 +848,8 @@ async function startTrueForgeSessionForIssue(
         status: "started",
         session: result.session,
         turn: result.turn,
-        model: process.env.MODEL_NAME ?? "configured model",
-        provider: process.env.MODEL_PROVIDER ?? "configured provider"
+        model: process.env.DEEPSEEK_MODEL ?? defaultLlmModel,
+        provider: process.env.MODEL_PROVIDER ?? "deepseek"
       }
     };
   } catch (error) {
@@ -3288,20 +3289,18 @@ function githubMcpHandlerFromEnv(githubClient: GitHubRestClientLike | undefined)
   });
 }
 
-function trueForgeRuntimeFromEnv(): ByterSessionStarter | undefined {
-  const baseUrl = process.env.TRUEFORGE_URL;
-  const token = process.env.TRUEFORGE_API_KEY;
-  if (!baseUrl || !token) {
+function trueForgeRuntimeFromEnv(githubClient: GitHubRestClientLike | undefined): ByterSessionStarter | undefined {
+  if (!githubClient || !process.env.DEEPSEEK_API_KEY || !process.env.E2B_API_KEY) {
     return undefined;
   }
 
-  return new ByterTrueForgeRuntime({
-    baseUrl,
-    token,
-    modelName: process.env.MODEL_NAME ?? "gpt-5.6-sol",
-    modelProvider: process.env.MODEL_PROVIDER ?? "openai",
-    mcpServerName: process.env.TRUEFORGE_MCP_SERVER_NAME ?? "byter-github"
-  });
+  return new ByterTrueForgeRuntime(
+    {
+      modelName: process.env.DEEPSEEK_MODEL ?? defaultLlmModel,
+      modelProvider: process.env.MODEL_PROVIDER ?? "deepseek"
+    },
+    ByterHarness.fromEnv(githubClient)
+  );
 }
 
 function defaultStaticDir(): string {

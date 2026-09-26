@@ -5,6 +5,7 @@
     { "path": "./packages/github" },
     { "path": "./packages/agent" },
     { "path": "./apps/github-mcp" },
+    { "path": "./packages/harness" },
     { "path": "./apps/web" },
     { "path": "./demo/buggy-parser" }
   ]

@@ -114,7 +114,7 @@ async function dispatchRequest(
   return errorResponse(request.id, -32601, "MCP method not found");
 }
 
-function inputSchemaFor(name: GitHubMcpToolName) {
+export function inputSchemaFor(name: GitHubMcpToolName) {
   switch (name) {
     case "read_issue":
     case "add_verified_label":
