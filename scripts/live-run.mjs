@@ -24,7 +24,10 @@ for (const line of (await readFile(join(repoRoot, ".env"), "utf8")).split("\n"))
   if (match && !process.env[match[1]]) process.env[match[1]] = match[2];
 }
 
-const dataDir = await mkdtemp(join(tmpdir(), `byter-live-${runLabel}-`));
+// LIVE_DATA_DIR pins the directory so another process can resume the session later.
+const dataDir = process.env.LIVE_DATA_DIR
+  ? (await mkdir(process.env.LIVE_DATA_DIR, { recursive: true }), resolve(process.env.LIVE_DATA_DIR))
+  : await mkdtemp(join(tmpdir(), `byter-live-${runLabel}-`));
 const staticDir = await mkdtemp(join(tmpdir(), "byter-live-static-"));
 await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
 process.env.DATA_DIR = dataDir;

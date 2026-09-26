@@ -66,7 +66,9 @@ export class ByterHarness {
   }
 
   private async createTurn(sessionId: string, request: unknown): Promise<unknown> {
-    if (!this.store.hasSession(sessionId)) {
+    // Reloads the session when this process did not run the original turn, so an
+    // approval that arrives after a restart still resumes the paused write.
+    if (!(await this.store.ensureSession(sessionId))) {
       throw new Error(`Unknown harness session: ${sessionId}`);
     }
 
@@ -221,10 +223,12 @@ export class ByterHarness {
   }
 
   private async subscribeToTurn(sessionId: string, turnId: string): Promise<AsyncIterable<unknown>> {
+    await this.store.ensureSession(sessionId);
     return this.store.subscribeToTurn(sessionId, turnId);
   }
 
   private async deleteSession(sessionId: string): Promise<unknown> {
+    await this.store.ensureSession(sessionId);
     await this.closeSandbox(sessionId);
     this.store.deleteSession(sessionId);
     return { data: { id: sessionId, deleted: true } };

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { GitHubRestClientLike } from "@byter/github-mcp";
+import { approvalPayloadHash, type GitHubRestClientLike } from "@byter/github-mcp";
 import { createToolDispatcher, sandboxToolName } from "../src/tool-dispatcher.js";
 import { GuardValidationError } from "../src/structured-output-guard.js";
 import type { SandboxClientLike } from "../src/sandbox-client.js";
@@ -19,6 +19,13 @@ function newDispatcher(
   sandbox: SandboxClientLike = fakeSandbox()
 ) {
   const client = {
+    getBranch: vi.fn().mockResolvedValue({ commit: { sha: "base-sha" } }),
+    getCommit: vi.fn().mockResolvedValue({ tree: { sha: "base-tree" } }),
+    createTree: vi.fn().mockResolvedValue({ sha: "new-tree" }),
+    createCommit: vi.fn().mockResolvedValue({ sha: "new-commit" }),
+    createBranch: vi.fn().mockResolvedValue(undefined),
+    deleteBranch: vi.fn().mockResolvedValue(undefined),
+    createPullRequest: vi.fn().mockResolvedValue({ number: 42, html_url: "https://github.test/pull/42" }),
     getIssue: vi.fn().mockResolvedValue({
       number: 7,
       title: "Crash",
@@ -40,7 +47,7 @@ function newDispatcher(
     }
   });
 
-  return { dispatcher, client, sandbox };
+  return { dispatcher, client: client as any, sandbox };
 }
 
 describe("tool dispatcher", () => {
@@ -169,6 +176,31 @@ describe("tool dispatcher", () => {
     const payload = JSON.parse(result.content[0]!.text);
     expect(payload.accepted).toBe(true);
     expect(payload.instruction).toContain("create_fix_pull_request");
+  });
+
+  it("keeps the approval payload hash stable when the body contains a code fence", async () => {
+    // The guard sits between the paused call and the write. If it alters the arguments,
+    // the hash recomputed inside assertApproved no longer matches the approved one and a
+    // legitimate write is blocked. A fenced block in the PR body used to trigger this.
+    const writeArgs = {
+      owner: "o",
+      repo: "r",
+      baseBranch: "main",
+      branchName: "byter/fix-7-abc",
+      title: "Fix trailing escape crash",
+      body: "## Problem\n\n```ts\ntokenizePattern(\"\\\\\");\n```\n\nThrows a TypeError.",
+      files: [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }]
+    };
+    const { dispatcher, client } = newDispatcher();
+
+    const result = await dispatcher.callTool("create_fix_pull_request", writeArgs, {
+      approved: true,
+      expectedPayloadHash: approvalPayloadHash("create_fix_pull_request", writeArgs)
+    });
+
+    expect(JSON.parse(result.content[0]!.text).number).toBe(42);
+    // The body reached GitHub with its fence intact.
+    expect(client.createPullRequest).toHaveBeenCalledWith("o", "r", expect.objectContaining({ body: writeArgs.body }));
   });
 
   it("refuses the GitHub write without an approval context", async () => {

@@ -34,6 +34,31 @@ describe("structured output guard", () => {
     }
   });
 
+  it("preserves a fenced code block inside a string value byte for byte", () => {
+    // The approval payload hash is computed over these arguments twice: once when the
+    // call is paused and once when it is executed. Rewriting a ```ts block inside
+    // candidatePatch.body between those two points makes the hashes disagree and the
+    // GitHub write is refused. Observed on a real run whose PR body contained a fence.
+    const withFence = {
+      ...validResult,
+      candidatePatch: {
+        ...validResult.candidatePatch,
+        body: "## Problem\n\n```ts\ntokenizePattern(\"\\\\\");\n```\n\nThrows a TypeError."
+      }
+    };
+    const raw = JSON.stringify(withFence);
+
+    const result = validateAndParse(raw, byterResultSchema);
+
+    expect(result.valid).toBe(true);
+    if (result.valid) {
+      expect(result.value).toEqual(withFence);
+      // Stable enough to hash: identical to a plain parse of the same text.
+      expect(JSON.stringify(result.value)).toBe(JSON.stringify(JSON.parse(raw)));
+      expect((result.value.candidatePatch as { body: string }).body).toContain("```ts");
+    }
+  });
+
   it("strips markdown code fences before parsing", () => {
     const wrapped = `\`\`\`json\n${JSON.stringify(validResult, null, 2)}\n\`\`\``;
 

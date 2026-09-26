@@ -42,15 +42,20 @@ export class GuardValidationError extends Error {
  */
 export function validateAndParse(rawArgs: string, schema: GuardSchema): GuardResult {
   const rawText = typeof rawArgs === "string" ? rawArgs : String(rawArgs);
-  const unfenced = stripFences(rawText).trim();
+  const trimmed = rawText.trim();
 
-  // When the payload is itself a JSON object, it is the intended arguments. A parse
-  // failure there means malformed or truncated output, so report that rather than
-  // falling through to a nested fragment that happens to parse — validating an inner
-  // object against the outer schema produces a misleading "missing fields" message and
-  // sends the model off correcting the wrong thing.
-  if (unfenced.startsWith("{")) {
-    const outermost = balancedJsonObjects(unfenced)[0];
+  // A payload that is already a JSON object is the intended arguments, and is used
+  // verbatim. Fence stripping must never touch it: a ```ts block inside a string value,
+  // such as a pull request body, would be silently rewritten, and the altered arguments
+  // then hash differently from the ones the approval was bound to, so assertApproved
+  // refuses the write. Only genuinely non-JSON payloads get unwrapped below.
+  //
+  // A parse failure here means malformed or truncated output, reported as such rather
+  // than falling through to a nested fragment that happens to parse — validating an
+  // inner object against the outer schema produces a misleading "missing fields"
+  // message and sends the model off correcting something that was never wrong.
+  if (trimmed.startsWith("{")) {
+    const outermost = balancedJsonObjects(trimmed)[0];
     if (!outermost) {
       return {
         valid: false,

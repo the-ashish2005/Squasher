@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { approvalPayloadHash, type GitHubRestClientLike } from "@byter/github-mcp";
 import { buildByterAgentSpec } from "@byter/agent";
@@ -445,6 +448,98 @@ describe("byter harness runtime", () => {
     await expect(harness.sessions.createTurn(sessionId, { input: [{ type: "user.message", content: "x" }] })).rejects.toThrow(
       /Unknown harness session/
     );
+  });
+
+  it("resumes a paused approval in a brand new process", async () => {
+    // A paused write waits on a human, so the process that ran the turn is often gone by
+    // the time approval arrives. Simulated here by discarding the harness and store and
+    // rebuilding both from the same DATA_DIR.
+    const dataDir = await mkdtemp(join(tmpdir(), "byter-store-"));
+    const github = fakeGitHub();
+
+    const first = scriptedLlm([
+      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
+    ]);
+    const originalStore = new SessionStore({ dataDir });
+    const original = new ByterHarness({ client: github, llm: first.llm, sandbox: fakeSandbox(), store: originalStore });
+
+    const { sessionId, turnId } = await startSession(original);
+    await drain(original, sessionId, turnId);
+    expect(originalStore.pending(sessionId)?.toolCallId).toBe("call_write");
+    await originalStore.flush();
+
+    // Nothing of the first process survives except DATA_DIR.
+    const revivedStore = new SessionStore({ dataDir });
+    expect(revivedStore.hasSession(sessionId)).toBe(false);
+    const revived = new ByterHarness({
+      client: github,
+      llm: scriptedLlm([textResponse(JSON.stringify(proofContract))]).llm,
+      sandbox: fakeSandbox(),
+      store: revivedStore
+    });
+
+    const approvalTurn = (await revived.sessions.createTurn(sessionId, {
+      previousTurnId: turnId,
+      input: [
+        { type: "user.tool_approval", threadId: "main", toolCallId: "call_write", approval: { status: "allow" } }
+      ]
+    })) as { data: { id: string } };
+    const events = await drain(revived, sessionId, approvalTurn.data.id);
+
+    expect(github.createPullRequest).toHaveBeenCalledTimes(1);
+    const receipt = events.find((event) => event.type === "tool.response" && event.toolCallId === "call_write");
+    expect(JSON.parse(String(receipt?.content))).toMatchObject({ number: 42 });
+  });
+
+  it("still rejects a hash mismatch after reloading a session from disk", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "byter-store-"));
+    const github = fakeGitHub();
+    const { llm } = scriptedLlm([
+      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
+    ]);
+    const store = new SessionStore({ dataDir });
+    const harness = new ByterHarness({ client: github, llm, sandbox: fakeSandbox(), store });
+    const { sessionId, turnId } = await startSession(harness);
+    await drain(harness, sessionId, turnId);
+    await store.flush();
+
+    // Tamper with the snapshot on disk, as an attacker with write access would.
+    const snapshotPath = join(dataDir, "harness-sessions", `${sessionId}.json`);
+    const snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
+    snapshot.pending.arguments.files = [{ path: "src/evil.ts", content: "malicious" }];
+    await writeFile(snapshotPath, JSON.stringify(snapshot), "utf8");
+
+    const revived = new ByterHarness({
+      client: github,
+      llm,
+      sandbox: fakeSandbox(),
+      store: new SessionStore({ dataDir })
+    });
+
+    await expect(
+      revived.sessions.createTurn(sessionId, {
+        input: [
+          { type: "user.tool_approval", threadId: "main", toolCallId: "call_write", approval: { status: "allow" } }
+        ]
+      })
+    ).rejects.toThrow(/approval payload hash mismatch/);
+    expect(github.createPullRequest).not.toHaveBeenCalled();
+  });
+
+  it("reports a genuinely unknown session rather than reviving nothing", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "byter-store-"));
+    const harness = new ByterHarness({
+      client: fakeGitHub(),
+      llm: scriptedLlm([textResponse("x")]).llm,
+      sandbox: fakeSandbox(),
+      store: new SessionStore({ dataDir })
+    });
+
+    await expect(
+      harness.sessions.createTurn("sess_does_not_exist", { input: [{ type: "user.message", content: "x" }] })
+    ).rejects.toThrow(/Unknown harness session/);
   });
 
   it("lists persisted events under a data wrapper for the agent runtime", async () => {
