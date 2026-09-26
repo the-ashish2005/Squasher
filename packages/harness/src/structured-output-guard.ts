@@ -1,6 +1,14 @@
 const placeholderPattern = /^(?:\.{3}|…|todo|tbd|n\/?a|placeholder|full file content)$/i;
 const resultStatuses = ["patch-ready", "verified", "not-reproduced", "blocked", "failed"] as const;
 
+/**
+ * Must stay >= the `proof.attempts` clamp in `extractLiveProofResult`
+ * (apps/server/src/server.ts), because `hasGenuineProof` re-checks the count on the
+ * clamped copy. If the server truncates below this, a contract the guard accepted is
+ * rejected downstream and the run fails after a correct reproduction.
+ */
+const serverAttemptsClampBytes = 2_000;
+
 export interface GuardSchema {
   name: string;
   /** Exact expected shape, quoted verbatim back to the model on a corrective retry. */
@@ -34,8 +42,28 @@ export class GuardValidationError extends Error {
  */
 export function validateAndParse(rawArgs: string, schema: GuardSchema): GuardResult {
   const rawText = typeof rawArgs === "string" ? rawArgs : String(rawArgs);
-  const candidates = jsonCandidates(rawText);
+  const unfenced = stripFences(rawText).trim();
 
+  // When the payload is itself a JSON object, it is the intended arguments. A parse
+  // failure there means malformed or truncated output, so report that rather than
+  // falling through to a nested fragment that happens to parse — validating an inner
+  // object against the outer schema produces a misleading "missing fields" message and
+  // sends the model off correcting the wrong thing.
+  if (unfenced.startsWith("{")) {
+    const outermost = balancedJsonObjects(unfenced)[0];
+    if (!outermost) {
+      return {
+        valid: false,
+        rawText,
+        error:
+          "The tool arguments are not a complete JSON object: the opening brace is never closed, " +
+          "so the output was cut off. Return the whole object, keeping long text fields short enough to finish."
+      };
+    }
+    return validateCandidate(outermost, schema, rawText);
+  }
+
+  const candidates = jsonCandidates(rawText);
   if (candidates.length === 0) {
     return { valid: false, rawText, error: "No JSON object was found in the tool arguments." };
   }
@@ -68,6 +96,33 @@ export function validateAndParse(rawArgs: string, schema: GuardSchema): GuardRes
   return { valid: false, rawText, error: firstSchemaError ?? lastParseError };
 }
 
+function validateCandidate(candidate: string, schema: GuardSchema, rawText: string): GuardResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unknown syntax error";
+    return {
+      valid: false,
+      rawText,
+      error: `The tool arguments were not valid JSON (${detail}). Return one complete, raw JSON object.`
+    };
+  }
+
+  if (!isRecord(parsed)) {
+    return { valid: false, rawText, error: "The tool arguments parsed to a non-object JSON value." };
+  }
+
+  const violations = schema.validate(parsed);
+  return violations.length === 0
+    ? { valid: true, value: parsed, cleanedJson: JSON.stringify(parsed) }
+    : { valid: false, rawText, error: violations.join(" ") };
+}
+
+function stripFences(text: string): string {
+  return text.replace(/```[a-zA-Z0-9_-]*\s*\n?/g, "").replace(/```/g, "");
+}
+
 /** Builds the single corrective follow-up message sent before the one allowed retry. */
 export function buildCorrectionMessage(schema: GuardSchema, problem: string): string {
   return [
@@ -78,6 +133,11 @@ export function buildCorrectionMessage(schema: GuardSchema, problem: string): st
     "Return the arguments as one raw JSON object matching exactly this schema, with no markdown fence, no prose, and no trailing commentary:",
     schema.describe(),
     "",
+    "Resend the COMPLETE object, not just the field named above. Every top-level field must be",
+    "present again with the same values as before, changing only what the problem describes —",
+    "a retry that silently drops a field, or that is cut off before the closing brace, is rejected.",
+    "Keep long text fields brief so the object finishes.",
+    "",
     "Call the tool again now with corrected arguments. Use only concrete values you actually observed in this run."
   ].join("\n");
 }
@@ -87,7 +147,7 @@ export function buildCorrectionMessage(schema: GuardSchema, problem: string): st
  * JSON object in the text, outermost first.
  */
 function jsonCandidates(text: string): string[] {
-  const unfenced = text.replace(/```[a-zA-Z0-9_-]*\s*\n?/g, "").replace(/```/g, "");
+  const unfenced = stripFences(text);
   const sources = unfenced === text ? [text] : [unfenced, text];
   const candidates: string[] = [];
 
@@ -166,7 +226,8 @@ export const byterResultSchema: GuardSchema = {
       "Rules for status \"patch-ready\" and \"verified\":",
       "- summary must be at least 20 characters of concrete description.",
       "- proof.before, proof.after and proof.regressions must each be at least 6 characters.",
-      "- proof.attempts must report matching counts of at least three, for example \"3/3\".",
+      '- proof.attempts must report matching counts of at least three, for example "3/3". Put the count',
+      "  near the start of the field so it survives truncation, then add detail after it.",
       "- candidatePatch.title must be at least 8 characters and candidatePatch.body at least 12.",
       "- candidatePatch.files must be non-empty, each with the exact final path and full file content.",
       "- Placeholder values such as \"...\", \"TODO\", \"TBD\", \"N/A\" or \"full file content\" are rejected.",
@@ -200,7 +261,11 @@ export const byterResultSchema: GuardSchema = {
         const attemptErrors = meaningful(proof.attempts, "proof.attempts", 3);
         errors.push(...attemptErrors);
         if (attemptErrors.length === 0 && !hasThreeMatchingAttempts(proof.attempts as string)) {
-          errors.push('Field "proof.attempts" must report at least 3 of 3 matching executions, for example "3/3".');
+          errors.push(
+            `Field "proof.attempts" must report at least 3 of 3 matching executions, for example "3/3", ` +
+              `within its first ${serverAttemptsClampBytes} characters. Start the field with the count, ` +
+              `such as "3/3 before-fix failures, 3/3 after-fix passes", then add any detail afterwards.`
+          );
         }
       } else {
         errors.push(...nonEmpty(proof.before, "proof.before"));
@@ -291,7 +356,9 @@ function meaningful(value: unknown, field: string, minimumLength: number): strin
 }
 
 function hasThreeMatchingAttempts(value: string): boolean {
-  const match = value.match(/(?:^|\D)(\d+)\s*\/\s*(\d+)(?:\D|$)/);
+  // Only the leading window survives to the server's own check.
+  const window = Buffer.from(value, "utf8").subarray(0, serverAttemptsClampBytes).toString("utf8");
+  const match = window.match(/(?:^|\D)(\d+)\s*\/\s*(\d+)(?:\D|$)/);
   return Boolean(match && Number(match[1]) >= 3 && match[1] === match[2]);
 }
 

@@ -147,6 +147,75 @@ describe("structured output guard", () => {
     }
   });
 
+  // The cases below were produced by real deepseek-flash runs against a live issue.
+  it("accepts a narrative attempts field with the count past 200 characters", () => {
+    // Real run 7 wrote 877 characters here with "3/3" late. The server used to clamp this
+    // field to 200 bytes and re-check the count, failing a genuinely proven run.
+    const buried =
+      "1. Read `src/tokenizer.ts` and `README.md` from the base branch with the GitHub MCP read tool; " +
+      "`package.json`, `src/index.ts`, and `tests/tokenizer.test.ts` were fetched to establish the " +
+      "surrounding structure before any sandbox work began. Then the reproducer ran 3/3 times.";
+    expect(buried.length).toBeGreaterThan(200);
+
+    const result = validateAndParse(
+      JSON.stringify({ ...validResult, proof: { ...validResult.proof, attempts: buried } }),
+      byterResultSchema
+    );
+
+    expect(result.valid).toBe(true);
+  });
+
+  it("still rejects a count that falls outside the server's clamp window", () => {
+    const tooLate = `${"Narrative detail. ".repeat(140)}3/3 attempts matched.`;
+    expect(tooLate.length).toBeGreaterThan(2_000);
+
+    const result = validateAndParse(
+      JSON.stringify({ ...validResult, proof: { ...validResult.proof, attempts: tooLate } }),
+      byterResultSchema
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) expect(result.error).toContain("proof.attempts");
+  });
+
+  it("rejects a retry that drops a required top-level field", () => {
+    // Real run 13: the retry fixed proof.attempts but omitted status while regenerating
+    // a 7.5 KB object, so the correction message must demand the complete object.
+    const { status: _dropped, ...withoutStatus } = validResult;
+
+    const result = validateAndParse(JSON.stringify(withoutStatus), byterResultSchema);
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) expect(result.error).toContain('Field "status"');
+    expect(buildCorrectionMessage(byterResultSchema, "x")).toContain("COMPLETE object");
+  });
+
+  it("reports truncated JSON as truncation, not as missing schema fields", () => {
+    // A large candidatePatch.body cut off mid-string: the outer object never closes,
+    // but the nested patch object would parse on its own and mislead the correction.
+    const truncated = '{"kind":"byter.result","candidatePatch":{"title":"Fix it","body":"## Problem\\n\\nlong text';
+
+    const result = validateAndParse(truncated, byterResultSchema);
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.error).toMatch(/not a complete JSON object|cut off/);
+      expect(result.error).not.toContain('Field "kind"');
+    }
+  });
+
+  it("still reports a genuine schema violation when the outer object parses", () => {
+    const result = validateAndParse(
+      JSON.stringify({ kind: "not.byter", status: "patch-ready" }),
+      byterResultSchema
+    );
+
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.error).toContain('Field "kind"');
+    }
+  });
+
   it("quotes the expected schema and the specific problem in the correction message", () => {
     const message = buildCorrectionMessage(byterResultSchema, 'Field "proof.attempts" must report at least 3 of 3.');
 

@@ -2836,7 +2836,10 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
         ...(typeof parsed.proof.before === "string" ? { before: clampText(parsed.proof.before, 2_000) } : {}),
         ...(typeof parsed.proof.after === "string" ? { after: clampText(parsed.proof.after, 2_000) } : {}),
         ...(typeof parsed.proof.regressions === "string" ? { regressions: clampText(parsed.proof.regressions, 2_000) } : {}),
-        ...(typeof parsed.proof.attempts === "string" ? { attempts: clampText(parsed.proof.attempts, 200) } : {})
+        // Clamped alongside its sibling proof fields: hasGenuineProof re-checks the N/N
+        // count on this stored copy, and a 200-byte cut dropped counts that the model had
+        // written later in a longer narrative, failing runs that had genuinely proved 3/3.
+        ...(typeof parsed.proof.attempts === "string" ? { attempts: clampText(parsed.proof.attempts, 2_000) } : {})
       }
     : undefined;
   const candidatePatch = status === "patch-ready" || status === "verified"
