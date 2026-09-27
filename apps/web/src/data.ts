@@ -423,6 +423,7 @@ export const statusLabels: Record<RunStatus, string> = {
   "environment-failed": "Environment failed",
   reproducing: "Reproducing",
   "not-reproduced": "Not reproduced",
+  "not-actionable": "Not actionable",
   flaky: "Flaky",
   verified: "Verified",
   minimizing: "Minimizing",

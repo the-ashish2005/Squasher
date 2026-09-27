@@ -374,3 +374,77 @@ describe("fork-based pull requests", () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 });
+
+describe("result statuses for implemented changes", () => {
+  const implementedProof = {
+    kind: "byter.result",
+    status: "implemented-feature",
+    summary: "Added the requested Cancel button and verified it renders beside Save.",
+    proof: {
+      before: "The new acceptance test failed 3/3 against the unchanged page: no Cancel button present.",
+      after: "The same test passed 3/3 after the change.",
+      regressions: "The existing suite passed 3/3 alongside it.",
+      attempts: "3/3 matching executions before and after"
+    },
+    candidatePatch: {
+      title: "Add a Cancel button beside Save",
+      body: "Adds the requested Cancel button to index.html.",
+      files: [{ path: "index.html", content: "<button>Cancel</button>\n" }]
+    }
+  };
+
+  it("accepts implemented-feature and implemented-improvement", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+
+    for (const status of ["implemented-feature", "implemented-improvement"]) {
+      const result = await tools.callTool({
+        name: "submit_byter_result",
+        arguments: { ...implementedProof, status }
+      });
+      expect(result.content[0]?.text, status).toContain('"accepted":true');
+    }
+  });
+
+  it("holds an implemented change to the same evidence bar as a defect", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+
+    // Implementing without running anything three times is not evidence.
+    await expect(
+      tools.callTool({
+        name: "submit_byter_result",
+        arguments: { ...implementedProof, proof: { ...implementedProof.proof, attempts: "ran it once" } }
+      })
+    ).rejects.toThrow("at least 3/3 matching executions");
+
+    // Placeholder text is rejected here exactly as it is for a defect.
+    await expect(
+      tools.callTool({
+        name: "submit_byter_result",
+        arguments: { ...implementedProof, proof: { ...implementedProof.proof, after: "..." } }
+      })
+    ).rejects.toThrow("proof.after");
+  });
+
+  it("accepts not-actionable without demanding proof, and rejects an unknown status", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+
+    const accepted = await tools.callTool({
+      name: "submit_byter_result",
+      arguments: {
+        kind: "byter.result",
+        status: "not-actionable",
+        summary: "The request names a service this repository does not contain.",
+        proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "0/0" },
+        candidatePatch: null
+      }
+    });
+    expect(accepted.content[0]?.text).toContain('"accepted":true');
+
+    await expect(
+      tools.callTool({
+        name: "submit_byter_result",
+        arguments: { ...implementedProof, status: "implemented-whatever" }
+      })
+    ).rejects.toThrow("valid Byter result status");
+  });
+});

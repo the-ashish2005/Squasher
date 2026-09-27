@@ -580,10 +580,13 @@ describe("byter harness runtime", () => {
     // The issue text was recovered from the rendered prompt.
     expect(store.issue(created.data.id)?.title).toBe("Add a green Cancel button next to Save");
 
-    // The first patch-ready claim was rejected, with a correction naming the right status.
+    // The first patch-ready claim was rejected, with a correction pointing at the
+    // implementation path rather than at not-reproduced: the request is actionable, it
+    // just is not a defect.
     const guardEvents = events.filter((event) => event.type === guardEventType);
     expect(guardEvents).toHaveLength(1);
-    expect(String(guardEvents[0]?.problem)).toContain("not-reproduced");
+    expect(String(guardEvents[0]?.problem)).toContain("implemented-feature");
+    expect(String(guardEvents[0]?.problem)).toContain("implemented-improvement");
 
     const correction = complete.mock.calls[1]?.[0] as Array<{ role: string; content: string }>;
     expect(correction.at(-1)?.content).toContain("reports no observable failure");

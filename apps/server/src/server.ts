@@ -7,7 +7,12 @@ import { fileURLToPath } from "node:url";
 import { ByterTrueForgeRuntime } from "@byter/agent";
 import {
   approvalPayloadHash,
+  bugProofStatuses,
+  byterResultStatuses,
   createGitHubMcpHttpHandler,
+  implementationStatuses,
+  provenResultStatuses,
+  type ByterResultStatus,
   type GitHubRestClientLike
 } from "@byter/github-mcp";
 import type {
@@ -85,7 +90,7 @@ interface TrueForgePendingApproval {
 }
 
 interface LiveProofResult {
-  status: "patch-ready" | "verified" | "not-reproduced" | "blocked" | "failed";
+  status: ByterResultStatus;
   summary: string;
   rootCauseSummary?: string;
   proposedFixSummary?: string;
@@ -1324,6 +1329,11 @@ const lifecycleLabelDefinitions = [
   { name: "byter:triaging", color: "1d5fd1", description: "Byter is triaging this issue" },
   { name: "byter:needs-info", color: "a85b00", description: "Byter needs more issue information" },
   { name: "byter:not-reproduced", color: "6e7781", description: "Byter could not reproduce this issue" },
+  {
+    name: "byter:not-actionable",
+    color: "6e7781",
+    description: "Byter understood this request but did not build it"
+  },
   { name: "byter:security-review", color: "b42318", description: "Byter held this issue for security review" },
   { name: "byter:pr-created", color: "1a7f37", description: "Byter created a draft pull request" },
   // Reconciled here as well as applied by applyVerifiedLabel and
@@ -1332,6 +1342,14 @@ const lifecycleLabelDefinitions = [
   // claims in place: an issue could carry byter:verified and byter:not-reproduced at
   // once, publicly asserting a proof that a later run had disproved.
   { name: "byter:verified", color: "8250df", description: "Issue verified by reproducible evidence" },
+  // Kept distinct from byter:verified on purpose. That label asserts a reproduced defect,
+  // and an implemented change never reproduced anything; reusing it would make Byter's own
+  // evidence claim mean two different things.
+  {
+    name: "byter:implemented",
+    color: "0969da",
+    description: "Byter implemented and verified the requested change"
+  },
   {
     name: "byter:awaiting-approval",
     color: "d1242f",
@@ -1353,6 +1371,7 @@ function desiredLifecycleLabels(record: PersistedWebhookRunRecord): string[] {
   if (record.run.status === "pr-created") labels.push("byter:pr-created");
   else if (record.run.status === "needs-info") labels.push("byter:needs-info");
   else if (record.run.status === "not-reproduced") labels.push("byter:not-reproduced");
+  else if (record.run.status === "not-actionable") labels.push("byter:not-actionable");
   else if (
     record.run.status !== "awaiting-approval" &&
     (record.run.status === "triaging" || record.trueForge.status === "started")
@@ -1365,7 +1384,8 @@ function desiredLifecycleLabels(record: PersistedWebhookRunRecord): string[] {
   // still have been refused, as when a patch arrives with no approval checkpoint, and
   // that run must not be labelled verified.
   if (provenRunStatuses.has(record.run.status) && hasGenuineProof(record.trueForge.result)) {
-    labels.push("byter:verified");
+    const status = record.trueForge.result?.status;
+    labels.push(status && implementationStatuses.has(status) ? "byter:implemented" : "byter:verified");
     if (record.run.status === "awaiting-approval") labels.push("byter:awaiting-approval");
   }
 
@@ -1543,7 +1563,16 @@ async function applyVerifiedLabel(
   record: PersistedWebhookRunRecord,
   githubClient: GitHubRestClientLike | undefined
 ): Promise<PersistedWebhookRunRecord> {
-  if (!githubClient || !canWriteToUpstream(record) || record.verifiedLabel || !hasGenuineProof(record.trueForge.result)) {
+  // byter:verified asserts a reproduced defect. An implemented change clears the same
+  // evidence bar but reproduced nothing, so it earns byter:implemented from
+  // desiredLifecycleLabels instead and must not pick this one up on the way past.
+  if (
+    !githubClient ||
+    !canWriteToUpstream(record) ||
+    record.verifiedLabel ||
+    !hasGenuineProof(record.trueForge.result) ||
+    !bugProofStatuses.has(record.trueForge.result?.status ?? "")
+  ) {
     return record;
   }
 
@@ -1658,7 +1687,8 @@ function hasGenuineProof(result: LiveProofResult | undefined): boolean {
     result.candidatePatch.files.every((file) => isMeaningfulProofText(file.path, 3) && isMeaningfulProofText(file.content, 4))
   );
   return Boolean(
-    (result?.status === "verified" || result?.status === "patch-ready") &&
+    result &&
+      provenResultStatuses.has(result.status) &&
       isMeaningfulProofText(result.summary, 20) &&
       isMeaningfulProofText(proof?.before, 6) &&
       isMeaningfulProofText(proof?.after, 6) &&
@@ -1753,6 +1783,34 @@ async function appendGitHubComment(
   }
 }
 
+/**
+ * Evidence headings for the public issue comment. An implemented change has no
+ * reproduction and observed no failure, so it must not be described as though it did.
+ */
+function evidenceLabelsFor(result: LiveProofResult | undefined) {
+  return result && implementationStatuses.has(result.status)
+    ? {
+        attempts: "Verification",
+        attemptsFallback: "3/3 matching runs",
+        before: "Before change",
+        beforeFallback: "Requested behaviour absent",
+        after: "After change",
+        afterFallback: "New behaviour verified",
+        regressions: "Existing checks",
+        heading: "Requested change"
+      }
+    : {
+        attempts: "Reproduction",
+        attemptsFallback: "3/3 matching failures",
+        before: "Before",
+        beforeFallback: "Failure observed",
+        after: "After",
+        afterFallback: "Passes after patch",
+        regressions: "Regression suite",
+        heading: "Root cause"
+      };
+}
+
 export function buildGitHubStatusComment(record: PersistedWebhookRunRecord, kind: GitHubCommentKind): string {
   const status = githubCommentStatus(record);
   const result = record.trueForge.result;
@@ -1800,15 +1858,16 @@ export function buildGitHubStatusComment(record: PersistedWebhookRunRecord, kind
       `**[View evidence ->](${runUrl})**`
     );
   } else if (record.run.status !== "failed" && result?.candidatePatch && hasGenuineProof(result)) {
+    const evidence = evidenceLabelsFor(result);
     lines.push(
       "",
       "### Evidence",
-      `- **Reproduction:** ${commentProofText(result.proof?.attempts, "3/3 matching failures", 180)}`,
-      `- **Before:** ${commentProofText(result.proof?.before, "Failure observed", 260)}`,
-      `- **After:** ${commentProofText(result.proof?.after, "Passes after patch", 260)}`,
-      `- **Regression suite:** ${commentProofText(result.proof?.regressions, "Passed", 260)}`,
+      `- **${evidence.attempts}:** ${commentProofText(result.proof?.attempts, evidence.attemptsFallback, 180)}`,
+      `- **${evidence.before}:** ${commentProofText(result.proof?.before, evidence.beforeFallback, 260)}`,
+      `- **${evidence.after}:** ${commentProofText(result.proof?.after, evidence.afterFallback, 260)}`,
+      `- **${evidence.regressions}:** ${commentProofText(result.proof?.regressions, "Passed", 260)}`,
       "",
-      "### Root cause",
+      `### ${evidence.heading}`,
       safeCommentMarkdown(result.rootCauseSummary ?? summarizeCommentText(result.summary), 360),
       "",
       "### Proposed fix",
@@ -1826,13 +1885,14 @@ export function buildGitHubStatusComment(record: PersistedWebhookRunRecord, kind
       );
     }
   } else if (record.run.status !== "failed" && result && hasGenuineProof(result)) {
+    const evidence = evidenceLabelsFor(result);
     lines.push(
       "",
       "### Evidence",
-      `- **Reproduction:** ${commentProofText(result.proof?.attempts, "3/3 matching failures", 180)}`,
-      `- **Before:** ${commentProofText(result.proof?.before, "Failure observed", 260)}`,
-      `- **After:** ${commentProofText(result.proof?.after, "Passes after patch", 260)}`,
-      `- **Regression suite:** ${commentProofText(result.proof?.regressions, "Passed", 260)}`,
+      `- **${evidence.attempts}:** ${commentProofText(result.proof?.attempts, evidence.attemptsFallback, 180)}`,
+      `- **${evidence.before}:** ${commentProofText(result.proof?.before, evidence.beforeFallback, 260)}`,
+      `- **${evidence.after}:** ${commentProofText(result.proof?.after, evidence.afterFallback, 260)}`,
+      `- **${evidence.regressions}:** ${commentProofText(result.proof?.regressions, "Passed", 260)}`,
       "",
       "### Finding",
       safeCommentMarkdown(result.rootCauseSummary ?? summarizeCommentText(result.summary), 360),
@@ -1949,11 +2009,19 @@ function githubCommentStatus(record: PersistedWebhookRunRecord): { label: string
   if (record.run.status === "not-reproduced") {
     return { label: "Not reproduced", detail: "The reported failure was not observed in the investigated environment." };
   }
+  if (record.run.status === "not-actionable") {
+    return {
+      label: "Not actionable",
+      detail: "The request was understood but not implemented; the summary explains why."
+    };
+  }
   if (record.run.status === "awaiting-approval") {
     return { label: "Patch ready for review", detail: "Verified evidence is ready; TrueForge is paused before GitHub writes." };
   }
   if (record.run.status === "patch-ready" || record.run.status === "verified") {
-    return { label: "Verified", detail: "The reported failure is backed by executable evidence." };
+    return implementationStatuses.has(record.trueForge.result?.status ?? "")
+      ? { label: "Implemented", detail: "The requested change is implemented and backed by executable evidence." }
+      : { label: "Verified", detail: "The reported failure is backed by executable evidence." };
   }
   if (record.run.status === "rejected") {
     return { label: "Run rejected", detail: "The run was stopped before repository mutation." };
@@ -2783,7 +2851,11 @@ async function monitorTrueForgeTurn(
     const pendingApproval = result?.candidatePatch
       ? extractTrueForgePendingApproval(events, activeTurnId, result.candidatePatch.hash, result.candidatePatch)
       : undefined;
-    const requiresExecutableProof = Boolean(result && (result.status === "verified" || result.candidatePatch));
+    // An implemented change must have executed its checks too: the whole point of the
+    // implementation path is that tests were run, not that code was written.
+    const requiresExecutableProof = Boolean(
+      result && (provenResultStatuses.has(result.status) || result.candidatePatch)
+    );
     const validResult = Boolean(
       result &&
       (!requiresExecutableProof || (hasGenuineProof(result) && hasExecutableProof(eventMetadata))) &&
@@ -3105,7 +3177,7 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
   if (!status) {
     return undefined;
   }
-  if ((status === "patch-ready" || status === "verified") && !submittedResult) {
+  if (provenResultStatuses.has(status) && !submittedResult) {
     console.error("TrueForge positive proof was not submitted through submit_byter_result");
     return undefined;
   }
@@ -3122,12 +3194,16 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
         ...(typeof parsed.proof.attempts === "string" ? { attempts: clampText(parsed.proof.attempts, 2_000) } : {})
       }
     : undefined;
-  const candidatePatch = status === "patch-ready" || status === "verified"
+  const candidatePatch = provenResultStatuses.has(status)
     ? normalizeCandidatePatch(rawCandidatePatch, record, summary)
     : undefined;
 
   return {
-    status: candidatePatch ? "patch-ready" : status,
+    // A defect that arrives with a patch is patch-ready whatever it called itself, so a
+    // bare "verified" plus a fix still reaches the approval path. An implemented change
+    // keeps its own status: collapsing it to patch-ready would relabel work that never
+    // reproduced anything as a proven defect.
+    status: candidatePatch && bugProofStatuses.has(status) ? "patch-ready" : status,
     summary,
     rootCauseSummary: clampText(
       typeof parsed.rootCauseSummary === "string" ? parsed.rootCauseSummary : summarizeCommentText(summary),
@@ -3303,14 +3379,42 @@ function branchNameForIssue(issueNumber: number, deliveryId: string): string {
 
 function applyLiveProofResult(run: ReturnType<typeof createRun>, result: LiveProofResult) {
   if (result.candidatePatch) {
+    // One path to a pull request, shared by both kinds of work: the state machine's names
+    // are written for a defect, so an implemented change is narrated for what it actually
+    // did rather than as a reproduction it never performed.
+    const implemented = implementationStatuses.has(result.status);
+    const narration: Partial<Record<string, string>> = implemented
+      ? {
+          reproducing: "Byter inspected the repository for the requested change",
+          verified: "Byter confirmed the requested change is implementable here",
+          minimizing: "Byter scoped the change to the smallest surface",
+          fixing: "Byter implemented the requested change",
+          validating: "Byter verified the new behaviour and existing checks"
+        }
+      : {};
+
     for (const status of ["reproducing", "verified", "minimizing", "fixing", "validating", "patch-ready", "awaiting-approval"] as const) {
       if (canTransition(run.status, status)) {
-        run = transitionRun(run, status, `TrueForge proof: ${status}`, {
+        run = transitionRun(run, status, narration[status] ?? `TrueForge proof: ${status}`, {
           evidence: { summary: result.summary, ...(result.proof ? { proof: result.proof } : {}) }
         });
       }
     }
     return run;
+  }
+
+  // Understood and declined, which is not the same as a reproduction that failed.
+  if (result.status === "not-actionable" && canTransition(run.status, "not-actionable")) {
+    return transitionRun(run, "not-actionable", result.summary);
+  }
+
+  // Implemented and verified, but no patch survived normalization, so there is nothing to
+  // approve. Recorded as verified work rather than dropped silently.
+  if (implementationStatuses.has(result.status) && canTransition(run.status, "reproducing")) {
+    run = transitionRun(run, "reproducing", "Byter inspected the repository for the requested change");
+    if (canTransition(run.status, "verified")) {
+      return transitionRun(run, "verified", result.summary);
+    }
   }
 
   if (result.status === "not-reproduced" && canTransition(run.status, "reproducing")) {
@@ -3332,8 +3436,8 @@ function applyLiveProofResult(run: ReturnType<typeof createRun>, result: LivePro
 }
 
 function parseLiveResultStatus(value: unknown): LiveProofResult["status"] | undefined {
-  return value === "patch-ready" || value === "verified" || value === "not-reproduced" || value === "blocked" || value === "failed"
-    ? value
+  return typeof value === "string" && (byterResultStatuses as readonly string[]).includes(value)
+    ? (value as ByterResultStatus)
     : undefined;
 }
 

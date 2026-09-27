@@ -1,5 +1,8 @@
+import { byterResultStatuses, provenResultStatuses } from "@byter/github-mcp";
+
 const placeholderPattern = /^(?:\.{3}|…|todo|tbd|n\/?a|placeholder|full file content)$/i;
-const resultStatuses = ["patch-ready", "verified", "not-reproduced", "blocked", "failed"] as const;
+
+const resultStatuses = byterResultStatuses;
 
 /**
  * Must stay >= the `proof.attempts` clamp in `extractLiveProofResult`
@@ -213,7 +216,7 @@ export const byterResultSchema: GuardSchema = {
     return [
       "{",
       '  "kind": "byter.result",',
-      '  "status": "patch-ready" | "verified" | "not-reproduced" | "blocked" | "failed",',
+      '  "status": "patch-ready" | "verified" | "implemented-feature" | "implemented-improvement" | "not-reproduced" | "not-actionable" | "blocked" | "failed",',
       '  "summary": string,',
       '  "proof": {',
       '    "before": string,',
@@ -228,9 +231,13 @@ export const byterResultSchema: GuardSchema = {
       "  }",
       "}",
       "",
-      "Rules for status \"patch-ready\" and \"verified\":",
+      'Use "patch-ready" or "verified" only for a reproduced defect, and',
+      '"implemented-feature" or "implemented-improvement" only for a requested change that was',
+      "built and verified. Rules for all four:",
       "- summary must be at least 20 characters of concrete description.",
       "- proof.before, proof.after and proof.regressions must each be at least 6 characters.",
+      "  For a defect, proof.before is the reproduced failure. For an implemented change it is the",
+      "  starting state: the requested behaviour absent, or its new test failing before the change.",
       '- proof.attempts must report matching counts of at least three, for example "3/3". Put the count',
       "  near the start of the field so it survives truncation, then add detail after it.",
       "- candidatePatch.title must be at least 8 characters and candidatePatch.body at least 12.",
@@ -252,7 +259,7 @@ export const byterResultSchema: GuardSchema = {
       errors.push(`Field "status" must be one of ${resultStatuses.map((entry) => `"${entry}"`).join(", ")}.`);
     }
 
-    const positiveProof = status === "patch-ready" || status === "verified";
+    const positiveProof = typeof status === "string" && provenResultStatuses.has(status);
     errors.push(...(positiveProof ? meaningful(value.summary, "summary", 20) : nonEmpty(value.summary, "summary")));
 
     if (!isRecord(value.proof)) {

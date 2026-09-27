@@ -9,6 +9,13 @@ export type RunStatus =
   | "environment-failed"
   | "reproducing"
   | "not-reproduced"
+  /**
+   * Understood, but deliberately not built: impossible here, ambiguous, unrelated to the
+   * project, or out of scope. Distinct from not-reproduced, which means a claimed defect
+   * could not be demonstrated — reporting a declined change request as "not reproduced"
+   * describes work that was never attempted as a failed reproduction.
+   */
+  | "not-actionable"
   | "flaky"
   | "verified"
   | "minimizing"

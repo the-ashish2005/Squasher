@@ -79,6 +79,58 @@ export interface ApprovalContext {
   expectedPayloadHash?: string;
 }
 
+/**
+ * Every status a Byter result may carry, and the single source of truth for the three
+ * places that validate it: this tool's argument check, the harness's structured-output
+ * guard, and the server's result parser.
+ *
+ * Byter handles two kinds of actionable issue, and the status says which one was found:
+ *
+ * - patch-ready / verified        a reported defect was reproduced. "verified" is a
+ *                                reproduction without a fix attached; "patch-ready" adds
+ *                                a verified fix.
+ * - implemented-feature          a requested behaviour that did not exist was built and
+ *   implemented-improvement      verified. No reproduction exists, because nothing was
+ *                                broken; the evidence is the new behaviour passing and
+ *                                the existing suite still passing.
+ * - not-reproduced               a defect was claimed but could not be demonstrated.
+ * - not-actionable               understood, but not something to build: impossible,
+ *                                ambiguous, unrelated to the project, or out of scope.
+ * - blocked / failed             execution could not complete.
+ */
+export const byterResultStatuses = [
+  "patch-ready",
+  "verified",
+  "implemented-feature",
+  "implemented-improvement",
+  "not-reproduced",
+  "not-actionable",
+  "blocked",
+  "failed"
+] as const;
+
+export type ByterResultStatus = (typeof byterResultStatuses)[number];
+
+/** Asserts a reported defect was reproduced. Requires failure-then-pass evidence. */
+export const bugProofStatuses: ReadonlySet<string> = new Set(["patch-ready", "verified"]);
+
+/** Asserts a requested change was implemented and verified. No reproduction required. */
+export const implementationStatuses: ReadonlySet<string> = new Set([
+  "implemented-feature",
+  "implemented-improvement"
+]);
+
+/**
+ * Statuses held to the full evidence bar: concrete summary, before/after/regression text,
+ * and at least 3/3 matching executions. Both kinds clear the same bar; only the meaning of
+ * "before" differs — a reproduced failure for a defect, the requested behaviour absent or
+ * its new test failing for a change.
+ */
+export const provenResultStatuses: ReadonlySet<string> = new Set([
+  ...bugProofStatuses,
+  ...implementationStatuses
+]);
+
 export type GitHubMcpToolName =
   | "read_issue"
   | "read_file"
@@ -413,16 +465,12 @@ function expectByterResult(args: Record<string, unknown>): void {
   if (args.kind !== "byter.result") {
     throw new Error("Expected kind=byter.result");
   }
-  if (
-    args.status !== "patch-ready" &&
-    args.status !== "verified" &&
-    args.status !== "not-reproduced" &&
-    args.status !== "blocked" &&
-    args.status !== "failed"
-  ) {
+  if (typeof args.status !== "string" || !(byterResultStatuses as readonly string[]).includes(args.status)) {
     throw new Error("Expected a valid Byter result status");
   }
-  const positiveProof = args.status === "patch-ready" || args.status === "verified";
+  // Identical rigor for a reproduced defect and an implemented change: the bar is
+  // executed, repeated evidence either way.
+  const positiveProof = provenResultStatuses.has(args.status);
   if (positiveProof) expectMeaningfulText(args.summary, "summary", 20);
   else expectString(args.summary, "summary");
   if (!args.proof || typeof args.proof !== "object" || Array.isArray(args.proof)) {

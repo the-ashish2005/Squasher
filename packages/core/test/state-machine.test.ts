@@ -44,4 +44,41 @@ describe("Byter state machine", () => {
       "Invalid Byter transition: failed -> triaging"
     );
   });
+
+  it("reaches not-actionable from triage and from a reproduction attempt", () => {
+    // A declined change request is its own terminal outcome. Reporting it as
+    // not-reproduced would describe work that was never attempted as a failed
+    // reproduction, which is what this state exists to avoid.
+    const triaged = transitionRun(
+      transitionRun(createRun("run_1", issue), "security-review", "Scanning"),
+      "triaging",
+      "Ready for triage"
+    );
+    const declined = transitionRun(triaged, "not-actionable", "The request names a service this repo lacks");
+
+    expect(declined.status).toBe("not-actionable");
+
+    const investigated = transitionRun(
+      transitionRun(triaged, "environment-building", "Building"),
+      "reproducing",
+      "Inspecting"
+    );
+    expect(transitionRun(investigated, "not-actionable", "Ambiguous request").status).toBe("not-actionable");
+  });
+
+  it("does not leave the terminal not-actionable state", () => {
+    const declined = transitionRun(
+      transitionRun(
+        transitionRun(createRun("run_1", issue), "security-review", "Scanning"),
+        "triaging",
+        "Ready"
+      ),
+      "not-actionable",
+      "Out of scope for this project"
+    );
+
+    expect(() => transitionRun(declined, "fixing", "Try anyway")).toThrow(
+      "Invalid Byter transition: not-actionable -> fixing"
+    );
+  });
 });

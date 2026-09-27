@@ -9,7 +9,7 @@ import {
   GuardValidationError,
   type GuardSchema
 } from "./structured-output-guard.js";
-import { outOfScopeProblem } from "./issue-scope.js";
+import { resultContractProblem } from "./issue-scope.js";
 import type { HarnessAgentMessage, SessionStore } from "./session-store.js";
 import type { ToolDispatcher } from "./tool-dispatcher.js";
 
@@ -163,10 +163,12 @@ export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
       }
 
       try {
-        // Refuses a claimed proof for an issue that never reported a failure, before the
-        // result is accepted and the issue gets labelled byter:verified.
+        // Refuses a result whose evidence is the wrong kind for the issue it answers, in
+        // either direction: a defect claim for an issue that reported no failure, or an
+        // implementation claim for one that did. Runs before the result is accepted, and so
+        // before the issue can be labelled.
         if (toolCall.name === "submit_byter_result") {
-          const problem = outOfScopeProblem(args, issueTextFor(store, sessionId));
+          const problem = resultContractProblem(args, issueTextFor(store, sessionId));
           if (problem) {
             throw new GuardValidationError(toolCall.name, JSON.stringify(args).slice(0, 8 * 1024), problem);
           }
