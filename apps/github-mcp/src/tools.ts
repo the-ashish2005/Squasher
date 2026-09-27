@@ -44,8 +44,34 @@ export interface GitHubRestClientLike {
   createPullRequest(
     owner: string,
     repo: string,
-    input: { title: string; body: string; head: string; base: string; draft?: boolean }
+    input: {
+      title: string;
+      body: string;
+      head: string;
+      base: string;
+      draft?: boolean;
+      maintainerCanModify?: boolean;
+    }
   ): Promise<{ number: number; html_url: string }>;
+  getRepository?(owner: string, repo: string): Promise<{
+    full_name: string;
+    default_branch: string;
+    private: boolean;
+    fork: boolean;
+    archived?: boolean;
+    disabled?: boolean;
+    html_url: string;
+    owner: { login: string };
+    permissions?: { admin?: boolean; push?: boolean; pull?: boolean };
+  }>;
+  getAuthenticatedUser?(): Promise<{ login: string }>;
+  forkRepository?(owner: string, repo: string): Promise<{ full_name: string; owner: { login: string }; html_url: string }>;
+  mergeUpstream?(owner: string, repo: string, branch: string): Promise<void>;
+  listPullRequests?(
+    owner: string,
+    repo: string,
+    query?: { state?: "open" | "closed" | "all"; head?: string }
+  ): Promise<Array<{ number: number; html_url: string; state: string; head: { ref: string; label: string } }>>;
 }
 
 export interface ApprovalContext {
@@ -77,6 +103,9 @@ export interface GitHubMcpToolResult {
 
 export interface GitHubMcpServerOptions {
   client: GitHubRestClientLike;
+  /** Injectable clock and delay for the fork-readiness poll, so tests need not wait. */
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export function listGitHubTools(): Array<{ name: GitHubMcpToolName; description: string; requiresApproval: boolean }> {
@@ -98,7 +127,12 @@ export function listGitHubTools(): Array<{ name: GitHubMcpToolName; description:
   ];
 }
 
-export function createGitHubMcpTools({ client }: GitHubMcpServerOptions) {
+export function createGitHubMcpTools({ client, now, sleep }: GitHubMcpServerOptions) {
+  const forkPollOptions = {
+    ...(now ? { now } : {}),
+    ...(sleep ? { sleep } : {})
+  };
+
   return {
     async callTool(call: GitHubMcpToolCall): Promise<GitHubMcpToolResult> {
       switch (call.name) {
@@ -160,30 +194,42 @@ export function createGitHubMcpTools({ client }: GitHubMcpServerOptions) {
         case "create_fix_pull_request": {
           assertApproved(call.approval, approvalPayloadHash(call.name, call.arguments));
           const request = parseCreatePullRequestArgs(call.arguments);
+          const crossRepo = request.headOwner !== request.owner;
+
+          // The base is always read from upstream, so a stale fork cannot drag unrelated
+          // commits into the diff. Forks share object storage, so the upstream base commit
+          // and tree are reachable when writing into the fork.
           const base = await client.getBranch(request.owner, request.repo, request.baseBranch);
           const baseCommit = await client.getCommit(request.owner, request.repo, base.commit.sha);
-          const tree = await client.createTree(request.owner, request.repo, {
+
+          if (crossRepo) {
+            await ensureForkReady(client, request.headOwner, request.repo, request.baseBranch, forkPollOptions);
+          }
+
+          const tree = await client.createTree(request.headOwner, request.repo, {
             baseTree: baseCommit.tree.sha,
             files: request.files.map((file) => ({ path: file.path, content: file.content }))
           });
-          const commit = await client.createCommit(request.owner, request.repo, {
+          const commit = await client.createCommit(request.headOwner, request.repo, {
             message: `Byter fix: ${request.title}`,
             tree: tree.sha,
             parents: [base.commit.sha]
           });
-          await client.createBranch(request.owner, request.repo, request.branchName, commit.sha);
+          await client.createBranch(request.headOwner, request.repo, request.branchName, commit.sha);
 
           let pullRequest: { number: number; html_url: string };
           try {
             pullRequest = await client.createPullRequest(request.owner, request.repo, {
               title: request.title,
               body: request.body,
-              head: request.branchName,
+              head: crossRepo ? `${request.headOwner}:${request.branchName}` : request.branchName,
               base: request.baseBranch,
-              draft: true
+              draft: true,
+              maintainerCanModify: true
             });
           } catch (error) {
-            await client.deleteBranch(request.owner, request.repo, request.branchName);
+            // Roll back the branch we created, in the repository we created it in. Never the fork itself.
+            await client.deleteBranch(request.headOwner, request.repo, request.branchName);
             throw error;
           }
 
@@ -193,6 +239,8 @@ export function createGitHubMcpTools({ client }: GitHubMcpServerOptions) {
                 number: pullRequest.number,
                 url: pullRequest.html_url,
                 branch: request.branchName,
+                headOwner: request.headOwner,
+                crossRepo,
                 filesChanged: request.files.map((file) => file.path)
               },
               null,
@@ -296,15 +344,69 @@ function parseReadFileArgs(args: Record<string, unknown>) {
 }
 
 function parseCreatePullRequestArgs(args: Record<string, unknown>) {
+  const owner = expectString(args.owner, "owner");
   return {
-    owner: expectString(args.owner, "owner"),
+    owner,
     repo: expectString(args.repo, "repo"),
+    // The account holding the fix branch. Equal to owner for a same-repo write, so an
+    // omitted headOwner hashes identically to an explicit one naming the upstream owner.
+    // Because this is part of the canonical payload, the approval hash covers the write
+    // destination: an approved payload cannot be redirected to a different account.
+    headOwner: typeof args.headOwner === "string" && args.headOwner.length > 0 ? args.headOwner : owner,
     baseBranch: expectString(args.baseBranch, "baseBranch"),
     branchName: expectString(args.branchName, "branchName"),
     title: expectString(args.title, "title"),
     body: expectString(args.body, "body"),
     files: Array.isArray(args.files) ? expectPatchFiles(args.files) : []
   };
+}
+
+export const forkReadyTimeoutMs = 30_000;
+const forkPollIntervalMs = 1_500;
+
+/**
+ * A fork answers 202 before it is usable, so the branch write can race it. Poll until the
+ * fork resolves, then make sure its base branch exists before any ref is written.
+ */
+async function ensureForkReady(
+  client: GitHubRestClientLike,
+  headOwner: string,
+  repo: string,
+  baseBranch: string,
+  options: { now?: () => number; sleep?: (ms: number) => Promise<void> } = {}
+): Promise<void> {
+  const now = options.now ?? (() => Date.now());
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  if (!client.getRepository) {
+    // Without a probe there is no way to wait; let the branch write surface the failure.
+    return;
+  }
+
+  const deadline = now() + forkReadyTimeoutMs;
+  let lastError: unknown;
+  while (now() < deadline) {
+    try {
+      await client.getRepository(headOwner, repo);
+      await client.getBranch(headOwner, repo, baseBranch);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isNotFound(error)) {
+        throw error;
+      }
+      await sleep(forkPollIntervalMs);
+    }
+  }
+
+  throw new Error(
+    `Fork ${headOwner}/${repo} was not ready within ${Math.round(forkReadyTimeoutMs / 1000)}s: ${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    }`
+  );
+}
+
+function isNotFound(error: unknown): boolean {
+  return Boolean(error) && typeof error === "object" && (error as { status?: number }).status === 404;
 }
 
 function expectByterResult(args: Record<string, unknown>): void {

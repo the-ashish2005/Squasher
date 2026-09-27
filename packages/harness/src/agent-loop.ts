@@ -21,6 +21,24 @@ const guardedSchemas: Record<string, GuardSchema> = {
   create_fix_pull_request: createFixPullRequestSchema
 };
 
+/**
+ * Where an approved GitHub write is allowed to land. Resolved by the caller (the server,
+ * from its contribution policy) rather than by the model, so the write destination is never
+ * something the model chose. The decision is stamped into the tool arguments before the
+ * approval pause, which puts it inside the approval payload hash.
+ */
+export interface WriteTargetDecision {
+  allowed: boolean;
+  /** Account that will hold the fix branch. Omit for a same-repository write. */
+  headOwner?: string;
+  reason?: string;
+}
+
+export type WriteTargetResolver = (input: {
+  owner: string;
+  repo: string;
+}) => Promise<WriteTargetDecision> | WriteTargetDecision;
+
 export interface AgentLoopOptions {
   store: SessionStore;
   sessionId: string;
@@ -29,6 +47,7 @@ export interface AgentLoopOptions {
   dispatcher: ToolDispatcher;
   iterationLimit?: number;
   approvalRequiredTools?: string[];
+  resolveWriteTarget?: WriteTargetResolver;
 }
 
 /**
@@ -111,11 +130,34 @@ export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
           break;
         }
 
+        // Decide the write destination before pausing, so the approver sees it and the
+        // approval hash covers it. A refusal is reported back to the model rather than
+        // failing the turn: the proof is already submitted and still worth keeping.
+        const target = await resolveWriteTargetFor(options, toolCall.name, validated.value);
+        if (!target.allowed) {
+          const refusal = `GitHub write refused by contribution policy: ${target.reason ?? "not permitted"}`;
+          store.appendEvent(sessionId, turnId, {
+            type: "tool.response",
+            toolCallId: toolCall.id,
+            content: refusal
+          });
+          store.appendMessages(sessionId, [
+            { role: "tool", toolCallId: toolCall.id, content: refusal },
+            {
+              role: "user",
+              content:
+                "The gated GitHub write was refused by policy, not by a maintainer. Do not retry it. " +
+                "Return the same byter.result object as your final response so the evidence is preserved."
+            }
+          ]);
+          continue;
+        }
+
         pauseForApproval(store, sessionId, turnId, {
           toolCallId: toolCall.id,
           sourceEventId,
           name: toolCall.name,
-          arguments: validated.value
+          arguments: target.arguments
         });
         return;
       }
@@ -282,6 +324,79 @@ function validateForPause(
   return { ok: false, problem, exhausted: attempts > 1 };
 }
 
+/**
+ * Applies the caller's write-target policy to a gated tool call. Tools other than the
+ * pull request write are unaffected, and an absent resolver preserves same-repository
+ * behaviour exactly.
+ */
+async function resolveWriteTargetFor(
+  options: AgentLoopOptions,
+  toolName: string,
+  args: Record<string, unknown>
+): Promise<{ allowed: true; arguments: Record<string, unknown> } | { allowed: false; reason?: string }> {
+  if (toolName !== "create_fix_pull_request" || !options.resolveWriteTarget) {
+    return { allowed: true, arguments: args };
+  }
+
+  const owner = typeof args.owner === "string" ? args.owner : "";
+  const repo = typeof args.repo === "string" ? args.repo : "";
+  if (owner.length === 0 || repo.length === 0) {
+    // Let the write tool's own argument validation produce the error message.
+    return { allowed: true, arguments: args };
+  }
+
+  let decision: WriteTargetDecision;
+  try {
+    decision = await options.resolveWriteTarget({ owner, repo });
+  } catch (error) {
+    return {
+      allowed: false,
+      reason: `contribution policy could not be resolved: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  if (!decision.allowed) {
+    return { allowed: false, ...(decision.reason !== undefined ? { reason: decision.reason } : {}) };
+  }
+
+  if (!decision.headOwner || decision.headOwner === owner) {
+    return { allowed: true, arguments: args };
+  }
+
+  // Crossing into someone else's repository, so disclosure is not left to the model.
+  // Added before the pause, which means the approver reads the exact body that will ship.
+  const body = typeof args.body === "string" ? args.body : "";
+  return {
+    allowed: true,
+    arguments: { ...args, headOwner: decision.headOwner, body: withContributionDisclosure(body) }
+  };
+}
+
+export const contributionDisclosureMarker = "<!-- byter:disclosure -->";
+
+/**
+ * Appends an automated-contribution disclosure. Idempotent, so a resubmitted body is not
+ * stamped twice.
+ */
+export function withContributionDisclosure(body: string): string {
+  if (body.includes(contributionDisclosureMarker)) {
+    return body;
+  }
+
+  return [
+    body.trimEnd(),
+    "",
+    "---",
+    contributionDisclosureMarker,
+    "**Automated contribution.** This pull request was prepared by [Byter](https://github.com/the-ashish2005/Squasher), " +
+      "an automated agent that reproduces a reported defect in a sandbox before proposing a fix. " +
+      "A human reviewed and approved this patch before it was opened.",
+    "",
+    "No maintainer requested this change. Please close it without hesitation if it is unwanted, " +
+      "out of scope, or does not meet the project's standards."
+  ].join("\n");
+}
+
 function pauseForApproval(
   store: SessionStore,
   sessionId: string,
@@ -303,9 +418,12 @@ function pauseForApproval(
 
   // No turn.done here: the turn is paused, and emitting both would make the server
   // treat it as completed and request a redundant proof-contract continuation.
+  // headOwner travels on the event so the server can verify the paused destination against
+  // its own contribution decision without reaching into harness internals.
   store.appendEvent(sessionId, turnId, {
     type: "tool.approval_required",
     threadId: mainThreadId,
+    ...(typeof call.arguments.headOwner === "string" ? { headOwner: call.arguments.headOwner } : {}),
     toolCalls: [{ id: call.toolCallId, sourceEventId: call.sourceEventId }]
   });
   store.setTurnStatus(sessionId, turnId, "paused");

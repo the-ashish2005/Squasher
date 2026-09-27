@@ -18,7 +18,11 @@ import type {
   TrueForgeRuntimeEventListener,
   TrueForgeRuntimeEvent
 } from "@byter/agent";
-import { ByterHarness, defaultLlmModel } from "@byter/harness";
+import { ByterHarness, defaultLlmModel, type WriteTargetDecision } from "@byter/harness";
+import {
+  resolveContributionTarget,
+  type ContributionTarget
+} from "./contribution.js";
 import { canTransition, createRun, scanIssueText, transitionRun } from "@byter/core";
 import {
   GitHubRestClient,
@@ -48,6 +52,12 @@ export interface ByterServerOptions {
   trueForgeRuntime?: ByterSessionStarter;
   mcpHandler?: McpRequestHandler;
   githubClient?: GitHubRestClientLike;
+  /**
+   * Shared contribution decisions. Supply this alongside an injected `trueForgeRuntime` so the
+   * harness consults the same decisions this server records; omitting it still fails closed,
+   * because the approval path refuses a write the decision does not cover.
+   */
+  contributions?: ContributionRegistry;
 }
 
 type McpRequestHandler = (request: IncomingMessage, response: ServerResponse) => Promise<void>;
@@ -70,6 +80,8 @@ interface TrueForgePendingApproval {
   sourceEventId?: string;
   toolName: "create_fix_pull_request";
   payloadHash: string;
+  /** Account the paused write would push the fix branch to, when it is not the upstream owner. */
+  headOwner?: string;
 }
 
 interface LiveProofResult {
@@ -133,6 +145,7 @@ interface PersistedWebhookRunRecord {
   verifiedLabel?: { name: "byter:verified"; appliedAt?: string; error?: string };
   approvalLabel?: { name: "byter:awaiting-approval"; appliedAt?: string; error?: string };
   lifecycleLabels?: Array<{ name: string; appliedAt?: string; error?: string }>;
+  contribution?: ContributionTarget;
   run: ReturnType<typeof createRun>;
   scan: ReturnType<typeof scanIssueText>;
   trueForge: {
@@ -161,7 +174,8 @@ export function createByterServer(options: ByterServerOptions = {}): Server {
     });
   }
   const githubClient = options.githubClient ?? githubClientFromEnv();
-  const trueForgeRuntime = options.trueForgeRuntime ?? trueForgeRuntimeFromEnv(githubClient);
+  const contributions = options.contributions ?? new ContributionRegistry();
+  const trueForgeRuntime = options.trueForgeRuntime ?? trueForgeRuntimeFromEnv(githubClient, contributions);
   const mcpHandler = options.mcpHandler ?? githubMcpHandlerFromEnv(githubClient);
   const activeIssueTriggers = new Set<string>();
 
@@ -206,7 +220,8 @@ export function createByterServer(options: ByterServerOptions = {}): Server {
           trueForgeRuntime,
           githubClient,
           activeIssueTriggers,
-          postgresStore
+          postgresStore,
+          contributions
         );
         return;
       }
@@ -231,7 +246,8 @@ async function handleGitHubWebhook(
   trueForgeRuntime: ByterSessionStarter | undefined,
   githubClient: GitHubRestClientLike | undefined,
   activeIssueTriggers: Set<string>,
-  postgresStore?: PostgresStore
+  postgresStore?: PostgresStore,
+  contributions: ContributionRegistry = new ContributionRegistry()
 ): Promise<void> {
   if (request.method !== "POST") {
     sendJson(response, 405, { error: "Method not allowed" });
@@ -302,7 +318,18 @@ async function handleGitHubWebhook(
     return;
   }
 
-  await processIssueWebhook(webhook, deliveryId, response, dataDir, githubClient, trueForgeRuntime, activeIssueTriggers, isExplicitRetrigger, postgresStore);
+  await processIssueWebhook(
+    webhook,
+    deliveryId,
+    response,
+    dataDir,
+    githubClient,
+    trueForgeRuntime,
+    activeIssueTriggers,
+    isExplicitRetrigger,
+    postgresStore,
+    contributions
+  );
 }
 
 async function processIssueWebhook(
@@ -314,7 +341,8 @@ async function processIssueWebhook(
   trueForgeRuntime: ByterSessionStarter | undefined,
   activeIssueTriggers: Set<string>,
   isExplicitRetrigger = false,
-  postgresStore?: PostgresStore
+  postgresStore?: PostgresStore,
+  contributions: ContributionRegistry = new ContributionRegistry()
 ): Promise<void> {
   const issueTriggerKey = triggerKeyFor(webhook);
   if (!isExplicitRetrigger) {
@@ -362,6 +390,16 @@ async function processIssueWebhook(
       scan.safeToExecute ? "triaging" : "rejected",
       scan.safeToExecute ? "Issue ready for TrueForge triage" : "Issue rejected by security policy"
     );
+    // Resolved before the agent starts, because the agent can reach the gated write at any
+    // point after that and the harness reads this decision when it pauses.
+    const contribution = await resolveContributionForRun(
+      contributions,
+      githubClient,
+      webhook.repository.owner.login,
+      webhook.repository.name,
+      scan.safeToExecute
+    );
+
     const orchestration = await startTrueForgeSessionForIssue(run, webhook, deliveryId, scan.safeToExecute, trueForgeRuntime);
     run = orchestration.run;
 
@@ -373,6 +411,7 @@ async function processIssueWebhook(
       issueTitle: webhook.issue.title,
       issueBody: webhook.issue.body ?? "",
       dashboardUrl: dashboardUrlFor(run.id),
+      contribution,
       run,
       scan,
       trueForge: orchestration.trueForge
@@ -945,6 +984,23 @@ async function executeApproval(
     return { statusCode: 409, body: { error: "Live run is not awaiting approval" } };
   }
 
+  if (actionId === "approve-pr") {
+    // Enforced here rather than only inside the harness: an injected runtime that never
+    // received the write-target resolver must fail closed, not write to the upstream
+    // repository. This is the authoritative gate.
+    const policy = contributionApprovalBlocker(liveRecord);
+    if (policy) {
+      return { statusCode: 409, body: { error: policy } };
+    }
+
+    // A paused run can sit for hours, so the destination is re-checked at the moment of
+    // approval rather than trusting the state observed when the patch was produced.
+    const drift = await upstreamDriftBlocker(liveRecord, githubClient);
+    if (drift) {
+      return { statusCode: 409, body: { error: drift } };
+    }
+  }
+
   if (actionId !== "approve-pr") {
     let run = liveRecord.run;
     let trueForge = liveRecord.trueForge;
@@ -1297,11 +1353,123 @@ const provenRunStatuses = new Set([
   "rejected"
 ]);
 
+/**
+ * Resolves and registers where this run may write. A run whose issue failed the security
+ * scan is never a write candidate, so the probe is skipped and the run is pinned to triage.
+ */
+async function resolveContributionForRun(
+  contributions: ContributionRegistry,
+  githubClient: GitHubRestClientLike | undefined,
+  owner: string,
+  repo: string,
+  safeToExecute: boolean
+): Promise<ContributionTarget> {
+  const blocked = (reason: string): ContributionTarget => ({
+    mode: "triage",
+    headOwner: owner,
+    upstreamPushAccess: false,
+    archived: false,
+    reason
+  });
+
+  let target: ContributionTarget;
+  if (!githubClient) {
+    target = blocked("No GitHub client is configured, so no write is possible");
+  } else if (!safeToExecute) {
+    target = blocked("Issue was rejected by the security scan, so no GitHub write is attempted");
+  } else {
+    try {
+      target = await resolveContributionTarget({ client: githubClient, owner, repo });
+    } catch (error) {
+      target = blocked(
+        `Contribution policy could not be resolved: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  contributions.set(owner, repo, target);
+  return target;
+}
+
+/**
+ * Refuses an approval that the run's recorded contribution decision does not permit, and
+ * refuses a write whose paused destination disagrees with that decision.
+ *
+ * This is deliberately independent of the harness: the harness stamps the destination so the
+ * approver can see it and the payload hash covers it, but a runtime injected without the
+ * write-target resolver would stamp nothing, and an unstamped write goes to the upstream
+ * repository. Checking here means that case is refused rather than silently written.
+ */
+function contributionApprovalBlocker(record: PersistedWebhookRunRecord): string | undefined {
+  const contribution = record.contribution;
+  if (!contribution) {
+    // Records written before contribution modes carry no decision; leave them as they were.
+    return undefined;
+  }
+
+  if (contribution.mode === "triage") {
+    return `This run may not write to GitHub: ${contribution.reason}`;
+  }
+
+  // An unstamped write defaults to the upstream repository, which in fork mode is exactly
+  // the destination that has no push access, so this single comparison covers both a
+  // mis-stamped destination and a harness that stamped nothing at all.
+  const pausedHeadOwner = record.trueForge.pendingApproval?.headOwner ?? record.run.issue.owner;
+  if (pausedHeadOwner !== contribution.headOwner) {
+    return (
+      `The paused write targets ${pausedHeadOwner} but this run resolved to ${contribution.headOwner}. ` +
+      "Refusing rather than writing to an unverified destination."
+    );
+  }
+
+  return undefined;
+}
+
+/**
+ * Re-reads the upstream repository at approval time and reports why the write must not
+ * proceed, or undefined when nothing has drifted. Only decisive, cheap checks belong here:
+ * a probe failure is not treated as a blocker, because that would make every approval
+ * dependent on GitHub being reachable at that instant.
+ */
+async function upstreamDriftBlocker(
+  record: PersistedWebhookRunRecord,
+  githubClient: GitHubRestClientLike | undefined
+): Promise<string | undefined> {
+  if (!githubClient?.getRepository) {
+    return undefined;
+  }
+
+  const { owner, repo } = record.run.issue;
+  let probe: Awaited<ReturnType<NonNullable<GitHubRestClientLike["getRepository"]>>>;
+  try {
+    probe = await githubClient.getRepository(owner, repo);
+  } catch {
+    return undefined;
+  }
+
+  if (probe.archived === true || probe.disabled === true) {
+    return `${owner}/${repo} was archived or disabled after this patch was prepared, so it no longer accepts writes`;
+  }
+
+  if (record.baseBranch && probe.default_branch && record.baseBranch !== probe.default_branch) {
+    return `${owner}/${repo} changed its default branch from ${record.baseBranch} to ${probe.default_branch} after this patch was prepared; re-run the issue against the new base`;
+  }
+
+  return undefined;
+}
+
+/** Issue labels and comments are upstream writes, so they need push access to upstream. */
+function canWriteToUpstream(record: PersistedWebhookRunRecord): boolean {
+  // An absent decision means this record predates contribution modes; preserve the old
+  // attempt-and-swallow behaviour rather than silently going quiet on existing deployments.
+  return record.contribution === undefined || record.contribution.upstreamPushAccess;
+}
+
 async function syncLifecycleLabels(
   record: PersistedWebhookRunRecord,
   githubClient: GitHubRestClientLike | undefined
 ): Promise<PersistedWebhookRunRecord> {
-  if (!githubClient) return record;
+  if (!githubClient || !canWriteToUpstream(record)) return record;
   const desired = desiredLifecycleLabels(record);
   const owner = record.run.issue.owner;
   const repo = record.run.issue.repo;
@@ -1343,7 +1511,7 @@ async function applyVerifiedLabel(
   record: PersistedWebhookRunRecord,
   githubClient: GitHubRestClientLike | undefined
 ): Promise<PersistedWebhookRunRecord> {
-  if (!githubClient || record.verifiedLabel || !hasGenuineProof(record.trueForge.result)) {
+  if (!githubClient || !canWriteToUpstream(record) || record.verifiedLabel || !hasGenuineProof(record.trueForge.result)) {
     return record;
   }
 
@@ -1384,6 +1552,7 @@ async function applyAwaitingApprovalLabel(
 ): Promise<PersistedWebhookRunRecord> {
   if (
     !githubClient ||
+    !canWriteToUpstream(record) ||
     record.approvalLabel ||
     record.run.status !== "awaiting-approval" ||
     !hasGenuineProof(record.trueForge.result)
@@ -1497,7 +1666,7 @@ async function appendGitHubComment(
   githubClient: GitHubRestClientLike | undefined,
   kind: GitHubCommentKind
 ): Promise<PersistedWebhookRunRecord> {
-  if (!githubClient) {
+  if (!githubClient || !canWriteToUpstream(record)) {
     return record;
   }
 
@@ -2267,6 +2436,7 @@ function extractTrueForgePendingApproval(
     const raw = unwrapRuntimeEvent(event.raw);
     if (!isRecord(raw)) continue;
     const threadId = firstString(raw, ["threadId", "thread_id"]) ?? "main";
+    const headOwner = firstString(raw, ["headOwner", "head_owner"]);
     const toolCallRefs = Array.isArray(raw.toolCalls) ? raw.toolCalls : Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
 
     for (const ref of toolCallRefs) {
@@ -2284,6 +2454,7 @@ function extractTrueForgePendingApproval(
         threadId,
         toolCallId,
         ...(sourceEventId ? { sourceEventId } : {}),
+        ...(headOwner ? { headOwner } : {}),
         toolName: "create_fix_pull_request",
         payloadHash: expectedPayloadHash
       };
@@ -2295,6 +2466,7 @@ function extractTrueForgePendingApproval(
         turnId,
         threadId,
         toolCallId: fallbackCall.id,
+        ...(headOwner ? { headOwner } : {}),
         toolName: "create_fix_pull_request",
         payloadHash: expectedPayloadHash
       };
@@ -3339,7 +3511,10 @@ function githubMcpHandlerFromEnv(githubClient: GitHubRestClientLike | undefined)
   });
 }
 
-function trueForgeRuntimeFromEnv(githubClient: GitHubRestClientLike | undefined): ByterSessionStarter | undefined {
+function trueForgeRuntimeFromEnv(
+  githubClient: GitHubRestClientLike | undefined,
+  contributions: ContributionRegistry
+): ByterSessionStarter | undefined {
   if (!githubClient || !process.env.DEEPSEEK_API_KEY || !process.env.E2B_API_KEY) {
     return undefined;
   }
@@ -3349,8 +3524,50 @@ function trueForgeRuntimeFromEnv(githubClient: GitHubRestClientLike | undefined)
       modelName: process.env.DEEPSEEK_MODEL ?? defaultLlmModel,
       modelProvider: process.env.MODEL_PROVIDER ?? "deepseek"
     },
-    ByterHarness.fromEnv(githubClient)
+    ByterHarness.fromEnv(githubClient, {
+      resolveWriteTarget: ({ owner, repo }) => contributions.decide(owner, repo)
+    })
   );
+}
+
+/**
+ * Per-server cache of contribution decisions, keyed by repository. Populated once per run at
+ * webhook intake and read by the harness when it is about to pause a GitHub write, so the
+ * write destination is decided by policy rather than by the model, and GitHub is probed once
+ * per run rather than once per tool call.
+ */
+export class ContributionRegistry {
+  private readonly entries = new Map<string, ContributionTarget>();
+
+  private static key(owner: string, repo: string): string {
+    return `${owner}/${repo}`.toLowerCase();
+  }
+
+  set(owner: string, repo: string, target: ContributionTarget): void {
+    this.entries.set(ContributionRegistry.key(owner, repo), target);
+  }
+
+  get(owner: string, repo: string): ContributionTarget | undefined {
+    return this.entries.get(ContributionRegistry.key(owner, repo));
+  }
+
+  decide(owner: string, repo: string): WriteTargetDecision {
+    const target = this.get(owner, repo);
+    if (!target) {
+      // No decision was recorded for this repository, so nothing has established that a
+      // write is permitted. Fail closed rather than defaulting to the upstream repository.
+      return {
+        allowed: false,
+        reason: `no contribution decision was recorded for ${owner}/${repo}`
+      };
+    }
+
+    if (target.mode === "triage") {
+      return { allowed: false, reason: target.reason };
+    }
+
+    return { allowed: true, headOwner: target.headOwner };
+  }
 }
 
 function defaultStaticDir(): string {

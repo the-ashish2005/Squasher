@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { GitHubRestClient } from "../src/index.js";
+import { GitHubApiError, GitHubRestClient, validateHeadRef } from "../src/index.js";
+
+function jsonFetch(handler: (url: string, init: RequestInit) => unknown, status = 200) {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init ?? {} });
+    return new Response(JSON.stringify(handler(String(url), init ?? {})), {
+      status,
+      headers: { "Content-Type": "application/json" }
+    });
+  }) as typeof fetch;
+  return { calls, fetchImpl };
+}
 
 describe("GitHubRestClient", () => {
   it("uses GitHub REST headers and encodes content path segments", async () => {
@@ -171,6 +183,106 @@ describe("GitHubRestClient", () => {
       color: "8250df",
       description: "Issue verified by reproducible evidence"
     });
+  });
+
+  it("accepts a cross-fork head ref and keeps branch names colon-free", () => {
+    expect(validateHeadRef("byter/fix-17")).toBe("byter/fix-17");
+    expect(validateHeadRef("contributor:byter/fix-17")).toBe("contributor:byter/fix-17");
+
+    // A second colon, an empty side, or a colon inside the owner must never reach the API.
+    expect(() => validateHeadRef("a:b:c")).toThrow("Invalid GitHub pull request head ref");
+    expect(() => validateHeadRef(":byter/fix-17")).toThrow("Invalid GitHub pull request head ref");
+    expect(() => validateHeadRef("contributor:")).toThrow("Invalid GitHub branch name");
+    expect(() => validateHeadRef("owner/name:branch")).toThrow("Invalid GitHub pull request head ref");
+  });
+
+  it("refuses a colon in every ref-writing path", async () => {
+    const client = new GitHubRestClient({
+      token: "token",
+      fetchImpl: (() => {
+        throw new Error("fetch should not be called");
+      }) as typeof fetch
+    });
+
+    // validateHeadRef must not have loosened the guards on ref creation and deletion.
+    await expect(client.createBranch("owner", "repo", "fork:branch", "a".repeat(40))).rejects.toThrow(
+      "Invalid GitHub branch name"
+    );
+    await expect(client.deleteBranch("owner", "repo", "fork:branch")).rejects.toThrow("Invalid GitHub branch name");
+    await expect(client.getBranch("owner", "repo", "fork:branch")).rejects.toThrow("Invalid GitHub branch name");
+  });
+
+  it("sends maintainer_can_modify only for a cross-fork pull request", async () => {
+    const crossRepo = jsonFetch(() => ({ number: 3, html_url: "https://github.test/pull/3" }), 201);
+    const client = new GitHubRestClient({
+      token: "token",
+      apiBaseUrl: "https://api.github.test",
+      fetchImpl: crossRepo.fetchImpl
+    });
+
+    await client.createPullRequest("upstream", "repo", {
+      title: "Fix",
+      body: "Body",
+      head: "contributor:byter/fix-1",
+      base: "main"
+    });
+    await client.createPullRequest("upstream", "repo", {
+      title: "Fix",
+      body: "Body",
+      head: "byter/fix-1",
+      base: "main"
+    });
+
+    const crossBody = JSON.parse(crossRepo.calls[0]?.init.body as string);
+    const sameBody = JSON.parse(crossRepo.calls[1]?.init.body as string);
+    expect(crossBody).toMatchObject({ head: "contributor:byter/fix-1", draft: true, maintainer_can_modify: true });
+    expect(sameBody.maintainer_can_modify).toBeUndefined();
+  });
+
+  it("reads repository metadata, the authenticated account, and starts a fork", async () => {
+    const { calls, fetchImpl } = jsonFetch((url) => {
+      if (url.endsWith("/user")) return { login: "contributor" };
+      if (url.endsWith("/forks")) return { full_name: "contributor/repo", owner: { login: "contributor" }, html_url: "https://github.test/contributor/repo" };
+      return { full_name: "upstream/repo", default_branch: "main", private: false, fork: false, permissions: { push: false }, owner: { login: "upstream" }, html_url: "https://github.test/upstream/repo" };
+    });
+    const client = new GitHubRestClient({ token: "token", apiBaseUrl: "https://api.github.test", fetchImpl });
+
+    const repository = await client.getRepository("upstream", "repo");
+    const user = await client.getAuthenticatedUser();
+    const fork = await client.forkRepository("upstream", "repo");
+
+    expect(repository.permissions?.push).toBe(false);
+    expect(user.login).toBe("contributor");
+    expect(fork.owner.login).toBe("contributor");
+    expect(calls.map((call) => call.url)).toEqual([
+      "https://api.github.test/repos/upstream/repo",
+      "https://api.github.test/user",
+      "https://api.github.test/repos/upstream/repo/forks"
+    ]);
+    expect(calls[2]?.init.method).toBe("POST");
+  });
+
+  it("lists open pull requests with a cross-fork head filter", async () => {
+    const { calls, fetchImpl } = jsonFetch(() => []);
+    const client = new GitHubRestClient({ token: "token", apiBaseUrl: "https://api.github.test", fetchImpl });
+
+    await client.listPullRequests("upstream", "repo", { state: "open", head: "contributor:byter/fix-1" });
+
+    expect(calls[0]?.url).toBe(
+      "https://api.github.test/repos/upstream/repo/pulls?state=open&per_page=100&head=contributor%3Abyter%2Ffix-1"
+    );
+  });
+
+  it("carries the HTTP status on a failure so a missing fork is distinguishable", async () => {
+    const fetchImpl = (async () => new Response("Not Found", { status: 404, statusText: "Not Found" })) as typeof fetch;
+    const client = new GitHubRestClient({ token: "token", apiBaseUrl: "https://api.github.test", fetchImpl });
+
+    // A not-yet-created fork answers 404, which the fork poll must tell apart from a 403.
+    await expect(client.getRepository("contributor", "repo")).rejects.toMatchObject({
+      name: "GitHubApiError",
+      status: 404
+    });
+    await expect(client.getRepository("contributor", "repo")).rejects.toBeInstanceOf(GitHubApiError);
   });
 
   it("reads collaborator permissions and removes issue labels", async () => {

@@ -220,3 +220,157 @@ describe("GitHub MCP tools", () => {
     expect(client.deleteBranch).toHaveBeenCalledWith("o", "r", "byter/fix-9");
   });
 });
+
+describe("fork-based pull requests", () => {
+  const upstream = { owner: "upstream", repo: "project" };
+  const forkArgs = {
+    ...upstream,
+    headOwner: "contributor",
+    baseBranch: "main",
+    branchName: "byter/fix-42",
+    title: "Fix trailing slash handling",
+    body: "Verified by Byter.",
+    files: [{ path: "src/paths.ts", content: "export const fixed = true;\n" }]
+  };
+
+  function forkClient(overrides: Record<string, unknown> = {}) {
+    return {
+      getRepository: vi.fn().mockResolvedValue({ full_name: "contributor/project", default_branch: "main" }),
+      getBranch: vi.fn().mockResolvedValue({ commit: { sha: "a".repeat(40) } }),
+      getCommit: vi.fn().mockResolvedValue({ tree: { sha: "b".repeat(40) } }),
+      createTree: vi.fn().mockResolvedValue({ sha: "c".repeat(40) }),
+      createCommit: vi.fn().mockResolvedValue({ sha: "d".repeat(40) }),
+      createBranch: vi.fn().mockResolvedValue(undefined),
+      deleteBranch: vi.fn().mockResolvedValue(undefined),
+      createPullRequest: vi.fn().mockResolvedValue({ number: 7, html_url: "https://github.test/pull/7" }),
+      ...overrides
+    };
+  }
+
+  function approvalFor(args: Record<string, unknown>) {
+    return { approved: true, expectedPayloadHash: approvalPayloadHash("create_fix_pull_request", args) };
+  }
+
+  it("writes the branch into the fork and opens the pull request upstream", async () => {
+    const client = forkClient();
+    const tools = createGitHubMcpTools({ client: client as never, sleep: async () => {} });
+
+    const result = await tools.callTool({
+      name: "create_fix_pull_request",
+      arguments: forkArgs,
+      approval: approvalFor(forkArgs)
+    });
+
+    // The base is read from upstream so a stale fork cannot widen the diff.
+    expect(client.getBranch).toHaveBeenCalledWith("upstream", "project", "main");
+    expect(client.getCommit).toHaveBeenCalledWith("upstream", "project", "a".repeat(40));
+
+    // Every write lands in the fork.
+    expect(client.createTree).toHaveBeenCalledWith("contributor", "project", expect.objectContaining({ baseTree: "b".repeat(40) }));
+    expect(client.createCommit).toHaveBeenCalledWith("contributor", "project", expect.objectContaining({ parents: ["a".repeat(40)] }));
+    expect(client.createBranch).toHaveBeenCalledWith("contributor", "project", "byter/fix-42", "d".repeat(40));
+
+    // Only the pull request itself touches upstream, and it crosses the fork boundary.
+    expect(client.createPullRequest).toHaveBeenCalledWith(
+      "upstream",
+      "project",
+      expect.objectContaining({ head: "contributor:byter/fix-42", base: "main", draft: true, maintainerCanModify: true })
+    );
+    expect(result.content[0]?.text).toContain('"crossRepo": true');
+  });
+
+  it("rolls back the branch in the fork, never in the upstream repository", async () => {
+    const client = forkClient({ createPullRequest: vi.fn().mockRejectedValue(new Error("pull request failed")) });
+    const tools = createGitHubMcpTools({ client: client as never, sleep: async () => {} });
+
+    await expect(
+      tools.callTool({ name: "create_fix_pull_request", arguments: forkArgs, approval: approvalFor(forkArgs) })
+    ).rejects.toThrow("pull request failed");
+
+    expect(client.deleteBranch).toHaveBeenCalledTimes(1);
+    expect(client.deleteBranch).toHaveBeenCalledWith("contributor", "project", "byter/fix-42");
+  });
+
+  it("covers the write destination with the approval hash", async () => {
+    const client = forkClient();
+    const tools = createGitHubMcpTools({ client: client as never, sleep: async () => {} });
+    const { headOwner: _ignored, ...sameRepoArgs } = forkArgs;
+
+    // An approval granted for a same-repository write cannot be replayed to push into
+    // another account: headOwner is part of the canonical payload.
+    await expect(
+      tools.callTool({
+        name: "create_fix_pull_request",
+        arguments: forkArgs,
+        approval: approvalFor(sameRepoArgs)
+      })
+    ).rejects.toThrow("approval payload hash mismatch");
+
+    expect(client.createBranch).not.toHaveBeenCalled();
+  });
+
+  it("treats an omitted headOwner as the upstream owner for hashing", () => {
+    const { headOwner: _ignored, ...withoutHeadOwner } = forkArgs;
+    const explicitUpstream = { ...withoutHeadOwner, headOwner: upstream.owner };
+
+    // Same meaning, so the same hash: existing approvals keep working unchanged.
+    expect(approvalPayloadHash("create_fix_pull_request", withoutHeadOwner)).toBe(
+      approvalPayloadHash("create_fix_pull_request", explicitUpstream)
+    );
+  });
+
+  it("waits for a fork that GitHub has not finished creating", async () => {
+    let probes = 0;
+    const client = forkClient({
+      getRepository: vi.fn().mockImplementation(async () => {
+        probes += 1;
+        if (probes < 3) {
+          throw Object.assign(new Error("GitHub API 404 Not Found"), { status: 404 });
+        }
+        return { full_name: "contributor/project", default_branch: "main" };
+      })
+    });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const tools = createGitHubMcpTools({ client: client as never, sleep });
+
+    await tools.callTool({ name: "create_fix_pull_request", arguments: forkArgs, approval: approvalFor(forkArgs) });
+
+    expect(probes).toBe(3);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(client.createBranch).toHaveBeenCalled();
+  });
+
+  it("gives up when the fork never becomes ready", async () => {
+    const client = forkClient({
+      getRepository: vi.fn().mockRejectedValue(Object.assign(new Error("GitHub API 404 Not Found"), { status: 404 }))
+    });
+    let clock = 0;
+    const tools = createGitHubMcpTools({
+      client: client as never,
+      now: () => clock,
+      sleep: async () => {
+        clock += 5_000;
+      }
+    });
+
+    await expect(
+      tools.callTool({ name: "create_fix_pull_request", arguments: forkArgs, approval: approvalFor(forkArgs) })
+    ).rejects.toThrow("was not ready within 30s");
+
+    expect(client.createBranch).not.toHaveBeenCalled();
+  });
+
+  it("does not retry a fork probe failure that is not a missing repository", async () => {
+    const client = forkClient({
+      getRepository: vi.fn().mockRejectedValue(Object.assign(new Error("GitHub API 403 Forbidden"), { status: 403 }))
+    });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const tools = createGitHubMcpTools({ client: client as never, sleep });
+
+    await expect(
+      tools.callTool({ name: "create_fix_pull_request", arguments: forkArgs, approval: approvalFor(forkArgs) })
+    ).rejects.toThrow("403 Forbidden");
+
+    expect(sleep).not.toHaveBeenCalled();
+  });
+});

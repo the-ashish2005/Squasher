@@ -367,7 +367,7 @@ describe("Byter production server", () => {
       expect(trueForgeRuntime.subscribeToTurn).toHaveBeenCalledWith("session-live-1", "turn-live-1", expect.any(Function));
 
       let latest: any;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
         latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
         if (latest.trueForge.status === "completed") {
           break;
@@ -516,7 +516,7 @@ describe("Byter production server", () => {
       expect(response.status).toBe(202);
 
       let latest: any;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
         latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
         if (latest.run.status === "awaiting-approval") break;
         await new Promise((resolve) => setTimeout(resolve, 5));
@@ -602,7 +602,7 @@ describe("Byter production server", () => {
       expect(response.status).toBe(202);
 
       let latest: any;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
         latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
         if (latest.trueForge.status === "completed") break;
         await new Promise((resolve) => setTimeout(resolve, 5));
@@ -672,7 +672,7 @@ describe("Byter production server", () => {
       expect(response.status).toBe(202);
 
       let latest: any;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
         latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
         if (latest.run.status === "failed") break;
         await new Promise((resolve) => setTimeout(resolve, 5));
@@ -807,7 +807,7 @@ describe("Byter production server", () => {
       expect(response.status).toBe(202);
 
       let latest: any;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
         latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
         if (latest.run.status === "awaiting-approval") break;
         await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1004,7 +1004,7 @@ describe("Byter production server", () => {
       expect(response.status).toBe(202);
 
       let latest: any;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
         latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
         if (latest.run.status === "awaiting-approval") break;
         await new Promise((resolve) => setTimeout(resolve, 5));

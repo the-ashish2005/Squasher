@@ -3,7 +3,8 @@ import {
   defaultIterationLimit,
   recordDeniedToolCall,
   resumeApprovedToolCall,
-  runAgentTurn
+  runAgentTurn,
+  type WriteTargetResolver
 } from "./agent-loop.js";
 import { LlmClient } from "./llm-client.js";
 import { E2bSandboxClient, type SandboxClientLike } from "./sandbox-client.js";
@@ -22,6 +23,12 @@ export interface ByterHarnessOptions {
   store?: SessionStore;
   dataDir?: string;
   commandTimeoutMs?: number;
+  /**
+   * Decides where an approved pull request may be written. Supplied by the server from its
+   * contribution policy. Omitted means same-repository writes, which is the behaviour for
+   * a repository the token can already push to.
+   */
+  resolveWriteTarget?: WriteTargetResolver;
 }
 
 /**
@@ -56,11 +63,15 @@ export class ByterHarness {
     };
   }
 
-  static fromEnv(client: GitHubRestClientLike): ByterHarness {
+  static fromEnv(
+    client: GitHubRestClientLike,
+    options: { resolveWriteTarget?: WriteTargetResolver } = {}
+  ): ByterHarness {
     return new ByterHarness({
       client,
       llm: LlmClient.fromEnv(),
-      sandbox: E2bSandboxClient.fromEnv()
+      sandbox: E2bSandboxClient.fromEnv(),
+      ...(options.resolveWriteTarget ? { resolveWriteTarget: options.resolveWriteTarget } : {})
     });
   }
 
@@ -123,7 +134,8 @@ export class ByterHarness {
         llm: this.options.llm,
         dispatcher: this.dispatcherFor(sessionId, turn.id),
         iterationLimit: spec.iterationLimit,
-        approvalRequiredTools: spec.approvalRequiredTools
+        approvalRequiredTools: spec.approvalRequiredTools,
+        ...(this.options.resolveWriteTarget ? { resolveWriteTarget: this.options.resolveWriteTarget } : {})
       })
     );
 

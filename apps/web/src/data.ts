@@ -91,6 +91,15 @@ export interface DashboardRun extends ReproRun {
   };
   patchDiff?: Array<{ path: string; before: string; after: string }>;
   pullRequest?: { number: number; url: string };
+  /** Where an approved write would land, so the approver sees the destination before deciding. */
+  contribution?: {
+    mode: "own" | "fork" | "triage";
+    reason: string;
+    /** Human-readable "head → base", present only when a write is possible. */
+    writeTarget?: string;
+    forkUrl?: string;
+    policyFindings?: Array<{ path: string; excerpt: string }>;
+  };
   proof?: { before?: string; after?: string; regressions?: string; attempts?: string };
   tests: Array<{ id: string; label: string; status: "passed" | "failed" | "pending"; detail: string; log?: string }>;
   harness: HarnessState;
@@ -111,6 +120,16 @@ interface WebhookRunRecord {
   githubComments?: Array<{ id?: number; url: string; kind: "started" | "completed" | "failed" | "approval"; createdAt: string }>;
   verifiedLabel?: { name: "byter:verified"; appliedAt?: string; error?: string };
   approvalLabel?: { name: "byter:awaiting-approval"; appliedAt?: string; error?: string };
+  contribution?: {
+    mode?: "own" | "fork" | "triage";
+    headOwner?: string;
+    upstreamPushAccess?: boolean;
+    reason?: string;
+    forkUrl?: string;
+    policyFindings?: Array<{ path: string; excerpt: string }>;
+    existingPullRequestUrl?: string;
+  };
+  baseBranch?: string;
   run: ReproRun;
   scan: SecurityScanResult;
   trueForge?: {
@@ -141,6 +160,34 @@ interface WebhookRunRecord {
       };
       pullRequest?: { number: number; url: string };
     };
+  };
+}
+
+/**
+ * Renders the write destination for the approval panel. Returns undefined for records that
+ * predate contribution modes, so those runs display exactly as before.
+ */
+function describeContribution(
+  record: WebhookRunRecord,
+  branchName: string | undefined
+): DashboardRun["contribution"] | undefined {
+  const contribution = record.contribution;
+  if (!contribution?.mode) {
+    return undefined;
+  }
+
+  const base = `${record.repository}:${record.baseBranch ?? "default branch"}`;
+  const head =
+    contribution.mode === "fork" && contribution.headOwner
+      ? `${contribution.headOwner}:${branchName ?? "fix branch"}`
+      : `${record.repository}:${branchName ?? "fix branch"}`;
+
+  return {
+    mode: contribution.mode,
+    reason: contribution.reason ?? "",
+    ...(contribution.mode === "triage" ? {} : { writeTarget: `${head} → ${base}` }),
+    ...(contribution.forkUrl ? { forkUrl: contribution.forkUrl } : {}),
+    ...(contribution.policyFindings?.length ? { policyFindings: contribution.policyFindings } : {})
   };
 }
 
@@ -181,6 +228,7 @@ export function toDashboardRunFromWebhook(record: WebhookRunRecord): DashboardRu
   const trace = (record.trueForge?.events ?? []).map(sanitizeTraceEvent);
   const commentHistory = record.githubComments ?? (record.githubStatusComment ? [{ ...record.githubStatusComment, kind: "legacy" as const, createdAt: record.receivedAt }] : []);
   const latestComment = commentHistory.at(-1);
+  const contribution = describeContribution(record, livePatch?.branchName);
 
   return {
     ...record.run,
@@ -218,6 +266,7 @@ export function toDashboardRunFromWebhook(record: WebhookRunRecord): DashboardRu
       : {}),
     ...(liveResult?.patchDiff ? { patchDiff: liveResult.patchDiff } : {}),
     ...(pullRequest ? { pullRequest } : {}),
+    ...(contribution ? { contribution } : {}),
     ...(liveResult?.proof ? { proof: compactProof(liveResult.proof) } : {}),
     tests: buildLiveTests(liveResult?.proof, trace),
     harness: {

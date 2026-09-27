@@ -48,6 +48,31 @@ export interface GitHubCollaboratorPermission {
   permission: string;
 }
 
+export interface GitHubRepository {
+  full_name: string;
+  default_branch: string;
+  private: boolean;
+  fork: boolean;
+  archived?: boolean;
+  disabled?: boolean;
+  html_url: string;
+  owner: { login: string };
+  /** Absent when the token cannot see permissions (for example an unauthenticated read). */
+  permissions?: { admin?: boolean; push?: boolean; pull?: boolean };
+}
+
+export interface GitHubAuthenticatedUser {
+  login: string;
+}
+
+export interface GitHubPullRequestSummary {
+  number: number;
+  html_url: string;
+  state: string;
+  draft?: boolean;
+  head: { ref: string; label: string };
+}
+
 export class GitHubRestClient {
   private readonly token: string;
   private readonly apiBaseUrl: string;
@@ -116,6 +141,46 @@ export class GitHubRestClient {
     return this.request<GitHubCollaboratorPermission>(
       `${repoBasePath(owner, repo)}/collaborators/${encodeURIComponent(expectNonEmpty(username, "GitHub username"))}/permission`
     );
+  }
+
+  async getRepository(owner: string, repo: string): Promise<GitHubRepository> {
+    return this.request<GitHubRepository>(repoBasePath(owner, repo));
+  }
+
+  async getAuthenticatedUser(): Promise<GitHubAuthenticatedUser> {
+    return this.request<GitHubAuthenticatedUser>("/user");
+  }
+
+  /**
+   * Starts a fork into the authenticated account. GitHub answers 202 before the fork
+   * exists, so callers must poll getRepository until it resolves.
+   */
+  async forkRepository(owner: string, repo: string): Promise<GitHubRepository> {
+    return this.request<GitHubRepository>(`${repoBasePath(owner, repo)}/forks`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+  }
+
+  /** Fast-forwards a fork's branch to its upstream. Only needed when a cross-network ref fails. */
+  async mergeUpstream(owner: string, repo: string, branch: string): Promise<void> {
+    await this.request(`${repoBasePath(owner, repo)}/merge-upstream`, {
+      method: "POST",
+      body: JSON.stringify({ branch: validateBranchName(branch) })
+    });
+  }
+
+  async listPullRequests(
+    owner: string,
+    repo: string,
+    query: { state?: "open" | "closed" | "all"; head?: string } = {}
+  ): Promise<GitHubPullRequestSummary[]> {
+    const params = new URLSearchParams({ state: query.state ?? "open", per_page: "100" });
+    if (query.head) {
+      params.set("head", validateHeadRef(query.head));
+    }
+
+    return this.request<GitHubPullRequestSummary[]>(`${repoBasePath(owner, repo)}/pulls?${params.toString()}`);
   }
 
   async createIssueComment(
@@ -237,16 +302,21 @@ export class GitHubRestClient {
       head: string;
       base: string;
       draft?: boolean;
+      maintainerCanModify?: boolean;
     }
   ): Promise<GitHubPullRequest> {
+    // head may be "branch" (same repo) or "forkOwner:branch" (cross repo).
+    const head = validateHeadRef(input.head);
     return this.request<GitHubPullRequest>(`${repoBasePath(owner, repo)}/pulls`, {
       method: "POST",
       body: JSON.stringify({
         title: expectNonEmpty(input.title, "pull request title"),
         body: input.body,
-        head: validateBranchName(input.head),
+        head,
         base: validateBranchName(input.base),
-        draft: input.draft ?? true
+        draft: input.draft ?? true,
+        // Only meaningful across a fork boundary; GitHub ignores it otherwise.
+        ...(head.includes(":") ? { maintainer_can_modify: input.maintainerCanModify ?? true } : {})
       })
     });
   }
@@ -266,7 +336,7 @@ export class GitHubRestClient {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`GitHub API ${response.status} ${response.statusText}: ${text}`);
+      throw new GitHubApiError(response.status, `GitHub API ${response.status} ${response.statusText}: ${text}`);
     }
 
     if (response.status === 204) {
@@ -275,6 +345,41 @@ export class GitHubRestClient {
 
     return (await response.json()) as T;
   }
+}
+
+/** Carries the HTTP status so callers can tell "fork not ready yet" (404) from a real failure. */
+export class GitHubApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "GitHubApiError";
+    this.status = status;
+  }
+}
+
+/**
+ * Validates a pull request head ref, which may cross a fork boundary as "owner:branch".
+ * Deliberately separate from validateBranchName: that one guards ref creation and deletion
+ * paths where a colon must never be accepted.
+ */
+export function validateHeadRef(head: string): string {
+  const separator = head.indexOf(":");
+  if (separator === -1) {
+    return validateBranchName(head);
+  }
+
+  if (head.indexOf(":", separator + 1) !== -1) {
+    throw new Error("Invalid GitHub pull request head ref");
+  }
+
+  const owner = head.slice(0, separator);
+  const branch = head.slice(separator + 1);
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)) {
+    throw new Error("Invalid GitHub pull request head ref");
+  }
+
+  return `${owner}:${validateBranchName(branch)}`;
 }
 
 function repoBasePath(owner: string, repo: string): string {

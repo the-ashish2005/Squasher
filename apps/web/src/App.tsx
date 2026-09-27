@@ -257,6 +257,7 @@ function ApprovalPanel({ run, currentStatus, pullRequest, approval, approvalErro
         </div>
         <div className="approval-meta"><span><FileCode2 size={13} />{patch.files.length} files ready for review</span></div>
         <ul className="file-list">{patch.files.map((file) => <li key={file}><FileCode2 size={14} />{file}</li>)}</ul>
+        <ContributionTarget contribution={run.contribution} />
         {currentStatus === "awaiting-approval" && !pullRequest ? <>
           <div className="preapproval-state"><ShieldCheck size={17} /><div><strong>Nothing has been written</strong><span>No branch, commit, or pull request exists until a maintainer approves.</span></div></div>
           <GitHubApprovalGuide />
@@ -265,6 +266,60 @@ function ApprovalPanel({ run, currentStatus, pullRequest, approval, approvalErro
         {pullRequest ? <a className="button button-success" href={pullRequest.url} target="_blank" rel="noreferrer"><GitPullRequestArrow size={17} />Open draft PR #{pullRequest.number}<ArrowUpRight size={15} /></a> : currentStatus === "awaiting-approval" ? <div className="approval-actions"><p className="control-label">Review decision</p>{run.approvals.map((action) => <ApprovalActionButton key={action.id} action={action} pending={pendingAction === action.id} disabled={pendingAction !== undefined} onClick={onApproval} />)}</div> : undefined}
       </> : <div className="empty-state"><RadioTower size={20} /><p>{run.events.at(-1)?.message ?? "Run is waiting for a candidate proof."}</p></div>}
     </section>
+  );
+}
+
+/**
+ * Names the exact destination of an approved write. Approving a write whose destination is
+ * not visible is the one thing the review page must never ask for, so this renders above the
+ * decision buttons whenever a contribution decision exists.
+ */
+function ContributionTarget({ contribution }: { contribution?: DashboardRun["contribution"] }) {
+  if (!contribution) return undefined;
+
+  if (contribution.mode === "triage") {
+    return (
+      <div className="contribution-target blocked">
+        <ShieldAlert size={17} />
+        <div>
+          <strong>No GitHub write will happen</strong>
+          <span>{contribution.reason}</span>
+          {contribution.policyFindings?.length ? (
+            <ul className="policy-findings">
+              {contribution.policyFindings.map((finding) => (
+                <li key={`${finding.path}:${finding.excerpt}`}>
+                  <code>{finding.path}</code> — “{finding.excerpt}”
+                </li>
+              ))}
+            </ul>
+          ) : undefined}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`contribution-target ${contribution.mode}`}>
+      <GitPullRequestArrow size={17} />
+      <div>
+        <strong>{contribution.mode === "fork" ? "Pull request from your fork" : "Pull request in this repository"}</strong>
+        <span className="write-target">{contribution.writeTarget}</span>
+        {contribution.mode === "fork" ? (
+          <span>
+            The fix branch is pushed to your fork, never to the upstream repository. The pull request
+            discloses that it was prepared by an automated agent.
+            {contribution.forkUrl ? (
+              <>
+                {" "}
+                <a href={contribution.forkUrl} target="_blank" rel="noreferrer">
+                  View fork<ArrowUpRight size={12} />
+                </a>
+              </>
+            ) : undefined}
+          </span>
+        ) : undefined}
+      </div>
+    </div>
   );
 }
 
