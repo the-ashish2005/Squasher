@@ -914,6 +914,344 @@ describe("Byter production server", () => {
     }
   });
 
+  it("surfaces the real GitHub error and lets a definitively failed write be retried", async () => {
+    // Reproduces a real live failure: approving a fork-based write whose fork was still
+    // finishing GitHub's own import returned a 403 on the first git write. The approval
+    // reconciliation's isSettled check only recognised a parsed pull request as "done", so
+    // it polled uselessly for its full budget and then reported a generic timeout message,
+    // discarding the real error that had already arrived. Worse, the dead turn it had
+    // already recorded was reused by every later approval click, so retrying could never
+    // make progress even once the underlying condition (the fork settling) cleared.
+    const staticDir = await mkdtemp(join(tmpdir(), "byter-static-"));
+    const liveDataDir = await mkdtemp(join(tmpdir(), "byter-data-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+    const proofText = JSON.stringify({
+      kind: "byter.result",
+      status: "patch-ready",
+      summary: "Reproduced 3/3 and passed the regression check.",
+      proof: { before: "3/3 failed", after: "3/3 passed", regressions: "passed", attempts: "3/3" },
+      candidatePatch: {
+        title: "Fix trailing slash handling",
+        body: "Verified by Byter.",
+        files: [{ path: "src/paths.ts", content: "export const fixed = true;\n" }]
+      }
+    });
+    const writeArguments = {
+      owner: "o",
+      repo: "r",
+      baseBranch: "main",
+      branchName: `byter/fix-30-${createHash("sha256").update("delivery-proof-30").digest("hex").slice(0, 10)}`,
+      title: "Fix trailing slash handling",
+      body: "Verified by Byter.",
+      files: [{ path: "src/paths.ts", content: "export const fixed = true;\n" }]
+    };
+    let resolveToolApprovalCalls = 0;
+    const trueForgeRuntime = {
+      startSession: vi.fn().mockResolvedValue({
+        session: { id: "session-proof-30", title: null },
+        turn: { id: "turn-proof-30", sessionId: "session-proof-30", status: "running" }
+      }),
+      resolveToolApproval: vi.fn().mockImplementation(async () => {
+        resolveToolApprovalCalls += 1;
+        return {
+          id: `turn-approval-30-${resolveToolApprovalCalls}`,
+          sessionId: "session-proof-30",
+          status: "running"
+        };
+      }),
+      subscribeToTurn: vi.fn().mockImplementation(async (_sessionId: string, turnId: string) => {
+        if (turnId === "turn-approval-30-1") {
+          // The first attempt's write fails definitively: no pull request, a real
+          // GitHub API error on the terminal event.
+          return [
+            { sequenceNumber: 8, type: "turn.done", raw: { event: {
+              type: "turn.done",
+              state: {
+                status: "error",
+                message:
+                  'Approved GitHub write failed: GitHub API 403 Forbidden: {"message":"Resource not accessible by personal access token","documentation_url":"https://docs.github.com/rest/git/trees#create-a-tree"}'
+              }
+            } } }
+          ];
+        }
+        if (turnId === "turn-approval-30-2") {
+          // The retry succeeds -- the underlying condition (the fork finishing import)
+          // has since cleared.
+          return [
+            { sequenceNumber: 9, type: "tool.response", raw: { event: {
+              id: "event-response-30",
+              type: "tool.response",
+              threadId: "thread-write-30",
+              toolCallId: "call-write-30",
+              content: JSON.stringify({ content: [{ type: "text", text: JSON.stringify({ number: 55, url: "https://github.test/pull/55" }) }] })
+            } } },
+            { sequenceNumber: 10, type: "turn.done", raw: { event: { type: "turn.done", state: { status: "done" } } } }
+          ];
+        }
+        return [
+          ...executableProofEvents("proof30", 3),
+          submittedResultEvent("proof30", 5, proofText),
+          { sequenceNumber: 6, type: "model.message", raw: { event: {
+            id: "event-write-30",
+            type: "model.message",
+            toolCalls: [{
+              id: "call-write-30",
+              type: "function",
+              function: { name: "create_fix_pull_request", arguments: JSON.stringify(writeArguments) }
+            }]
+          } } },
+          { sequenceNumber: 7, type: "tool.approval_required", raw: { event: {
+            id: "event-approval-30",
+            type: "tool.approval_required",
+            threadId: "thread-write-30",
+            toolCalls: [{ id: "call-write-30", sourceEventId: "event-write-30" }]
+          } } }
+        ];
+      })
+    };
+    const githubClient = {
+      createIssueComment: vi.fn().mockResolvedValue({ id: 701, html_url: "https://github.test/issues/30#issuecomment-701" }),
+      addLabels: vi.fn().mockResolvedValue(undefined),
+      updateIssueComment: vi.fn().mockImplementation(async (_owner: string, _repo: string, id: number) => ({ id, html_url: "https://github.test/issues/30#issuecomment-701" }))
+    } as any;
+    const server = createByterServer({ staticDir, dataDir: liveDataDir, trueForgeRuntime, githubClient });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    const isolatedBaseUrl = `http://127.0.0.1:${address.port}`;
+    const payload = JSON.stringify({
+      action: "opened",
+      issue: {
+        number: 30,
+        title: "Trailing slash bug",
+        body: "lastSegment throws on a trailing slash.",
+        html_url: "https://github.test/o/r/issues/30"
+      },
+      repository: { name: "r", full_name: "o/r", default_branch: "main", owner: { login: "o" } }
+    });
+
+    try {
+      const response = await fetch(`${isolatedBaseUrl}/api/github/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-GitHub-Event": "issues",
+          "X-GitHub-Delivery": "delivery-proof-30",
+          "X-Hub-Signature-256": signWebhookPayload(payload, "webhook-secret")
+        },
+        body: payload
+      });
+      expect(response.status).toBe(202);
+
+      let latest: any;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
+        if (latest.run.status === "awaiting-approval") break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(latest.run.status).toBe("awaiting-approval");
+
+      const approvalPayload = JSON.stringify({
+        action: "created",
+        issue: JSON.parse(payload).issue,
+        comment: { body: "approve", user: { login: "maintainer" }, author_association: "OWNER" },
+        repository: JSON.parse(payload).repository
+      });
+
+      const firstAttempt = await fetch(`${isolatedBaseUrl}/api/github/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-GitHub-Event": "issue_comment",
+          "X-GitHub-Delivery": "delivery-approval-30-first",
+          "X-Hub-Signature-256": signWebhookPayload(approvalPayload, "webhook-secret")
+        },
+        body: approvalPayload
+      });
+      const firstBody = await firstAttempt.json();
+
+      // The real error is surfaced, not a generic "did not reach terminal event" message.
+      expect(firstAttempt.status).toBe(502);
+      expect(firstBody.error).toContain("403 Forbidden");
+      expect(firstBody.error).toContain("create-a-tree");
+      expect(firstBody.error).not.toContain("did not reach its expected terminal event");
+
+      const afterFirstLines = (await readFile(join(liveDataDir, "webhook-runs.jsonl"), "utf8")).trim().split("\n");
+      const afterFirstRecord = JSON.parse(afterFirstLines.at(-1)!);
+      // The dead turn is cleared, not kept around to be re-polled forever.
+      expect(afterFirstRecord.trueForge.pendingApproval.approvalTurnId).toBeUndefined();
+      expect(afterFirstRecord.run.status).toBe("awaiting-approval");
+
+      // No receipt manipulation here: the last receipt on disk is already "write-failed"
+      // from the first attempt, which is exactly the condition that must permit a retry.
+      const retry = await fetch(`${isolatedBaseUrl}/api/github/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-GitHub-Event": "issue_comment",
+          "X-GitHub-Delivery": "delivery-approval-30-retry",
+          "X-Hub-Signature-256": signWebhookPayload(approvalPayload, "webhook-secret")
+        },
+        body: approvalPayload
+      });
+      const retryBody = await retry.json();
+
+      // The retry actually retried the write -- a second, fresh approval turn -- rather
+      // than re-polling the first, already-dead one.
+      expect(retry.status).toBe(200);
+      expect(retryBody.resultStatus).toBe("pr-created");
+      expect(retryBody.pullRequest.url).toBe("https://github.test/pull/55");
+      expect(trueForgeRuntime.resolveToolApproval).toHaveBeenCalledTimes(2);
+
+      const finalRun = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
+      expect(finalRun.run.status).toBe("pr-created");
+      expect(finalRun.trueForge.result.pullRequest).toEqual({ number: 55, url: "https://github.test/pull/55" });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
+  it("does not hang forever when subscribeToTurn never resolves", async () => {
+    // The harness's subscribeToTurn generator only terminates once it yields the turn's
+    // terminal event, and it can only yield events still in its in-memory history.
+    // Snapshots deliberately exclude events, so a session reloaded after a restart starts
+    // with none: re-subscribing to a turn from before that restart waits on events that
+    // will never arrive. Live: resuming an approval whose first attempt ran in a
+    // since-restarted process hung the approval request indefinitely. This never resolving
+    // mock stands in for that hang; without the timeout, this test would not complete.
+    const staticDir = await mkdtemp(join(tmpdir(), "byter-static-"));
+    const liveDataDir = await mkdtemp(join(tmpdir(), "byter-data-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+    const proofText = JSON.stringify({
+      kind: "byter.result",
+      status: "patch-ready",
+      summary: "Reproduced 3/3 and passed the regression check.",
+      proof: { before: "3/3 failed", after: "3/3 passed", regressions: "passed", attempts: "3/3" },
+      candidatePatch: {
+        title: "Fix trailing slash handling",
+        body: "Verified by Byter.",
+        files: [{ path: "src/paths.ts", content: "export const fixed = true;\n" }]
+      }
+    });
+    const writeArguments = {
+      owner: "o",
+      repo: "r",
+      baseBranch: "main",
+      branchName: `byter/fix-31-${createHash("sha256").update("delivery-proof-31").digest("hex").slice(0, 10)}`,
+      title: "Fix trailing slash handling",
+      body: "Verified by Byter.",
+      files: [{ path: "src/paths.ts", content: "export const fixed = true;\n" }]
+    };
+    const trueForgeRuntime = {
+      startSession: vi.fn().mockResolvedValue({
+        session: { id: "session-proof-31", title: null },
+        turn: { id: "turn-proof-31", sessionId: "session-proof-31", status: "running" }
+      }),
+      resolveToolApproval: vi.fn().mockResolvedValue({
+        id: "turn-approval-31",
+        sessionId: "session-proof-31",
+        status: "running"
+      }),
+      subscribeToTurn: vi.fn().mockImplementation(async (_sessionId: string, turnId: string) => {
+        if (turnId === "turn-approval-31") {
+          // Never resolves: the historical events this call needs are gone, and no
+          // waiter for this dead session will ever be released.
+          return new Promise(() => {});
+        }
+        return [
+          ...executableProofEvents("proof31", 3),
+          submittedResultEvent("proof31", 5, proofText),
+          { sequenceNumber: 6, type: "model.message", raw: { event: {
+            id: "event-write-31",
+            type: "model.message",
+            toolCalls: [{
+              id: "call-write-31",
+              type: "function",
+              function: { name: "create_fix_pull_request", arguments: JSON.stringify(writeArguments) }
+            }]
+          } } },
+          { sequenceNumber: 7, type: "tool.approval_required", raw: { event: {
+            id: "event-approval-31",
+            type: "tool.approval_required",
+            threadId: "thread-write-31",
+            toolCalls: [{ id: "call-write-31", sourceEventId: "event-write-31" }]
+          } } }
+        ];
+      }),
+      listSessionEvents: vi.fn().mockResolvedValue([])
+    };
+    const githubClient = {
+      createIssueComment: vi.fn().mockResolvedValue({ id: 703, html_url: "https://github.test/issues/31#issuecomment-703" }),
+      addLabels: vi.fn().mockResolvedValue(undefined),
+      updateIssueComment: vi.fn().mockImplementation(async (_owner: string, _repo: string, id: number) => ({ id, html_url: "https://github.test/issues/31#issuecomment-703" }))
+    } as any;
+    const server = createByterServer({ staticDir, dataDir: liveDataDir, trueForgeRuntime, githubClient });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    const isolatedBaseUrl = `http://127.0.0.1:${address.port}`;
+    const payload = JSON.stringify({
+      action: "opened",
+      issue: {
+        number: 31,
+        title: "Trailing slash bug",
+        body: "lastSegment throws on a trailing slash.",
+        html_url: "https://github.test/o/r/issues/31"
+      },
+      repository: { name: "r", full_name: "o/r", default_branch: "main", owner: { login: "o" } }
+    });
+
+    try {
+      const response = await fetch(`${isolatedBaseUrl}/api/github/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-GitHub-Event": "issues",
+          "X-GitHub-Delivery": "delivery-proof-31",
+          "X-Hub-Signature-256": signWebhookPayload(payload, "webhook-secret")
+        },
+        body: payload
+      });
+      expect(response.status).toBe(202);
+
+      let latest: any;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
+        if (latest.run.status === "awaiting-approval") break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(latest.run.status).toBe("awaiting-approval");
+
+      const approvalPayload = JSON.stringify({
+        action: "created",
+        issue: JSON.parse(payload).issue,
+        comment: { body: "approve", user: { login: "maintainer" }, author_association: "OWNER" },
+        repository: JSON.parse(payload).repository
+      });
+
+      // Reaching this assertion at all is the point: before the timeout fix, this request
+      // never completed.
+      const attempt = await fetch(`${isolatedBaseUrl}/api/github/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-GitHub-Event": "issue_comment",
+          "X-GitHub-Delivery": "delivery-approval-31",
+          "X-Hub-Signature-256": signWebhookPayload(approvalPayload, "webhook-secret")
+        },
+        body: approvalPayload
+      });
+
+      // The point of this test is that the request completes at all -- reaching any
+      // assertion here means the timeout worked, since before the fix this request never
+      // resolved. The specific error is the raw timeout, which takes priority over the
+      // generic "did not settle" message the same way any other stream failure does.
+      expect(attempt.status).toBe(502);
+      const body = await attempt.json();
+      expect(body.error).toContain("Timed out after");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  }, 10_000);
+
   it("matches a native approval when its source event wrapper differs", async () => {
     const staticDir = await mkdtemp(join(tmpdir(), "byter-static-"));
     const liveDataDir = await mkdtemp(join(tmpdir(), "byter-data-"));

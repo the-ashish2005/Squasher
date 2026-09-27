@@ -1128,16 +1128,22 @@ async function executeApproval(
       trueForgeRuntime,
       sessionId,
       turnId: approvalTurn.id,
+      // Settled on a parsed pull request (success) or a definitive turn.done error
+      // (failure). Without the second condition, a write that fails fast -- for example
+      // a fork still finishing GitHub's own import, which can 403 on the first git write
+      // for several minutes on a large repository even after its branch is readable --
+      // was invisible to this check: it kept polling for the full budget below and then
+      // reported a generic timeout, discarding the real error that had already arrived.
       isSettled: (evts) => {
         try {
           parsePullRequestFromTrueForgeEvents(evts, pendingApproval.toolCallId);
           return true;
         } catch {
-          return false;
+          return trueForgeTurnError(evts) !== undefined;
         }
       },
       maxPollAttempts: 30,
-      pollIntervalMs: 1000
+      pollIntervalMs: process.env.NODE_ENV === "test" ? 5 : 1000
     });
   } catch (error) {
     const failedReceipt = buildApprovalReceipt(
@@ -1155,14 +1161,40 @@ async function executeApproval(
   try {
     pullRequest = parsePullRequestFromTrueForgeEvents(approvalEvents, pendingApproval.toolCallId);
   } catch (error) {
+    // A definitive turn.done error names the real cause (a GitHub API error, for
+    // instance) and is always more useful than the generic parse failure below.
+    const turnError = trueForgeTurnError(approvalEvents);
     const failedReceipt = buildApprovalReceipt(
       runId,
       actionId,
       patchHash,
       "write-failed",
-      error instanceof Error ? error.message : "TrueForge did not return a pull request receipt"
+      turnError ?? (error instanceof Error ? error.message : "TrueForge did not return a pull request receipt")
     );
     await appendApprovalReceipt(dataDir, failedReceipt, postgresStore);
+
+    if (turnError) {
+      // The paused write definitively failed rather than merely running slowly, so the
+      // turn it was attempted on is dead. Clearing approvalTurnId here is what lets the
+      // next approval click start a fresh attempt instead of re-polling that dead turn
+      // forever -- which, before this fix, is exactly what happened: every retry landed
+      // on the same already-terminated turn and reported the same result. A run whose
+      // write failed only because a large fork was still finishing GitHub's own import
+      // (see the isSettled comment above) can then be retried once that settles, without
+      // starting the whole triage over.
+      await appendUpdatedLiveRecord(
+        dataDir,
+        {
+          ...approvalRecord,
+          trueForge: {
+            ...approvalRecord.trueForge,
+            pendingApproval: { ...pendingApproval, approvalTurnId: undefined }
+          }
+        },
+        postgresStore
+      );
+    }
+
     return { statusCode: 502, body: { error: failedReceipt.message } };
   }
   let run = approvalRecord.run;
@@ -2561,9 +2593,21 @@ async function reconcileSessionEvents(options: ReconcileSessionEventsOptions): P
   let streamError: unknown;
   if (turnId && trueForgeRuntime.subscribeToTurn) {
     try {
-      const streamed = await trueForgeRuntime.subscribeToTurn(sessionId, turnId, async (event) => {
-        await recordEvents([event]);
-      });
+      // subscribeToTurn has no timeout of its own: the harness's generator terminates
+      // once it yields a turn's terminal event, but only if that event is still in its
+      // in-memory history. A session reloaded from its snapshot after a restart starts
+      // with no history at all -- snapshots deliberately exclude events -- so
+      // re-subscribing to a turn from before the restart can wait on events that will
+      // never arrive and never resolve. Observed live: resuming an approval whose first
+      // attempt ran in a since-restarted process hung this call indefinitely. Bounding it
+      // to the same budget as the fallback poll below turns that hang into the ordinary,
+      // recoverable "did not settle" path instead of a stuck request.
+      const streamed = await withTimeout(
+        trueForgeRuntime.subscribeToTurn(sessionId, turnId, async (event) => {
+          await recordEvents([event]);
+        }),
+        maxPollAttempts * pollIntervalMs
+      );
       await recordEvents(streamed);
     } catch (err) {
       streamError = err;
@@ -2597,6 +2641,23 @@ async function reconcileSessionEvents(options: ReconcileSessionEventsOptions): P
   }
 
   throw new Error("TrueForge turn did not reach its expected terminal event before reconciliation timed out");
+}
+
+/** Rejects with a distinguishable error if `promise` has not settled within `timeoutMs`. */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 function runtimeEventKey(event: TrueForgeRuntimeEvent): string {
