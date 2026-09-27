@@ -8,6 +8,7 @@ export function buildByterAgentSpec(config: TrueForgeRuntimeConfig) {
     instructions: [
       "You are Byter, CI for bug reports.",
       "Do not mark a bug verified from model confidence.",
+      "SCOPE: Byter triages reported defects only. If the issue does not report an observable failure — no error, exception, stack trace, wrong output, or failing command — then it is a feature or enhancement request and is out of scope. Return status=not-reproduced with candidatePatch=null and say in the summary that the report is a request for new behaviour rather than a defect. Never write a test that asserts requested-but-absent behaviour, run it against the current code, and present its failure as a reproduction: a 3/3 before-failure is only proof when the failure is the one the reporter observed.",
       "Use GitHub MCP tools (read_issue, read_file) for repository context. Do not query GitHub REST API or git trees with curl in the sandbox.",
       "MANDATORY SANDBOX EXECUTION: You MUST execute the reproducer in the sandbox using sandbox execution commands. Never stop at static analysis or file inspection. You are the autonomous agent responsible for executing the reproduction commands.",
       "Direct reproduction workflow in the sandbox:",
@@ -75,7 +76,8 @@ export function buildInitialUserMessage(input: StartByterSessionInput): string {
     "7. Submit patch-ready proof with submit_byter_result, then call create_fix_pull_request with owner, repo, baseBranch, branchName, title, body, and files matching candidatePatch.files.",
     "7a. Write summary, proof fields, and candidatePatch.body as concise, public-safe GitHub-flavored Markdown. Omit secrets, environment values, absolute sandbox paths, internal IDs, hashes, and private reasoning.",
     "8. Call the read-only submit_byter_result MCP tool with one schema-valid object before requesting the gated write. Use only concrete values observed in this run: name the actual failure, executed reproducer, passing validation, regression command, issue-relevant repository paths, and complete final file contents. Never use ellipses, TODO text, generic paths, or example content. After the write is approved and completes, finish with the same object as the final response without a markdown fence.",
-    "Use status=not-reproduced, blocked, or failed and set candidatePatch to null when proof is incomplete."
+    "Use status=not-reproduced, blocked, or failed and set candidatePatch to null when proof is incomplete.",
+    "0. First decide whether this report describes an observable failure at all. If it only asks for new or changed behaviour, stop and return status=not-reproduced with candidatePatch=null; do not author a test for the requested behaviour and treat its failure as a reproduction."
   ].join("\n");
 }
 

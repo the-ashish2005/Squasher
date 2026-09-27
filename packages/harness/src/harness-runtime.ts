@@ -7,7 +7,12 @@ import {
 } from "./agent-loop.js";
 import { LlmClient } from "./llm-client.js";
 import { E2bSandboxClient, type SandboxClientLike } from "./sandbox-client.js";
-import { SessionStore, type HarnessEventEnvelope, type HarnessSessionSpec } from "./session-store.js";
+import {
+  SessionStore,
+  type HarnessEventEnvelope,
+  type HarnessIssueText,
+  type HarnessSessionSpec
+} from "./session-store.js";
 import { createToolDispatcher } from "./tool-dispatcher.js";
 
 export interface ByterHarnessOptions {
@@ -91,6 +96,20 @@ export class ByterHarness {
       ...(isFirstTurn ? [{ role: "system" as const, content: spec.instructions }] : []),
       { role: "user" as const, content }
     ]);
+
+    if (isFirstTurn) {
+      const issue = parseIssueText(content);
+      if (issue) {
+        this.store.setIssue(sessionId, issue);
+      } else {
+        // The scope check needs the report verbatim; without it a feature request could
+        // be accepted as a proven defect, so make the gap loud rather than silent.
+        console.warn(
+          `Byter harness could not read the issue text from the initial message for session ${sessionId}; ` +
+            "the out-of-scope proof check is inactive for this run"
+        );
+      }
+    }
 
     const turn = this.store.createTurn(sessionId, previousTurnId);
     this.store.appendEvent(sessionId, turn.id, { type: "turn.created" });
@@ -251,6 +270,19 @@ function parseSpec(request: unknown): HarnessSessionSpec {
     ],
     approvalRequiredTools: stringArray(mcpServer.requireApprovalForTools) ?? ["create_fix_pull_request"]
   };
+}
+
+/**
+ * Recovers the reported title and body from the message `buildInitialUserMessage`
+ * renders in packages/agent. Returns undefined rather than guessing if the expected
+ * markers are missing, so a format change disables the scope check loudly instead of
+ * silently feeding it prompt scaffolding.
+ */
+function parseIssueText(content: string): HarnessIssueText | undefined {
+  const title = /^Title:[ \t]*(.+)$/m.exec(content)?.[1]?.trim();
+  const body = /^Issue body:\n([\s\S]*?)(?:\n\nRequired proof path:|$)/m.exec(content)?.[1]?.trim();
+  if (!title || body === undefined) return undefined;
+  return { title, body };
 }
 
 function firstInput(request: unknown): Record<string, unknown> {

@@ -33,6 +33,12 @@ export interface HarnessAgentMessage {
   toolCalls?: Array<{ id: string; name: string; arguments: string }>;
 }
 
+/** The reported issue, kept so scope checks do not re-parse the rendered prompt. */
+export interface HarnessIssueText {
+  title: string;
+  body: string;
+}
+
 export interface HarnessSessionSpec {
   instructions: string;
   iterationLimit: number;
@@ -55,6 +61,7 @@ interface SessionSnapshot {
   turns: HarnessTurnRecord[];
   messages: HarnessAgentMessage[];
   pending?: PendingToolCall;
+  issue?: HarnessIssueText;
   nextSequenceNumber: number;
 }
 
@@ -67,6 +74,7 @@ interface SessionState {
   events: StoredEvent[];
   messages: HarnessAgentMessage[];
   pending?: PendingToolCall;
+  issue?: HarnessIssueText;
   sandboxId?: string;
   nextSequenceNumber: number;
   waiters: Array<() => void>;
@@ -131,6 +139,7 @@ export class SessionStore {
       turns: stored.turns ?? [],
       messages: stored.messages ?? [],
       ...(stored.pending ? { pending: stored.pending } : {}),
+      ...(stored.issue ? { issue: stored.issue } : {}),
       // Events are not snapshotted, but sequence numbers continue from where they
       // stopped so replayed events cannot collide with ones already on the dashboard.
       events: [],
@@ -290,6 +299,16 @@ export class SessionStore {
     this.persist(sessionId);
   }
 
+  issue(sessionId: string): HarnessIssueText | undefined {
+    const issue = this.sessions.get(sessionId)?.issue;
+    return issue ? { ...issue } : undefined;
+  }
+
+  setIssue(sessionId: string, issue: HarnessIssueText): void {
+    this.expect(sessionId).issue = { ...issue };
+    this.persist(sessionId);
+  }
+
   pending(sessionId: string): PendingToolCall | undefined {
     const pendingCall = this.sessions.get(sessionId)?.pending;
     return pendingCall ? { ...pendingCall } : undefined;
@@ -344,6 +363,7 @@ export class SessionStore {
       turns: session.turns,
       messages: session.messages,
       ...(session.pending ? { pending: session.pending } : {}),
+      ...(session.issue ? { issue: session.issue } : {}),
       nextSequenceNumber: session.nextSequenceNumber
     };
     const body = JSON.stringify(snapshot);

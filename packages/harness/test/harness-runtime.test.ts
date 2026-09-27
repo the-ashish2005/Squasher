@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { approvalPayloadHash, type GitHubRestClientLike } from "@byter/github-mcp";
-import { buildByterAgentSpec } from "@byter/agent";
+import { buildByterAgentSpec, buildInitialUserMessage } from "@byter/agent";
 import { ByterHarness } from "../src/harness-runtime.js";
 import { guardEventType, SessionStore } from "../src/session-store.js";
 import type { LlmClient, LlmResponse } from "../src/llm-client.js";
@@ -540,6 +540,92 @@ describe("byter harness runtime", () => {
     await expect(
       harness.sessions.createTurn("sess_does_not_exist", { input: [{ type: "user.message", content: "x" }] })
     ).rejects.toThrow(/Unknown harness session/);
+  });
+
+  it("refuses a claimed proof for a feature request and makes the model back down", async () => {
+    // Reproduces a real live run: the agent wrote its own acceptance test for a
+    // requested button, recorded a genuine 3/3 before/after, and returned patch-ready.
+    const notReproduced = {
+      kind: "byter.result",
+      status: "not-reproduced",
+      summary: "The report asks for a new button and describes no defect.",
+      proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "0/3" },
+      candidatePatch: null
+    };
+    const { llm, complete } = scriptedLlm([
+      toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_2", name: "submit_byter_result", arguments: notReproduced }]),
+      textResponse("done")
+    ]);
+    const github = fakeGitHub();
+    const store = new SessionStore({});
+    const harness = new ByterHarness({ client: github, llm, sandbox: fakeSandbox(), store });
+
+    const spec = buildByterAgentSpec({ modelName: "deepseek-flash" });
+    const created = (await harness.sessions.create({ agent: { spec } })) as { data: { id: string } };
+    const featureRequestMessage = buildInitialUserMessage({
+      issueUrl: "https://github.test/o/r/issues/2",
+      issueTitle: "Add a green Cancel button next to Save",
+      issueBody: "Could we add a second button? Nothing is broken right now, I would just like the extra button.",
+      repository: "o/r",
+      baseBranch: "main",
+      branchName: "byter/fix-2-abc"
+    });
+    const turn = (await harness.sessions.createTurn(created.data.id, {
+      input: [{ type: "user.message", content: featureRequestMessage }]
+    })) as { data: { id: string } };
+
+    const events = await drain(harness, created.data.id, turn.data.id);
+
+    // The issue text was recovered from the rendered prompt.
+    expect(store.issue(created.data.id)?.title).toBe("Add a green Cancel button next to Save");
+
+    // The first patch-ready claim was rejected, with a correction naming the right status.
+    const guardEvents = events.filter((event) => event.type === guardEventType);
+    expect(guardEvents).toHaveLength(1);
+    expect(String(guardEvents[0]?.problem)).toContain("not-reproduced");
+
+    const correction = complete.mock.calls[1]?.[0] as Array<{ role: string; content: string }>;
+    expect(correction.at(-1)?.content).toContain("reports no observable failure");
+
+    // No patch, and nothing was queued for a GitHub write.
+    expect(store.pending(created.data.id)).toBeUndefined();
+    expect(github.createPullRequest).not.toHaveBeenCalled();
+    expect(events.some((event) => event.type === "tool.approval_required")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "turn.done", state: { status: "completed" } });
+  });
+
+  it("still accepts a proven defect through the same path", async () => {
+    const { llm } = scriptedLlm([
+      toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: proofContract }]),
+      textResponse("done")
+    ]);
+    const store = new SessionStore({});
+    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
+
+    const created = (await harness.sessions.create({
+      agent: { spec: buildByterAgentSpec({ modelName: "deepseek-flash" }) }
+    })) as { data: { id: string } };
+    const turn = (await harness.sessions.createTurn(created.data.id, {
+      input: [
+        {
+          type: "user.message",
+          content: buildInitialUserMessage({
+            issueUrl: "https://github.test/o/r/issues/1",
+            issueTitle: "Tokenizer crashes on a trailing escape",
+            issueBody: "tokenizePattern('\\\\') throws TypeError: Cannot read properties of undefined.",
+            repository: "o/r",
+            baseBranch: "main",
+            branchName: "byter/fix-1-abc"
+          })
+        }
+      ]
+    })) as { data: { id: string } };
+
+    const events = await drain(harness, created.data.id, turn.data.id);
+
+    expect(events.filter((event) => event.type === guardEventType)).toHaveLength(0);
+    expect(events.at(-1)).toMatchObject({ type: "turn.done", state: { status: "completed" } });
   });
 
   it("lists persisted events under a data wrapper for the agent runtime", async () => {

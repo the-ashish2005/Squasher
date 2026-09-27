@@ -9,6 +9,7 @@ import {
   GuardValidationError,
   type GuardSchema
 } from "./structured-output-guard.js";
+import { outOfScopeProblem } from "./issue-scope.js";
 import type { HarnessAgentMessage, SessionStore } from "./session-store.js";
 import type { ToolDispatcher } from "./tool-dispatcher.js";
 
@@ -120,6 +121,15 @@ export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
       }
 
       try {
+        // Refuses a claimed proof for an issue that never reported a failure, before the
+        // result is accepted and the issue gets labelled byter:verified.
+        if (toolCall.name === "submit_byter_result") {
+          const problem = outOfScopeProblem(args, issueTextFor(store, sessionId));
+          if (problem) {
+            throw new GuardValidationError(toolCall.name, JSON.stringify(args).slice(0, 8 * 1024), problem);
+          }
+        }
+
         const result = await dispatcher.callTool(toolCall.name, args);
         const text = result.content.map((part) => part.text).join("\n");
         store.appendEvent(sessionId, turnId, {
@@ -331,6 +341,11 @@ function llmErrorMessage(error: unknown): string {
     return `Model max tokens breached: ${detail}`;
   }
   return `Model request failed: ${detail}`;
+}
+
+/** Empty text when the issue could not be read, which makes the scope check a no-op. */
+function issueTextFor(store: SessionStore, sessionId: string): { title: string; body: string } {
+  return store.issue(sessionId) ?? { title: "", body: "" };
 }
 
 function parseArguments(value: string): Record<string, unknown> {
