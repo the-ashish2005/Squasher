@@ -1237,18 +1237,65 @@ const lifecycleLabelDefinitions = [
   { name: "byter:needs-info", color: "a85b00", description: "Byter needs more issue information" },
   { name: "byter:not-reproduced", color: "6e7781", description: "Byter could not reproduce this issue" },
   { name: "byter:security-review", color: "b42318", description: "Byter held this issue for security review" },
-  { name: "byter:pr-created", color: "1a7f37", description: "Byter created a draft pull request" }
+  { name: "byter:pr-created", color: "1a7f37", description: "Byter created a draft pull request" },
+  // Reconciled here as well as applied by applyVerifiedLabel and
+  // applyAwaitingApprovalLabel. Those only ever add, and each only retracts a label the
+  // same record applied, so a second run over one issue used to leave the first run's
+  // claims in place: an issue could carry byter:verified and byter:not-reproduced at
+  // once, publicly asserting a proof that a later run had disproved.
+  { name: "byter:verified", color: "8250df", description: "Issue verified by reproducible evidence" },
+  {
+    name: "byter:awaiting-approval",
+    color: "d1242f",
+    description: "Verified patch is waiting for maintainer approval"
+  }
 ] as const;
 
+/**
+ * The complete set of Byter labels the issue should carry right now. Anything defined
+ * above and absent from this set is removed, so the labels always describe the latest
+ * run rather than the union of every run.
+ */
 function desiredLifecycleLabels(record: PersistedWebhookRunRecord): string[] {
   if (!record.scan.safeToExecute) return ["byter:security-review"];
-  if (record.run.status === "pr-created") return ["byter:pr-created"];
-  if (record.run.status === "awaiting-approval") return [];
-  if (record.run.status === "needs-info") return ["byter:needs-info"];
-  if (record.run.status === "not-reproduced") return ["byter:not-reproduced"];
-  if (record.run.status === "triaging" || record.trueForge.status === "started") return ["byter:triaging"];
-  return [];
+
+  const labels: string[] = [];
+
+  // At most one status label, mirroring where the run actually is.
+  if (record.run.status === "pr-created") labels.push("byter:pr-created");
+  else if (record.run.status === "needs-info") labels.push("byter:needs-info");
+  else if (record.run.status === "not-reproduced") labels.push("byter:not-reproduced");
+  else if (
+    record.run.status !== "awaiting-approval" &&
+    (record.run.status === "triaging" || record.trueForge.status === "started")
+  ) {
+    labels.push("byter:triaging");
+  }
+
+  // Claims about the evidence, retracted as soon as they no longer hold. The run status
+  // gates this, not hasGenuineProof alone: a result can carry well-formed proof text and
+  // still have been refused, as when a patch arrives with no approval checkpoint, and
+  // that run must not be labelled verified.
+  if (provenRunStatuses.has(record.run.status) && hasGenuineProof(record.trueForge.result)) {
+    labels.push("byter:verified");
+    if (record.run.status === "awaiting-approval") labels.push("byter:awaiting-approval");
+  }
+
+  return labels;
 }
+
+/**
+ * Statuses only reachable once the proof contract was accepted. "rejected" stays in the
+ * set because the maintainer declined the patch, which does not unmake the reproduction.
+ */
+const provenRunStatuses = new Set([
+  "verified",
+  "patch-ready",
+  "awaiting-approval",
+  "approved",
+  "pr-created",
+  "rejected"
+]);
 
 async function syncLifecycleLabels(
   record: PersistedWebhookRunRecord,
