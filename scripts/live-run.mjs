@@ -104,7 +104,16 @@ try {
   await new Promise((closed) => server.close(closed));
 }
 
-const events = await readHarnessEvents(dataDir);
+const sessionId = latest?.trueForge?.session?.id;
+const allEvents = await readHarnessEvents(dataDir);
+// harness-events.jsonl is DATA_DIR-wide, not run-scoped: with a fresh temp DATA_DIR (the
+// default) it only ever holds this run's events, but with LIVE_DATA_DIR pointed at a
+// shared directory it accumulates every run ever driven against that directory. Filtering
+// by the session id this run actually got back is what keeps the summary about this run.
+if (!sessionId) {
+  console.warn(`[run ${runLabel}] no session id was returned; the summary below is DATA_DIR-wide, not run-scoped`);
+}
+const events = sessionId ? allEvents.filter((entry) => entry.sessionId === sessionId) : allEvents;
 const guardEvents = events.filter((entry) => entry.event?.type === "byter.structured_output.guard");
 const toolCalls = events.flatMap((entry) =>
   (entry.event?.toolCalls ?? []).map((call) => call.function?.name).filter(Boolean)
