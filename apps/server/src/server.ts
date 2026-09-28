@@ -2454,33 +2454,61 @@ async function* readJsonlLines(path: string): AsyncGenerator<string> {
   }
 }
 
+/**
+ * Reads the newest record from the tail of a JSONL file.
+ *
+ * The window grows until it holds a complete record. One record can be larger than any
+ * fixed window — a candidate patch carries the full text of every file it changes, and a
+ * three-file patch against a real repository measured 315 KB against a 256 KB window. When
+ * the newest record is larger than the window, every line in that window is a fragment of
+ * it, nothing parses, and the run vanishes from the dashboard behind "No persisted webhook
+ * runs found" while sitting complete in the file.
+ *
+ * Records that merely share a window with a larger neighbour were always fine: the window
+ * ends at EOF, so the newest record is complete in it whenever it fits at all.
+ */
 async function readLatestJsonlRecord(dataDir: string, fileName: string): Promise<unknown | undefined> {
   let file;
   try {
     file = await open(join(dataDir, fileName), "r");
     const metadata = await file.stat();
-    const length = Math.min(metadata.size, maxLatestRunReadBytes);
-    const start = metadata.size - length;
-    const buffer = Buffer.alloc(length);
-    await file.read(buffer, 0, length, start);
+    if (metadata.size === 0) return undefined;
 
-    const lines = buffer.toString("utf8").split("\n").filter(Boolean);
-    let latest: unknown;
-    let latestReceivedAt = Number.NEGATIVE_INFINITY;
-    for (const line of lines) {
-      try {
-        const candidate = JSON.parse(line) as unknown;
-        const receivedAt = receivedAtTimestamp(candidate);
-        if (latest === undefined || receivedAt >= latestReceivedAt) {
-          latest = candidate;
-          latestReceivedAt = receivedAt;
+    for (
+      let length = Math.min(metadata.size, maxLatestRunReadBytes);
+      ;
+      length = Math.min(metadata.size, length * 4)
+    ) {
+      const start = metadata.size - length;
+      const buffer = Buffer.alloc(length);
+      await file.read(buffer, 0, length, start);
+      const text = buffer.toString("utf8");
+
+      // A window that starts mid-file opens mid-record; drop that leading fragment rather
+      // than letting it parse-fail and be mistaken for a malformed record.
+      const firstNewline = text.indexOf("\n");
+      const usable = start > 0 ? (firstNewline === -1 ? "" : text.slice(firstNewline + 1)) : text;
+
+      let latest: unknown;
+      let latestReceivedAt = Number.NEGATIVE_INFINITY;
+      for (const line of usable.split("\n").filter(Boolean)) {
+        try {
+          const candidate = JSON.parse(line) as unknown;
+          const receivedAt = receivedAtTimestamp(candidate);
+          if (latest === undefined || receivedAt >= latestReceivedAt) {
+            latest = candidate;
+            latestReceivedAt = receivedAt;
+          }
+        } catch {
+          // Ignore a partial or malformed trailing line.
         }
-      } catch {
-        // Ignore a partial or malformed trailing line.
       }
-    }
 
-    return latest;
+      if (latest !== undefined) return latest;
+      // Nothing complete in this window: either it opened inside one oversized record, or
+      // the tail is malformed. Widen until the whole file has been seen.
+      if (length >= metadata.size) return undefined;
+    }
   } catch {
     return undefined;
   } finally {
