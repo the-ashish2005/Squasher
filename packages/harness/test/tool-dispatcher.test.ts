@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { approvalPayloadHash, type GitHubRestClientLike } from "@byter/github-mcp";
+import { approvalPayloadHash, type GitHubRestClientLike } from "@squasher/github-mcp";
 import { createToolDispatcher, sandboxToolName } from "../src/tool-dispatcher.js";
 import { GuardValidationError } from "../src/structured-output-guard.js";
 import type { SandboxClientLike } from "../src/sandbox-client.js";
@@ -59,7 +59,7 @@ describe("tool dispatcher", () => {
     expect(names).toEqual([
       "read_issue",
       "read_file",
-      "submit_byter_result",
+      "submit_squasher_result",
       "create_fix_pull_request",
       sandboxToolName
     ]);
@@ -72,7 +72,7 @@ describe("tool dispatcher", () => {
   it("requests strict schema adherence for the proof contract", () => {
     const { dispatcher } = newDispatcher();
 
-    const submit = dispatcher.tools().find((tool) => tool.function.name === "submit_byter_result");
+    const submit = dispatcher.tools().find((tool) => tool.function.name === "submit_squasher_result");
 
     expect(submit?.function.strict).toBe(true);
   });
@@ -143,8 +143,8 @@ describe("tool dispatcher", () => {
     const { dispatcher } = newDispatcher();
 
     await expect(
-      dispatcher.callTool("submit_byter_result", {
-        kind: "byter.result",
+      dispatcher.callTool("submit_squasher_result", {
+        kind: "squasher.result",
         status: "patch-ready",
         summary: "too short",
         proof: { before: "b", after: "a", regressions: "r", attempts: "1/3" },
@@ -156,8 +156,8 @@ describe("tool dispatcher", () => {
   it("accepts a valid proof contract and returns the patch-ready instruction", async () => {
     const { dispatcher } = newDispatcher();
 
-    const result = await dispatcher.callTool("submit_byter_result", {
-      kind: "byter.result",
+    const result = await dispatcher.callTool("submit_squasher_result", {
+      kind: "squasher.result",
       status: "patch-ready",
       summary: "The reported tokenizer failure was reproduced three times and then fixed.",
       proof: {
@@ -186,7 +186,7 @@ describe("tool dispatcher", () => {
       owner: "o",
       repo: "r",
       baseBranch: "main",
-      branchName: "byter/fix-7-abc",
+      branchName: "squasher/fix-7-abc",
       title: "Fix trailing escape crash",
       body: "## Problem\n\n```ts\ntokenizePattern(\"\\\\\");\n```\n\nThrows a TypeError.",
       files: [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }]
@@ -211,9 +211,9 @@ describe("tool dispatcher", () => {
         owner: "o",
         repo: "r",
         baseBranch: "main",
-        branchName: "byter/fix-7-abc",
+        branchName: "squasher/fix-7-abc",
         title: "Fix trailing escape crash",
-        body: "Verified by Byter.",
+        body: "Verified by Squasher.",
         files: [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }]
       })
     ).rejects.toThrow(/approval is required/);

@@ -1,5 +1,5 @@
 /**
- * Drives one real Byter run against a live GitHub issue, using the real DeepSeek
+ * Drives one real Squasher run against a live GitHub issue, using the real DeepSeek
  * model and a real E2B sandbox. Parks at awaiting-approval; never approves.
  *
  *   node scripts/live-run.mjs [runLabel]
@@ -27,20 +27,20 @@ for (const line of (await readFile(join(repoRoot, ".env"), "utf8")).split("\n"))
 // LIVE_DATA_DIR pins the directory so another process can resume the session later.
 const dataDir = process.env.LIVE_DATA_DIR
   ? (await mkdir(process.env.LIVE_DATA_DIR, { recursive: true }), resolve(process.env.LIVE_DATA_DIR))
-  : await mkdtemp(join(tmpdir(), `byter-live-${runLabel}-`));
-const staticDir = await mkdtemp(join(tmpdir(), "byter-live-static-"));
-await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+  : await mkdtemp(join(tmpdir(), `squasher-live-${runLabel}-`));
+const staticDir = await mkdtemp(join(tmpdir(), "squasher-live-static-"));
+await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
 process.env.DATA_DIR = dataDir;
 process.env.STATIC_DIR = staticDir;
 
-const { createByterServer } = await import(join(repoRoot, "apps/server/dist/server.js"));
+const { createSquasherServer } = await import(join(repoRoot, "apps/server/dist/server.js"));
 
 const [owner, repoName] = targetRepo.split("/");
 const issue = await fetchIssue();
 const deliveryId = `live-${runLabel}-${randomUUID()}`;
 const payload = JSON.stringify({
   action: "labeled",
-  label: { name: process.env.BYTER_TRIGGER_LABEL ?? "byter:run" },
+  label: { name: process.env.SQUASHER_TRIGGER_LABEL ?? process.env.BYTER_TRIGGER_LABEL ?? "squasher:run" },
   issue: {
     number: issue.number,
     title: issue.title,
@@ -56,7 +56,7 @@ const payload = JSON.stringify({
   }
 });
 
-const server = createByterServer();
+const server = createSquasherServer();
 await new Promise((ready) => server.listen(0, "127.0.0.1", ready));
 const { port } = server.address();
 const baseUrl = `http://127.0.0.1:${port}`;
@@ -118,7 +118,7 @@ if (!sessionId) {
   console.warn(`[run ${runLabel}] no session id was recorded; the summary below is DATA_DIR-wide, not run-scoped`);
 }
 const events = sessionId ? allEvents.filter((entry) => entry.sessionId === sessionId) : allEvents;
-const guardEvents = events.filter((entry) => entry.event?.type === "byter.structured_output.guard");
+const guardEvents = events.filter((entry) => entry.event?.type === "squasher.structured_output.guard");
 const toolCalls = events.flatMap((entry) =>
   (entry.event?.toolCalls ?? []).map((call) => call.function?.name).filter(Boolean)
 );

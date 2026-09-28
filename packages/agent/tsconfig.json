@@ -6,7 +6,7 @@
     "outDir": "dist",
     "rootDir": "src",
     "paths": {
-      "@byter/core": ["../core/src/index.js"]
+      "@squasher/core": ["../core/src/index.js"]
     }
   },
   "references": [{ "path": "../core" }],

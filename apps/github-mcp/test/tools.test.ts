@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { approvalPayloadHash, createGitHubMcpTools, listGitHubTools } from "../src/index.js";
+import { approvalPayloadHash, createGitHubMcpTools, listGitHubTools, maxReadFileBytes } from "../src/index.js";
 
 describe("GitHub MCP tools", () => {
   it("exposes read and approved write tools", () => {
     expect(listGitHubTools()).toEqual([
       expect.objectContaining({ name: "read_issue", requiresApproval: false }),
       expect.objectContaining({ name: "read_file", requiresApproval: false }),
-      expect.objectContaining({ name: "submit_byter_result", requiresApproval: false }),
+      expect.objectContaining({ name: "submit_squasher_result", requiresApproval: false }),
       expect.objectContaining({ name: "add_verified_label", requiresApproval: true }),
       expect.objectContaining({ name: "comment_on_issue", requiresApproval: true }),
       expect.objectContaining({ name: "create_fix_pull_request", requiresApproval: true })
@@ -39,9 +39,9 @@ describe("GitHub MCP tools", () => {
     const tools = createGitHubMcpTools({ client: client as never });
 
     const result = await tools.callTool({
-      name: "submit_byter_result",
+      name: "submit_squasher_result",
       arguments: {
-        kind: "byter.result",
+        kind: "squasher.result",
         status: "blocked",
         summary: "The sandbox runtime was unavailable.",
         proof: { before: "not run", after: "not run", regressions: "not run", attempts: "0/3" },
@@ -58,9 +58,9 @@ describe("GitHub MCP tools", () => {
     const tools = createGitHubMcpTools({ client: {} as never });
 
     await expect(tools.callTool({
-      name: "submit_byter_result",
+      name: "submit_squasher_result",
       arguments: {
-        kind: "byter.result",
+        kind: "squasher.result",
         status: "patch-ready",
         summary: "...",
         proof: { before: "...", after: "...", regressions: "...", attempts: "3/3" },
@@ -133,7 +133,7 @@ describe("GitHub MCP tools", () => {
       approval: { approved: true, expectedPayloadHash: approvalPayloadHash("add_verified_label", args) }
     });
 
-    expect(client.addLabels).toHaveBeenCalledWith("o", "r", 3, ["byter:verified"]);
+    expect(client.addLabels).toHaveBeenCalledWith("o", "r", 3, ["squasher:verified"]);
   });
 
   it("creates a draft fix pull request only with matching approval", async () => {
@@ -151,9 +151,9 @@ describe("GitHub MCP tools", () => {
       owner: "o",
       repo: "r",
       baseBranch: "main",
-      branchName: "byter/fix-9",
+      branchName: "squasher/fix-9",
       title: "Fix parser crash",
-      body: "Verified by Byter.",
+      body: "Verified by Squasher.",
       files: [{ path: "src/parser.ts", content: "export const fixed = true;\n" }]
     };
 
@@ -178,11 +178,11 @@ describe("GitHub MCP tools", () => {
       "r",
       expect.objectContaining({ tree: "c".repeat(40), parents: ["a".repeat(40)] })
     );
-    expect(client.createBranch).toHaveBeenCalledWith("o", "r", "byter/fix-9", "d".repeat(40));
+    expect(client.createBranch).toHaveBeenCalledWith("o", "r", "squasher/fix-9", "d".repeat(40));
     expect(client.createPullRequest).toHaveBeenCalledWith(
       "o",
       "r",
-      expect.objectContaining({ draft: true, head: "byter/fix-9" })
+      expect.objectContaining({ draft: true, head: "squasher/fix-9" })
     );
     expect(client.deleteBranch).not.toHaveBeenCalled();
     expect(result.content[0]?.text).toContain("https://github.test/pull/9");
@@ -203,9 +203,9 @@ describe("GitHub MCP tools", () => {
       owner: "o",
       repo: "r",
       baseBranch: "main",
-      branchName: "byter/fix-9",
+      branchName: "squasher/fix-9",
       title: "Fix parser crash",
-      body: "Verified by Byter.",
+      body: "Verified by Squasher.",
       files: [{ path: "src/parser.ts", content: "export const fixed = true;\n" }]
     };
 
@@ -217,7 +217,7 @@ describe("GitHub MCP tools", () => {
       })
     ).rejects.toThrow("pull request failed");
 
-    expect(client.deleteBranch).toHaveBeenCalledWith("o", "r", "byter/fix-9");
+    expect(client.deleteBranch).toHaveBeenCalledWith("o", "r", "squasher/fix-9");
   });
 });
 
@@ -227,9 +227,9 @@ describe("fork-based pull requests", () => {
     ...upstream,
     headOwner: "contributor",
     baseBranch: "main",
-    branchName: "byter/fix-42",
+    branchName: "squasher/fix-42",
     title: "Fix trailing slash handling",
-    body: "Verified by Byter.",
+    body: "Verified by Squasher.",
     files: [{ path: "src/paths.ts", content: "export const fixed = true;\n" }]
   };
 
@@ -268,13 +268,13 @@ describe("fork-based pull requests", () => {
     // Every write lands in the fork.
     expect(client.createTree).toHaveBeenCalledWith("contributor", "project", expect.objectContaining({ baseTree: "b".repeat(40) }));
     expect(client.createCommit).toHaveBeenCalledWith("contributor", "project", expect.objectContaining({ parents: ["a".repeat(40)] }));
-    expect(client.createBranch).toHaveBeenCalledWith("contributor", "project", "byter/fix-42", "d".repeat(40));
+    expect(client.createBranch).toHaveBeenCalledWith("contributor", "project", "squasher/fix-42", "d".repeat(40));
 
     // Only the pull request itself touches upstream, and it crosses the fork boundary.
     expect(client.createPullRequest).toHaveBeenCalledWith(
       "upstream",
       "project",
-      expect.objectContaining({ head: "contributor:byter/fix-42", base: "main", draft: true, maintainerCanModify: true })
+      expect.objectContaining({ head: "contributor:squasher/fix-42", base: "main", draft: true, maintainerCanModify: true })
     );
     expect(result.content[0]?.text).toContain('"crossRepo": true');
   });
@@ -288,7 +288,7 @@ describe("fork-based pull requests", () => {
     ).rejects.toThrow("pull request failed");
 
     expect(client.deleteBranch).toHaveBeenCalledTimes(1);
-    expect(client.deleteBranch).toHaveBeenCalledWith("contributor", "project", "byter/fix-42");
+    expect(client.deleteBranch).toHaveBeenCalledWith("contributor", "project", "squasher/fix-42");
   });
 
   it("covers the write destination with the approval hash", async () => {
@@ -377,7 +377,7 @@ describe("fork-based pull requests", () => {
 
 describe("result statuses for implemented changes", () => {
   const implementedProof = {
-    kind: "byter.result",
+    kind: "squasher.result",
     status: "implemented-feature",
     summary: "Added the requested Cancel button and verified it renders beside Save.",
     proof: {
@@ -398,7 +398,7 @@ describe("result statuses for implemented changes", () => {
 
     for (const status of ["implemented-feature", "implemented-improvement"]) {
       const result = await tools.callTool({
-        name: "submit_byter_result",
+        name: "submit_squasher_result",
         arguments: { ...implementedProof, status }
       });
       expect(result.content[0]?.text, status).toContain('"accepted":true');
@@ -411,7 +411,7 @@ describe("result statuses for implemented changes", () => {
     // Implementing without running anything three times is not evidence.
     await expect(
       tools.callTool({
-        name: "submit_byter_result",
+        name: "submit_squasher_result",
         arguments: { ...implementedProof, proof: { ...implementedProof.proof, attempts: "ran it once" } }
       })
     ).rejects.toThrow("at least 3/3 matching executions");
@@ -419,7 +419,7 @@ describe("result statuses for implemented changes", () => {
     // Placeholder text is rejected here exactly as it is for a defect.
     await expect(
       tools.callTool({
-        name: "submit_byter_result",
+        name: "submit_squasher_result",
         arguments: { ...implementedProof, proof: { ...implementedProof.proof, after: "..." } }
       })
     ).rejects.toThrow("proof.after");
@@ -429,9 +429,9 @@ describe("result statuses for implemented changes", () => {
     const tools = createGitHubMcpTools({ client: {} as never });
 
     const accepted = await tools.callTool({
-      name: "submit_byter_result",
+      name: "submit_squasher_result",
       arguments: {
-        kind: "byter.result",
+        kind: "squasher.result",
         status: "not-actionable",
         summary: "The request names a service this repository does not contain.",
         proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "0/0" },
@@ -442,9 +442,206 @@ describe("result statuses for implemented changes", () => {
 
     await expect(
       tools.callTool({
-        name: "submit_byter_result",
+        name: "submit_squasher_result",
         arguments: { ...implementedProof, status: "implemented-whatever" }
       })
-    ).rejects.toThrow("valid Byter result status");
+    ).rejects.toThrow("valid Squasher result status");
+  });
+});
+
+describe("proof contract across the rename", () => {
+  const proof = {
+    status: "blocked",
+    summary: "The sandbox runtime was unavailable.",
+    proof: { before: "not run", after: "not run", regressions: "not run", attempts: "0/3" },
+    candidatePatch: null
+  };
+
+  it("accepts the current kind and tool name", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+    const result = await tools.callTool({
+      name: "submit_squasher_result",
+      arguments: { kind: "squasher.result", ...proof }
+    });
+    expect(result.content[0]?.text).toContain('"accepted":true');
+  });
+
+  it("still accepts the pre-rename kind", async () => {
+    // A session paused before the rename carries byter.result in its message history and
+    // will submit it again on resume.
+    const tools = createGitHubMcpTools({ client: {} as never });
+    const result = await tools.callTool({
+      name: "submit_squasher_result",
+      arguments: { kind: "byter.result", ...proof }
+    });
+    expect(result.content[0]?.text).toContain('"accepted":true');
+  });
+
+  it("still accepts the pre-rename tool name", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+    const result = await tools.callTool({
+      name: "submit_byter_result" as never,
+      arguments: { kind: "byter.result", ...proof }
+    });
+    expect(result.content[0]?.text).toContain('"accepted":true');
+  });
+
+  it("rejects a kind that is neither", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+    await expect(
+      tools.callTool({ name: "submit_squasher_result", arguments: { kind: "other.result", ...proof } })
+    ).rejects.toThrow("kind=squasher.result");
+  });
+});
+
+describe("read_file bounding and progressive inspection", () => {
+  // Stands in for the file that ended a live run: ~42 KB of real-looking source.
+  const largeSource = Array.from({ length: 1200 }, (_, index) => `export const value${index} = ${index}; // padding to widen the line`).join("\n");
+
+  function fileOf(text: string, encoding = "base64", path = "web/app.js") {
+    const raw = Buffer.from(text, "utf8");
+    return {
+      path,
+      sha: "8d5e12f688b326cb0f60059e2ff4d4256871b6c1",
+      size: raw.byteLength,
+      encoding,
+      content: encoding === "base64" ? raw.toString("base64") : text
+    };
+  }
+
+  async function read(file: unknown, args: Record<string, unknown> = {}) {
+    const getFile = vi.fn().mockResolvedValue(file);
+    const tools = createGitHubMcpTools({ client: { getFile } as never });
+    const result = await tools.callTool({
+      name: "read_file",
+      arguments: { owner: "o", repo: "r", path: "web/app.js", ...args }
+    });
+    return { body: JSON.parse(result.content[0]!.text), payloadBytes: Buffer.byteLength(result.content[0]!.text, "utf8"), getFile };
+  }
+
+  it("does not return a whole large file, and says the result is incomplete", async () => {
+    const { body, payloadBytes } = await read(fileOf(largeSource));
+
+    expect(body.content).not.toBe(largeSource);
+    expect(body.complete).toBe(false);
+    expect(body.truncated).toBe(true);
+    expect(body.totalLines).toBe(1200);
+    // The whole point: the payload is bounded, where it used to be ~60 KB of base64.
+    expect(payloadBytes).toBeLessThan(maxReadFileBytes + 2048);
+    expect(body.returnedBytes).toBeLessThanOrEqual(maxReadFileBytes);
+  });
+
+  it("returns only the requested line range", async () => {
+    const { body } = await read(fileOf(largeSource), { startLine: 1, endLine: 250 });
+
+    expect(body.startLine).toBe(1);
+    expect(body.endLine).toBe(250);
+    // Each line keeps its newline, so a 250-line window ends with one.
+    expect(body.content.split("\n").filter((line: string) => line.length > 0)).toHaveLength(250);
+    expect(body.content).toContain("value0 =");
+    expect(body.content).toContain("value249 =");
+    expect(body.content).not.toContain("value250 =");
+  });
+
+  it("retrieves a later section through a second request", async () => {
+    const first = await read(fileOf(largeSource), { startLine: 1, endLine: 250 });
+    const second = await read(fileOf(largeSource), { startLine: 251, endLine: 500 });
+
+    expect(second.body.startLine).toBe(251);
+    expect(second.body.content).toContain("value250 =");
+    expect(second.body.content).not.toContain("value249 =");
+    // The two windows are disjoint and adjoining, so paging loses nothing.
+    expect(first.body.content.endsWith("\n")).toBe(true);
+  });
+
+  it("names the line to continue from, and reaching the end reports complete", async () => {
+    const { body } = await read(fileOf(largeSource), { startLine: 1, endLine: 10 });
+    expect(body.complete).toBe(false);
+    expect(body.nextStartLine).toBe(11);
+    expect(body.notice).toContain("startLine 11");
+
+    const tail = await read(fileOf(largeSource), { startLine: 1190 });
+    expect(tail.body.complete).toBe(true);
+    expect(tail.body.truncated).toBeUndefined();
+    expect(tail.body.nextStartLine).toBeUndefined();
+    expect(tail.body.notice).toBeUndefined();
+  });
+
+  it("returns a small file whole, decoded, with no truncation flags", async () => {
+    const { body } = await read(fileOf("export const fixed = true;\n"));
+
+    expect(body.encoding).toBe("utf8");
+    expect(body.content).toBe("export const fixed = true;\n");
+    expect(body.complete).toBe(true);
+    expect(body.truncated).toBeUndefined();
+    expect(body.totalLines).toBe(1);
+  });
+
+  it("bounds a single enormous line by bytes", async () => {
+    // A minified bundle is one line; a line-only bound would return all of it.
+    const { body, payloadBytes } = await read(fileOf(`const a=${"x".repeat(80 * 1024)};`));
+
+    expect(body.returnedBytes).toBeLessThanOrEqual(maxReadFileBytes);
+    expect(payloadBytes).toBeLessThan(maxReadFileBytes + 2048);
+    expect(body.complete).toBe(false);
+    // The cut line must be re-read, not skipped past.
+    expect(body.nextStartLine).toBe(1);
+  });
+
+  it("clamps a caller asking for more than the server maximum", async () => {
+    const { body } = await read(fileOf(largeSource), { maxBytes: 10 * 1024 * 1024 });
+
+    expect(body.returnedBytes).toBeLessThanOrEqual(maxReadFileBytes);
+  });
+
+  it("honours a smaller maxBytes than the default", async () => {
+    const { body } = await read(fileOf(largeSource), { maxBytes: 2048 });
+
+    expect(body.returnedBytes).toBeLessThanOrEqual(2048);
+    expect(body.complete).toBe(false);
+  });
+
+  it("rejects a malformed range instead of reading somewhere else", async () => {
+    await expect(read(fileOf(largeSource), { startLine: 0 })).rejects.toThrow("positive whole number");
+    await expect(read(fileOf(largeSource), { startLine: 2.5 })).rejects.toThrow("positive whole number");
+    await expect(read(fileOf(largeSource), { endLine: -1 })).rejects.toThrow("positive whole number");
+  });
+
+  it("reports an empty range rather than guessing", async () => {
+    const { body } = await read(fileOf(largeSource), { startLine: 900, endLine: 800 });
+
+    expect(body.content).toBe("");
+    expect(body.returnedBytes).toBe(0);
+    expect(body.notice).toContain("1200 lines");
+  });
+
+  it("still refuses a traversal path before any read happens", async () => {
+    // The path guard lives in the GitHub client and must not have been bypassed.
+    const client = {
+      getFile: vi.fn().mockImplementation(async (_o: string, _r: string, path: string) => {
+        if (path.includes("..")) throw new Error("Invalid GitHub repository path");
+        return fileOf("ok");
+      })
+    };
+    const tools = createGitHubMcpTools({ client: client as never });
+
+    await expect(
+      tools.callTool({ name: "read_file", arguments: { owner: "o", repo: "r", path: "../secrets" } })
+    ).rejects.toThrow("Invalid GitHub repository path");
+  });
+
+  it("returns no content for a binary file", async () => {
+    const binary = { path: "logo.png", sha: "abc", size: 4, encoding: "base64", content: Buffer.from([0, 1, 2, 3]).toString("base64") };
+    const { body } = await read(binary);
+
+    expect(body.content).toBe("");
+    expect(body.encoding).toBe("none");
+    expect(body.notice).toContain("Binary file");
+  });
+
+  it("does not split a multi-byte character at the cut", async () => {
+    const { body } = await read(fileOf("é".repeat(40 * 1024)));
+
+    expect(body.content).not.toContain("\uFFFD");
   });
 });

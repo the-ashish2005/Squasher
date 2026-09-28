@@ -1,5 +1,5 @@
 {
-  "name": "byter",
+  "name": "squasher",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -10,11 +10,11 @@
   "packageManager": "pnpm@10.0.0",
   "scripts": {
     "build": "pnpm -r --workspace-concurrency=1 build",
-    "dev": "pnpm --filter @byter/web dev",
+    "dev": "pnpm --filter @squasher/web dev",
     "lint": "pnpm -r --workspace-concurrency=1 lint",
     "test": "pnpm -r --workspace-concurrency=1 test",
     "typecheck": "pnpm -r --workspace-concurrency=1 typecheck",
-    "start": "pnpm --filter @byter/server start",
+    "start": "pnpm --filter @squasher/server start",
     "verify": "pnpm build && pnpm lint && pnpm typecheck && pnpm test"
   },
   "devDependencies": {

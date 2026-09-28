@@ -1,11 +1,11 @@
 import {
   buildInitialUserMessage,
   buildProofContractRecoveryMessage,
-  buildByterAgentSpec
-} from "./byter-agent.js";
+  buildSquasherAgentSpec
+} from "./squasher-agent.js";
 import type {
-  StartByterSessionInput,
-  StartByterSessionResult,
+  StartSquasherSessionInput,
+  StartSquasherSessionResult,
   ResolveToolApprovalInput,
   TrueForgeClientLike,
   TrueForgePartialSessionFailureDetails,
@@ -26,7 +26,7 @@ export class TrueForgeInitialTurnError extends Error {
   }
 }
 
-export class ByterTrueForgeRuntime {
+export class SquasherTrueForgeRuntime {
   private readonly client: TrueForgeClientLike;
   private readonly config: TrueForgeRuntimeConfig;
 
@@ -35,11 +35,11 @@ export class ByterTrueForgeRuntime {
     this.client = client;
   }
 
-  async startSession(input: StartByterSessionInput): Promise<StartByterSessionResult> {
+  async startSession(input: StartSquasherSessionInput): Promise<StartSquasherSessionResult> {
     const session = normalizeSession(
       await this.client.sessions.create({
         agent: {
-          spec: buildByterAgentSpec(this.config)
+          spec: buildSquasherAgentSpec(this.config)
         }
       })
     );

@@ -35,7 +35,7 @@ describe("GitHubRestClient", () => {
     expect(calls[0]?.url).toBe(
       "https://api.github.test/repos/owner-name/repo.name/contents/src/file%20name%3F%23.ts?ref=main"
     );
-    expect((calls[0]?.init.headers as Record<string, string>)["User-Agent"]).toBe("Byter/0.1.0");
+    expect((calls[0]?.init.headers as Record<string, string>)["User-Agent"]).toBe("Squasher/0.1.0");
     expect((calls[0]?.init.headers as Record<string, string>).Authorization).toBe("Bearer token");
   });
 
@@ -116,15 +116,15 @@ describe("GitHubRestClient", () => {
       files: [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }]
     });
     const commit = await client.createCommit("owner", "repo", {
-      message: "Byter fix: trailing escape",
+      message: "Squasher fix: trailing escape",
       tree: tree.sha,
       parents: [branch.commit.sha]
     });
-    await client.createBranch("owner", "repo", "byter/fix-17", commit.sha);
+    await client.createBranch("owner", "repo", "squasher/fix-17", commit.sha);
     const pullRequest = await client.createPullRequest("owner", "repo", {
       title: "Fix trailing escape",
-      body: "Verified by Byter.",
-      head: "byter/fix-17",
+      body: "Verified by Squasher.",
+      head: "squasher/fix-17",
       base: "main"
     });
 
@@ -145,7 +145,7 @@ describe("GitHubRestClient", () => {
       parents: ["a".repeat(40)]
     });
     expect(JSON.parse(calls[4]?.init.body as string)).toMatchObject({
-      ref: "refs/heads/byter/fix-17",
+      ref: "refs/heads/squasher/fix-17",
       sha: "d".repeat(40)
     });
     expect(JSON.parse(calls[5]?.init.body as string)).toMatchObject({ draft: true });
@@ -160,9 +160,9 @@ describe("GitHubRestClient", () => {
     }) as typeof fetch;
     const client = new GitHubRestClient({ token: "token", apiBaseUrl: "https://api.github.test", fetchImpl });
 
-    await client.deleteBranch("owner", "repo", "byter/fix-17");
+    await client.deleteBranch("owner", "repo", "squasher/fix-17");
 
-    expect(calls[0]?.url).toBe("https://api.github.test/repos/owner/repo/git/refs/heads/byter/fix-17");
+    expect(calls[0]?.url).toBe("https://api.github.test/repos/owner/repo/git/refs/heads/squasher/fix-17");
     expect(calls[0]?.init.method).toBe("DELETE");
   });
 
@@ -174,24 +174,24 @@ describe("GitHubRestClient", () => {
     }) as typeof fetch;
     const client = new GitHubRestClient({ token: "token", apiBaseUrl: "https://api.github.test", fetchImpl });
 
-    await client.createLabel("owner", "repo", "byter:verified", "8250df", "Issue verified by reproducible evidence");
+    await client.createLabel("owner", "repo", "squasher:verified", "8250df", "Issue verified by reproducible evidence");
 
     expect(calls[0]?.url).toBe("https://api.github.test/repos/owner/repo/labels");
     expect(calls[0]?.init.method).toBe("POST");
     expect(JSON.parse(calls[0]?.init.body as string)).toEqual({
-      name: "byter:verified",
+      name: "squasher:verified",
       color: "8250df",
       description: "Issue verified by reproducible evidence"
     });
   });
 
   it("accepts a cross-fork head ref and keeps branch names colon-free", () => {
-    expect(validateHeadRef("byter/fix-17")).toBe("byter/fix-17");
-    expect(validateHeadRef("contributor:byter/fix-17")).toBe("contributor:byter/fix-17");
+    expect(validateHeadRef("squasher/fix-17")).toBe("squasher/fix-17");
+    expect(validateHeadRef("contributor:squasher/fix-17")).toBe("contributor:squasher/fix-17");
 
     // A second colon, an empty side, or a colon inside the owner must never reach the API.
     expect(() => validateHeadRef("a:b:c")).toThrow("Invalid GitHub pull request head ref");
-    expect(() => validateHeadRef(":byter/fix-17")).toThrow("Invalid GitHub pull request head ref");
+    expect(() => validateHeadRef(":squasher/fix-17")).toThrow("Invalid GitHub pull request head ref");
     expect(() => validateHeadRef("contributor:")).toThrow("Invalid GitHub branch name");
     expect(() => validateHeadRef("owner/name:branch")).toThrow("Invalid GitHub pull request head ref");
   });
@@ -223,19 +223,19 @@ describe("GitHubRestClient", () => {
     await client.createPullRequest("upstream", "repo", {
       title: "Fix",
       body: "Body",
-      head: "contributor:byter/fix-1",
+      head: "contributor:squasher/fix-1",
       base: "main"
     });
     await client.createPullRequest("upstream", "repo", {
       title: "Fix",
       body: "Body",
-      head: "byter/fix-1",
+      head: "squasher/fix-1",
       base: "main"
     });
 
     const crossBody = JSON.parse(crossRepo.calls[0]?.init.body as string);
     const sameBody = JSON.parse(crossRepo.calls[1]?.init.body as string);
-    expect(crossBody).toMatchObject({ head: "contributor:byter/fix-1", draft: true, maintainer_can_modify: true });
+    expect(crossBody).toMatchObject({ head: "contributor:squasher/fix-1", draft: true, maintainer_can_modify: true });
     expect(sameBody.maintainer_can_modify).toBeUndefined();
   });
 
@@ -266,10 +266,10 @@ describe("GitHubRestClient", () => {
     const { calls, fetchImpl } = jsonFetch(() => []);
     const client = new GitHubRestClient({ token: "token", apiBaseUrl: "https://api.github.test", fetchImpl });
 
-    await client.listPullRequests("upstream", "repo", { state: "open", head: "contributor:byter/fix-1" });
+    await client.listPullRequests("upstream", "repo", { state: "open", head: "contributor:squasher/fix-1" });
 
     expect(calls[0]?.url).toBe(
-      "https://api.github.test/repos/upstream/repo/pulls?state=open&per_page=100&head=contributor%3Abyter%2Ffix-1"
+      "https://api.github.test/repos/upstream/repo/pulls?state=open&per_page=100&head=contributor%3Asquasher%2Ffix-1"
     );
   });
 
@@ -294,10 +294,10 @@ describe("GitHubRestClient", () => {
     const client = new GitHubRestClient({ token: "token", apiBaseUrl: "https://api.github.test", fetchImpl });
 
     await expect(client.getCollaboratorPermission("owner", "repo", "maintainer-name")).resolves.toEqual({ permission: "maintain" });
-    await client.removeLabel("owner", "repo", 17, "byter:awaiting-approval");
+    await client.removeLabel("owner", "repo", 17, "squasher:awaiting-approval");
 
     expect(calls[0]?.url).toBe("https://api.github.test/repos/owner/repo/collaborators/maintainer-name/permission");
-    expect(calls[1]?.url).toBe("https://api.github.test/repos/owner/repo/issues/17/labels/byter%3Aawaiting-approval");
+    expect(calls[1]?.url).toBe("https://api.github.test/repos/owner/repo/issues/17/labels/squasher%3Aawaiting-approval");
     expect(calls[1]?.init.method).toBe("DELETE");
   });
 });

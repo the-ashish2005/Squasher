@@ -1,5 +1,5 @@
 {
-  "name": "@byter/server",
+  "name": "@squasher/server",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -19,11 +19,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@byter/agent": "workspace:*",
-    "@byter/core": "workspace:*",
-    "@byter/github": "workspace:*",
-    "@byter/github-mcp": "workspace:*",
-    "@byter/harness": "workspace:*",
+    "@squasher/agent": "workspace:*",
+    "@squasher/core": "workspace:*",
+    "@squasher/github": "workspace:*",
+    "@squasher/github-mcp": "workspace:*",
+    "@squasher/harness": "workspace:*",
     "pg": "^8.13.1"
   },
   "devDependencies": {

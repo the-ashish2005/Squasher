@@ -56,7 +56,7 @@ export function transitionRun(
   options: { now?: Date; evidence?: Record<string, unknown> } = {}
 ): ReproRun {
   if (!canTransition(run.status, nextStatus)) {
-    throw new Error(`Invalid Byter transition: ${run.status} -> ${nextStatus}`);
+    throw new Error(`Invalid Squasher transition: ${run.status} -> ${nextStatus}`);
   }
 
   const timestamp = (options.now ?? new Date()).toISOString();

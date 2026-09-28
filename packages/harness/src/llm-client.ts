@@ -73,7 +73,7 @@ export class LlmClient {
   static fromEnv(overrides: Partial<LlmClientConfig> = {}): LlmClient {
     const apiKey = overrides.apiKey ?? process.env.DEEPSEEK_API_KEY;
     if (!apiKey) {
-      throw new Error("DEEPSEEK_API_KEY is required to start the Byter harness");
+      throw new Error("DEEPSEEK_API_KEY is required to start the Squasher harness");
     }
 
     return new LlmClient({
@@ -115,7 +115,11 @@ export class LlmClient {
       } catch (error) {
         lastError = error;
         const status = statusOf(error);
-        const retryable = status === 429 || (status !== undefined && status >= 500);
+        // A timeout or dropped connection carries no HTTP status, so a status-only rule
+        // treated the most common transient failure of all as permanently fatal and burned
+        // the run on the first occurrence. Observed live: a request carrying a 215 KB
+        // conversation timed out once and ended a run that had already done its work.
+        const retryable = status === 429 || (status !== undefined && status >= 500) || isConnectionError(error);
         if (!retryable || attempt === this.maxAttempts) break;
         await this.sleep(2 ** (attempt - 1) * 1000);
       }
@@ -128,6 +132,20 @@ export class LlmClient {
     }
     throw new LlmRequestError(detail, status);
   }
+}
+
+/**
+ * A transport-level failure: a timed-out request, a dropped socket, a DNS blip. These carry
+ * no HTTP status, and retrying them is more clearly safe than retrying a 5xx, because the
+ * request may never have reached the provider at all.
+ */
+function isConnectionError(error: unknown): boolean {
+  if (error instanceof OpenAI.APIConnectionError) {
+    return true;
+  }
+
+  // Providers and undici surface timeouts that never become an SDK error class.
+  return error instanceof Error && /timed?\s*out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up|EAI_AGAIN/i.test(error.message);
 }
 
 function statusOf(error: unknown): number | undefined {

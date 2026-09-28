@@ -4,26 +4,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { signWebhookPayload } from "@byter/github";
-import { ByterTrueForgeRuntime } from "@byter/agent";
-import { ByterHarness } from "@byter/harness";
-import type { LlmClient, LlmResponse } from "@byter/harness";
-import { createByterServer } from "../src/server.js";
+import { signWebhookPayload } from "@squasher/github";
+import { SquasherTrueForgeRuntime } from "@squasher/agent";
+import { SquasherHarness } from "@squasher/harness";
+import type { LlmClient, LlmResponse } from "@squasher/harness";
+import { createSquasherServer } from "../src/server.js";
 
 /**
- * End-to-end dry run: a real GitHub webhook drives the real ByterHarness through the
+ * End-to-end dry run: a real GitHub webhook drives the real SquasherHarness through the
  * real server, with only the model and the sandbox mocked. This is the proof that the
  * harness's event stream satisfies the existing server parsers unchanged.
  */
 
 const deliveryId = "delivery-harness-e2e-31";
 const issueNumber = 31;
-const branchName = `byter/fix-${issueNumber}-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 10)}`;
+const branchName = `squasher/fix-${issueNumber}-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 10)}`;
 
 const patchFiles = [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }];
 
 const proofContract = {
-  kind: "byter.result",
+  kind: "squasher.result",
   status: "patch-ready",
   summary: "The trailing escape crash was reproduced 3/3 times and the patch fixes it.",
   proof: {
@@ -85,7 +85,7 @@ function scriptedModel() {
       }
     ]),
     toolCalls([{ id: "call_verify", name: "run_command", arguments: { command: "node --experimental-strip-types repro.ts" } }]),
-    toolCalls([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+    toolCalls([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
     toolCalls([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
   ];
 
@@ -162,21 +162,21 @@ const issuePayload = JSON.stringify({
   }
 });
 
-describe("Byter harness end to end", () => {
+describe("Squasher harness end to end", () => {
   let dataDir: string;
   let staticDir: string;
 
   beforeEach(async () => {
     process.env.GITHUB_WEBHOOK_SECRET = "webhook-secret";
     process.env.APPROVAL_TOKEN = "approval-token";
-    delete process.env.BYTER_REQUIRE_TRIGGER_LABEL;
+    delete process.env.SQUASHER_REQUIRE_TRIGGER_LABEL;
     delete process.env.MCP_AUTH_TOKEN;
     // Keep an injected harness authoritative even if real keys are in the shell.
     delete process.env.DEEPSEEK_API_KEY;
     delete process.env.E2B_API_KEY;
-    staticDir = await mkdtemp(join(tmpdir(), "byter-static-"));
-    dataDir = await mkdtemp(join(tmpdir(), "byter-data-"));
-    await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+    staticDir = await mkdtemp(join(tmpdir(), "squasher-static-"));
+    dataDir = await mkdtemp(join(tmpdir(), "squasher-data-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
   });
 
   afterEach(() => {
@@ -188,13 +188,13 @@ describe("Byter harness end to end", () => {
     const { llm, complete } = scriptedModel();
     const sandbox = fakeSandbox();
     const githubClient = fakeGitHubClient();
-    const harness = new ByterHarness({ client: githubClient as never, llm, sandbox, dataDir });
-    const trueForgeRuntime = new ByterTrueForgeRuntime(
+    const harness = new SquasherHarness({ client: githubClient as never, llm, sandbox, dataDir });
+    const trueForgeRuntime = new SquasherTrueForgeRuntime(
       { modelName: "deepseek-v4-pro", modelProvider: "deepseek" },
       harness
     );
 
-    const server = createByterServer({
+    const server = createSquasherServer({
       staticDir,
       dataDir,
       trueForgeRuntime,

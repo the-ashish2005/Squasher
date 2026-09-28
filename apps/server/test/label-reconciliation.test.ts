@@ -4,14 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { signWebhookPayload } from "@byter/github";
-import { ByterTrueForgeRuntime } from "@byter/agent";
-import { ByterHarness } from "@byter/harness";
-import type { LlmClient, LlmResponse } from "@byter/harness";
-import { createByterServer } from "../src/server.js";
+import { signWebhookPayload } from "@squasher/github";
+import { SquasherTrueForgeRuntime } from "@squasher/agent";
+import { SquasherHarness } from "@squasher/harness";
+import type { LlmClient, LlmResponse } from "@squasher/harness";
+import { createSquasherServer } from "../src/server.js";
 
 /**
- * Byter labels used to be add-only outside the reconciled lifecycle set, so running one
+ * Squasher labels used to be add-only outside the reconciled lifecycle set, so running one
  * issue twice left the first run's claims behind. Observed on a public repo: an issue
  * carried byter:verified and byter:not-reproduced at the same time, publicly asserting a
  * proof that the second run had disproved.
@@ -21,7 +21,7 @@ const issueNumber = 42;
 const patchFiles = [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }];
 
 const provenResult = {
-  kind: "byter.result",
+  kind: "squasher.result",
   status: "patch-ready",
   summary: "The trailing escape crash was reproduced 3/3 times and the patch fixes it.",
   proof: {
@@ -38,7 +38,7 @@ const provenResult = {
 };
 
 const notReproducedResult = {
-  kind: "byter.result",
+  kind: "squasher.result",
   status: "not-reproduced",
   summary: "A second look found no observable failure in the reported environment.",
   proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "0/3" },
@@ -133,7 +133,7 @@ function payloadFor(delivery: string) {
   });
 }
 
-describe("Byter label reconciliation", () => {
+describe("Squasher label reconciliation", () => {
   let staticDir: string;
 
   beforeEach(async () => {
@@ -141,9 +141,9 @@ describe("Byter label reconciliation", () => {
     process.env.APPROVAL_TOKEN = "approval-token";
     delete process.env.DEEPSEEK_API_KEY;
     delete process.env.E2B_API_KEY;
-    delete process.env.BYTER_REQUIRE_TRIGGER_LABEL;
-    staticDir = await mkdtemp(join(tmpdir(), "byter-label-static-"));
-    await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+    delete process.env.SQUASHER_REQUIRE_TRIGGER_LABEL;
+    staticDir = await mkdtemp(join(tmpdir(), "squasher-label-static-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
   });
 
   afterEach(() => {
@@ -157,13 +157,13 @@ describe("Byter label reconciliation", () => {
     result: unknown,
     delivery: string
   ) {
-    const branchName = `byter/fix-${issueNumber}-${createHash("sha256").update(delivery).digest("hex").slice(0, 10)}`;
+    const branchName = `squasher/fix-${issueNumber}-${createHash("sha256").update(delivery).digest("hex").slice(0, 10)}`;
     const wantsWrite = (result as { status?: string }).status === "patch-ready";
     const llm = scriptedLlm([
       toolCallResponse([
         { id: "c1", name: "run_command", arguments: { command: "node --experimental-strip-types repro.ts" } }
       ]),
-      toolCallResponse([{ id: "c2", name: "submit_byter_result", arguments: result }]),
+      toolCallResponse([{ id: "c2", name: "submit_squasher_result", arguments: result }]),
       ...(wantsWrite
         ? [
             toolCallResponse([
@@ -184,11 +184,11 @@ describe("Byter label reconciliation", () => {
           ]
         : [textResponse("done")])
     ]);
-    const harness = new ByterHarness({ client: github.client as never, llm, sandbox: fakeSandbox() });
-    const server = createByterServer({
+    const harness = new SquasherHarness({ client: github.client as never, llm, sandbox: fakeSandbox() });
+    const server = createSquasherServer({
       staticDir,
       dataDir,
-      trueForgeRuntime: new ByterTrueForgeRuntime({ modelName: "deepseek-flash" }, harness),
+      trueForgeRuntime: new SquasherTrueForgeRuntime({ modelName: "deepseek-flash" }, harness),
       githubClient: github.client as never
     });
     await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
@@ -218,16 +218,16 @@ describe("Byter label reconciliation", () => {
     }
   }
 
-  it("retracts byter:verified when a later run no longer reproduces the bug", async () => {
+  it("retracts squasher:verified when a later run no longer reproduces the bug", async () => {
     const github = labelTrackingGitHub();
 
-    const first = await runOnce(await mkdtemp(join(tmpdir(), "byter-label-a-")), github, provenResult, "label-run-1");
+    const first = await runOnce(await mkdtemp(join(tmpdir(), "squasher-label-a-")), github, provenResult, "label-run-1");
     expect(first.run.status).toBe("awaiting-approval");
-    expect([...github.labels].sort()).toEqual(["byter:awaiting-approval", "byter:verified"]);
+    expect([...github.labels].sort()).toEqual(["squasher:awaiting-approval", "squasher:verified"]);
 
     // A second run over the same issue reaches the opposite verdict.
     const second = await runOnce(
-      await mkdtemp(join(tmpdir(), "byter-label-b-")),
+      await mkdtemp(join(tmpdir(), "squasher-label-b-")),
       github,
       notReproducedResult,
       "label-run-2"
@@ -235,20 +235,20 @@ describe("Byter label reconciliation", () => {
     expect(second.run.status).toBe("not-reproduced");
 
     // The stale claims must be gone, not merely joined by a contradicting one.
-    expect(github.labels.has("byter:verified")).toBe(false);
-    expect(github.labels.has("byter:awaiting-approval")).toBe(false);
-    expect(github.labels.has("byter:not-reproduced")).toBe(true);
+    expect(github.labels.has("squasher:verified")).toBe(false);
+    expect(github.labels.has("squasher:awaiting-approval")).toBe(false);
+    expect(github.labels.has("squasher:not-reproduced")).toBe(true);
   }, 30_000);
 
-  it("keeps byter:verified once a pull request exists", async () => {
+  it("keeps squasher:verified once a pull request exists", async () => {
     const github = labelTrackingGitHub();
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-label-c-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-label-c-"));
 
     const latest = await runOnce(dataDir, github, provenResult, "label-run-3");
     expect(latest.run.status).toBe("awaiting-approval");
 
     const approval = await (async () => {
-      const server = createByterServer({ staticDir, dataDir, githubClient: github.client as never });
+      const server = createSquasherServer({ staticDir, dataDir, githubClient: github.client as never });
       await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
       const { port } = server.address() as AddressInfo;
       try {
@@ -268,8 +268,8 @@ describe("Byter label reconciliation", () => {
 
     expect(approval.resultStatus).toBeDefined();
     // Rejecting the patch does not unmake the reproduction.
-    expect(github.labels.has("byter:verified")).toBe(true);
-    expect(github.labels.has("byter:awaiting-approval")).toBe(false);
+    expect(github.labels.has("squasher:verified")).toBe(true);
+    expect(github.labels.has("squasher:awaiting-approval")).toBe(false);
   }, 30_000);
 
   it("never labels a refused patch as verified", async () => {
@@ -280,16 +280,16 @@ describe("Byter label reconciliation", () => {
       toolCallResponse([
         { id: "c1", name: "run_command", arguments: { command: "node --experimental-strip-types repro.ts" } }
       ]),
-      toolCallResponse([{ id: "c2", name: "submit_byter_result", arguments: provenResult }]),
+      toolCallResponse([{ id: "c2", name: "submit_squasher_result", arguments: provenResult }]),
       // Ends without ever requesting the gated write, so no approval checkpoint exists.
       textResponse(JSON.stringify(provenResult))
     ]);
-    const harness = new ByterHarness({ client: github.client as never, llm, sandbox: fakeSandbox() });
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-label-d-"));
-    const server = createByterServer({
+    const harness = new SquasherHarness({ client: github.client as never, llm, sandbox: fakeSandbox() });
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-label-d-"));
+    const server = createSquasherServer({
       staticDir,
       dataDir,
-      trueForgeRuntime: new ByterTrueForgeRuntime({ modelName: "deepseek-flash" }, harness),
+      trueForgeRuntime: new SquasherTrueForgeRuntime({ modelName: "deepseek-flash" }, harness),
       githubClient: github.client as never
     });
     await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
@@ -314,7 +314,7 @@ describe("Byter label reconciliation", () => {
         await new Promise((wait) => setTimeout(wait, 20));
       }
       expect(latest.run.status).toBe("failed");
-      expect(github.labels.has("byter:verified")).toBe(false);
+      expect(github.labels.has("squasher:verified")).toBe(false);
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
     }

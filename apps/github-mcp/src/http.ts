@@ -68,7 +68,7 @@ async function dispatchRequest(
     return successResponse(request.id, {
       protocolVersion,
       capabilities: { tools: {} },
-      serverInfo: { name: "byter-github", version: "0.1.0" }
+      serverInfo: { name: "squasher-github", version: "0.1.0" }
     });
   }
 
@@ -135,19 +135,43 @@ export function inputSchemaFor(name: GitHubMcpToolName) {
           owner: { type: "string" },
           repo: { type: "string" },
           path: { type: "string" },
-          ref: { type: "string" }
+          ref: { type: "string" },
+          startLine: {
+            type: "integer",
+            minimum: 1,
+            description: "First line to return, 1-based. Defaults to 1."
+          },
+          endLine: {
+            type: "integer",
+            minimum: 1,
+            description: "Last line to return, inclusive. Defaults to the end of the file, subject to the byte cap."
+          },
+          maxBytes: {
+            type: "integer",
+            minimum: 1,
+            description: "Byte ceiling for the returned window. Clamped to the server maximum."
+          }
         }
       };
-    case "submit_byter_result":
+    case "submit_squasher_result":
       return {
         type: "object",
         additionalProperties: false,
         required: ["kind", "status", "summary", "proof", "candidatePatch"],
         properties: {
-          kind: { type: "string", const: "byter.result" },
+          kind: { type: "string", const: "squasher.result" },
           status: {
             type: "string",
-            enum: ["patch-ready", "verified", "not-reproduced", "blocked", "failed"]
+            enum: [
+              "patch-ready",
+              "verified",
+              "implemented-feature",
+              "implemented-improvement",
+              "not-reproduced",
+              "not-actionable",
+              "blocked",
+              "failed"
+            ]
           },
           summary: { type: "string" },
           proof: {
@@ -274,7 +298,7 @@ function expectToolName(value: unknown): GitHubMcpToolName {
   if (
     value === "read_issue" ||
     value === "read_file" ||
-    value === "submit_byter_result" ||
+    value === "submit_squasher_result" ||
     value === "add_verified_label" ||
     value === "comment_on_issue" ||
     value === "create_fix_pull_request"

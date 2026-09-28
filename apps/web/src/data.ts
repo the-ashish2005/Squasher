@@ -1,4 +1,4 @@
-import type { ReproRun, RunStatus, SecurityScanResult } from "@byter/core";
+import type { ReproRun, RunStatus, SecurityScanResult } from "@squasher/core";
 
 export type EvidenceKind = "stdout" | "stack" | "patch" | "policy";
 export type ApprovalActionId = "approve-pr" | "request-diff" | "reject-run";
@@ -34,7 +34,7 @@ export interface HarnessTraceEvent {
   at: string;
   type: string;
   category: HarnessEventCategory;
-  source: "trueforge" | "byter";
+  source: "trueforge" | "squasher";
   status: "info" | "running" | "passed" | "failed";
   summary: string;
   toolName?: string;
@@ -118,8 +118,9 @@ interface WebhookRunRecord {
   dashboardUrl?: string;
   githubStatusComment?: { id?: number; url: string };
   githubComments?: Array<{ id?: number; url: string; kind: "started" | "completed" | "failed" | "approval"; createdAt: string }>;
-  verifiedLabel?: { name: "byter:verified"; appliedAt?: string; error?: string };
-  approvalLabel?: { name: "byter:awaiting-approval"; appliedAt?: string; error?: string };
+  // Records written before the rename carry the byter: spelling.
+  verifiedLabel?: { name: "squasher:verified" | "byter:verified"; appliedAt?: string; error?: string };
+    approvalLabel?: { name: "squasher:awaiting-approval" | "byter:awaiting-approval"; appliedAt?: string; error?: string };
   contribution?: {
     mode?: "own" | "fork" | "triage";
     headOwner?: string;
@@ -192,7 +193,9 @@ function describeContribution(
 }
 
 export function apiUrl(path: string): string {
-  const baseUrl = (import.meta.env.VITE_BYTER_API_URL ?? "").trim().replace(/\/+$/, "");
+  // VITE_BYTER_API_URL is the pre-rename name, still read so existing .env files work.
+  const configured = import.meta.env.VITE_SQUASHER_API_URL ?? import.meta.env.VITE_BYTER_API_URL ?? "";
+  const baseUrl = configured.trim().replace(/\/+$/, "");
   return `${baseUrl}${path}`;
 }
 

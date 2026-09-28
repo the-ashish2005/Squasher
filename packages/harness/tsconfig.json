@@ -6,7 +6,7 @@
     "outDir": "dist",
     "rootDir": "src",
     "paths": {
-      "@byter/github-mcp": ["../../apps/github-mcp/src/index.js"]
+      "@squasher/github-mcp": ["../../apps/github-mcp/src/index.js"]
     }
   },
   "references": [{ "path": "../../apps/github-mcp" }],

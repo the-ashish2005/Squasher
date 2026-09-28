@@ -1,4 +1,5 @@
-import type { GitHubRestClientLike } from "@byter/github-mcp";
+import type { GitHubRestClientLike } from "@squasher/github-mcp";
+import { brandedEnv } from "./env.js";
 
 /**
  * How a run is allowed to write back to the issue's repository.
@@ -35,7 +36,7 @@ export interface ContributionTarget {
 export const defaultContributionMode: ContributionMode = "own";
 
 export function configuredContributionMode(env: NodeJS.ProcessEnv = process.env): ContributionMode {
-  const raw = env.BYTER_CONTRIBUTION_MODE?.trim().toLowerCase();
+  const raw = brandedEnv("CONTRIBUTION_MODE", env)?.trim().toLowerCase();
   if (raw === "fork" || raw === "triage" || raw === "own") {
     return raw;
   }
@@ -48,7 +49,7 @@ export function configuredContributionMode(env: NodeJS.ProcessEnv = process.env)
  * allowlist means no foreign repository is eligible, whatever the mode says.
  */
 export function upstreamAllowlist(env: NodeJS.ProcessEnv = process.env): string[] {
-  return (env.BYTER_UPSTREAM_ALLOWLIST ?? "")
+  return (brandedEnv("UPSTREAM_ALLOWLIST", env) ?? "")
     .split(",")
     .map((entry) => entry.trim().toLowerCase())
     .filter((entry) => entry.length > 0);
@@ -60,6 +61,30 @@ export function isUpstreamAllowlisted(
   allowlist: string[] = upstreamAllowlist()
 ): boolean {
   return allowlist.includes(`${owner}/${repo}`.toLowerCase());
+}
+
+/** One open pull request per upstream repository unless the operator raises it. */
+export const defaultMaxOpenPullRequests = 1;
+
+/**
+ * How many of this account's Squasher pull requests may be open on one upstream repository
+ * at once.
+ *
+ * The default of one is a courtesy rather than a correctness rule: these pull requests are
+ * unsolicited, and several arriving together on one maintainer's repository is the kind of
+ * thing that gets a contributor blocked. Raising it is reasonable where that does not apply
+ * — a repository you own, or a maintainer who has asked for more — so it is configuration
+ * rather than a constant.
+ *
+ * Anything that is not a positive whole number falls back to the default, because a
+ * mistyped limit must not silently become "no limit".
+ */
+export function maxOpenPullRequests(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = brandedEnv("MAX_OPEN_PULL_REQUESTS", env)?.trim();
+  if (!raw) return defaultMaxOpenPullRequests;
+
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : defaultMaxOpenPullRequests;
 }
 
 /** Files where a project is likely to state a contribution policy. */
@@ -140,6 +165,8 @@ export async function resolveContributionTarget(input: {
   repo: string;
   mode?: ContributionMode;
   allowlist?: string[];
+  /** Overrides SQUASHER_MAX_OPEN_PULL_REQUESTS; mainly so tests need not touch the environment. */
+  maxOpenPullRequests?: number;
 }): Promise<ContributionTarget> {
   const { client, owner, repo } = input;
   const mode = input.mode ?? configuredContributionMode();
@@ -155,7 +182,7 @@ export async function resolveContributionTarget(input: {
   });
 
   if (mode === "triage") {
-    return triage("BYTER_CONTRIBUTION_MODE is triage, so no GitHub write is attempted");
+    return triage("SQUASHER_CONTRIBUTION_MODE is triage, so no GitHub write is attempted");
   }
 
   if (!client.getRepository) {
@@ -201,14 +228,14 @@ export async function resolveContributionTarget(input: {
 
   if (mode === "own") {
     return triage(
-      "Token has no push access and BYTER_CONTRIBUTION_MODE is own; set it to fork to contribute through a fork",
+      "Token has no push access and SQUASHER_CONTRIBUTION_MODE is own; set it to fork to contribute through a fork",
       { defaultBranch: probe.default_branch }
     );
   }
 
   if (!isUpstreamAllowlisted(owner, repo, allowlist)) {
     return triage(
-      `${owner}/${repo} is not in BYTER_UPSTREAM_ALLOWLIST, so a fork-based pull request is not permitted`,
+      `${owner}/${repo} is not in SQUASHER_UPSTREAM_ALLOWLIST, so a fork-based pull request is not permitted`,
       { defaultBranch: probe.default_branch }
     );
   }
@@ -242,12 +269,26 @@ export async function resolveContributionTarget(input: {
     });
   }
 
-  const existing = await findOpenByterPullRequest(client, owner, repo, login);
-  if (existing) {
-    return triage(`A Byter pull request is already open for this repository: ${existing}`, {
-      defaultBranch: probe.default_branch,
-      existingPullRequestUrl: existing
-    });
+  const open = await scanOpenSquasherPullRequests(client, owner, repo, login);
+  if (open.unreadable) {
+    return triage(
+      "GitHub did not return the open pull request list, so the number already open here is unknown",
+      { defaultBranch: probe.default_branch }
+    );
+  }
+
+  const limit = input.maxOpenPullRequests ?? maxOpenPullRequests();
+  if (open.urls.length >= limit) {
+    const listed = open.urls.join(", ");
+    return triage(
+      limit === 1
+        ? `A Squasher pull request is already open for this repository: ${listed}. Raise SQUASHER_MAX_OPEN_PULL_REQUESTS to allow more than one at a time.`
+        : `${open.urls.length} Squasher pull requests are already open for this repository, at the SQUASHER_MAX_OPEN_PULL_REQUESTS limit of ${limit}: ${listed}`,
+      {
+        defaultBranch: probe.default_branch,
+        ...(open.urls[0] ? { existingPullRequestUrl: open.urls[0] } : {})
+      }
+    );
   }
 
   let forkUrl: string | undefined;
@@ -271,29 +312,44 @@ export async function resolveContributionTarget(input: {
   };
 }
 
-/** One open Byter pull request per upstream repository, so a repeat run cannot pile on. */
-export async function findOpenByterPullRequest(
+export interface OpenPullRequestScan {
+  /** This account's open Squasher pull requests on the upstream repository. */
+  urls: string[];
+  /** True when the listing could not be read, so the count is unknown and must block. */
+  unreadable: boolean;
+}
+
+/**
+ * Counts this account's open Squasher pull requests on one upstream repository, so a repeat
+ * run cannot pile on past the configured limit.
+ */
+export async function scanOpenSquasherPullRequests(
   client: GitHubRestClientLike,
   owner: string,
   repo: string,
   headOwner: string
-): Promise<string | undefined> {
+): Promise<OpenPullRequestScan> {
   if (!client.listPullRequests) {
-    return undefined;
+    // Without a listing there is nothing to count, and no basis to block either.
+    return { urls: [], unreadable: false };
   }
 
   try {
     const open = await client.listPullRequests(owner, repo, { state: "open" });
-    const match = open.find(
-      (pullRequest) =>
-        pullRequest.head.label.toLowerCase().startsWith(`${headOwner.toLowerCase()}:`) &&
-        pullRequest.head.ref.startsWith("byter/")
-    );
-    return match?.html_url;
+    const urls = open
+      .filter(
+        (pullRequest) =>
+          pullRequest.head.label.toLowerCase().startsWith(`${headOwner.toLowerCase()}:`) &&
+          // squasher/ is the current prefix; byter/ is what pre-rename runs opened, and a
+          // pull request still open under that name counts just the same.
+          (pullRequest.head.ref.startsWith("squasher/") || pullRequest.head.ref.startsWith("byter/"))
+      )
+      .map((pullRequest) => pullRequest.html_url);
+    return { urls, unreadable: false };
   } catch {
-    // A listing failure must not be read as "no pull request exists": that is the direction
-    // that duplicates. Treat it as a blocker by reporting a sentinel the caller surfaces.
-    return "unknown (GitHub did not return the open pull request list)";
+    // A listing failure must not be read as "none are open": that is the direction that
+    // duplicates. Report it so the caller blocks on an unknown count.
+    return { urls: [], unreadable: true };
   }
 }
 

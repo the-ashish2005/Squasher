@@ -25,7 +25,7 @@ export interface TrueForgeRuntimeEvent {
 
 export type TrueForgeRuntimeEventListener = (event: TrueForgeRuntimeEvent) => void | Promise<void>;
 
-export interface StartByterSessionInput {
+export interface StartSquasherSessionInput {
   issueUrl: string;
   issueTitle: string;
   issueBody: string;
@@ -44,7 +44,7 @@ export interface ResolveToolApprovalInput {
   reason?: string;
 }
 
-export interface StartByterSessionResult {
+export interface StartSquasherSessionResult {
   session: TrueForgeSession;
   turn: TrueForgeTurn;
 }

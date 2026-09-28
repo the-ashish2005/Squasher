@@ -3,7 +3,8 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
-  const apiTarget = env.BYTER_API_TARGET ?? "http://127.0.0.1:8787";
+  // BYTER_API_TARGET is the pre-rename name, still read so existing .env files work.
+  const apiTarget = env.SQUASHER_API_TARGET ?? env.BYTER_API_TARGET ?? "http://127.0.0.1:8787";
 
   return {
     plugins: [react()],

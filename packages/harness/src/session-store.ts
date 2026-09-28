@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
-export const guardEventType = "byter.structured_output.guard";
+export const guardEventType = "squasher.structured_output.guard";
+
+/**
+ * Pre-rename event type. Event logs written before the rename carry it, so anything that
+ * reads history back -- the dashboard trace, the live-run summary -- must still match it.
+ */
+export const legacyGuardEventType = "byter.structured_output.guard";
 
 export interface HarnessEventEnvelope {
   sequenceNumber: number;

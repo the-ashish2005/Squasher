@@ -6,7 +6,7 @@
     "outDir": "dist",
     "rootDir": "src",
     "paths": {
-      "@byter/github": ["../../packages/github/src/index.js"]
+      "@squasher/github": ["../../packages/github/src/index.js"]
     }
   },
   "references": [{ "path": "../../packages/github" }],

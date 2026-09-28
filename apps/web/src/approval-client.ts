@@ -1,4 +1,7 @@
-import type { RunStatus } from "@byter/core";
+const approvalTokenKey = "squasher:approval-token";
+const legacyApprovalTokenKey = "byter:approval-token";
+
+import type { RunStatus } from "@squasher/core";
 import { apiUrl, type ApprovalActionId } from "./data";
 
 export interface ApprovalSubmission {
@@ -11,7 +14,9 @@ export interface ApprovalSubmission {
   pullRequest?: { number: number; url: string };
 }
 
-const storagePrefix = "byter:approval:";
+const storagePrefix = "squasher:approval:";
+/** Pre-rename prefix, still read so saved decisions survive the upgrade. */
+const legacyStoragePrefix = "byter:approval:";
 
 export async function submitApprovalAction(input: {
   runId: string;
@@ -36,17 +41,22 @@ export async function submitApprovalAction(input: {
 }
 
 function approvalAuthHeader(): Record<string, string> {
-  const storedToken = window.localStorage.getItem("byter:approval-token");
+  // Falls back to the pre-rename key so a saved token is not lost on upgrade.
+  const storedToken =
+    window.localStorage.getItem(approvalTokenKey) ?? window.localStorage.getItem(legacyApprovalTokenKey);
   const token = storedToken ?? window.prompt("Approval token") ?? "";
   if (token && !storedToken) {
-    window.localStorage.setItem("byter:approval-token", token);
+    window.localStorage.setItem(approvalTokenKey, token);
   }
 
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 export function readApprovalSubmission(runId: string): ApprovalSubmission | undefined {
-  const raw = window.localStorage.getItem(`${storagePrefix}${runId}`);
+  const key = `${storagePrefix}${runId}`;
+  const legacyKey = `${legacyStoragePrefix}${runId}`;
+  // A decision recorded before the rename still belongs to this run.
+  const raw = window.localStorage.getItem(key) ?? window.localStorage.getItem(legacyKey);
   if (!raw) {
     return undefined;
   }
@@ -54,7 +64,8 @@ export function readApprovalSubmission(runId: string): ApprovalSubmission | unde
   try {
     return JSON.parse(raw) as ApprovalSubmission;
   } catch {
-    window.localStorage.removeItem(`${storagePrefix}${runId}`);
+    window.localStorage.removeItem(key);
+    window.localStorage.removeItem(legacyKey);
     return undefined;
   }
 }

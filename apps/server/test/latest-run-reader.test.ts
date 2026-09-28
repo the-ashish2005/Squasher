@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createByterServer } from "../src/server.js";
+import { createSquasherServer } from "../src/server.js";
 
 /**
  * The dashboard reads the newest run from the tail of webhook-runs.jsonl through a fixed
@@ -39,7 +39,7 @@ function recordFor(options: { delivery: string; receivedAt: string; padBytes: nu
           title: "Add cache validation headers",
           body: "Emits ETag and Cache-Control.",
           baseBranch: "main",
-          branchName: "byter/fix-45-abc1234567",
+          branchName: "squasher/fix-45-abc1234567",
           // Stands in for the full file contents a real patch carries.
           files: [{ path: "server/index.js", content: "x".repeat(options.padBytes) }],
           hash: "a".repeat(64),
@@ -58,8 +58,8 @@ describe("latest run reader", () => {
     process.env.APPROVAL_TOKEN = "approval-token";
     delete process.env.DEEPSEEK_API_KEY;
     delete process.env.E2B_API_KEY;
-    staticDir = await mkdtemp(join(tmpdir(), "byter-latest-static-"));
-    await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+    staticDir = await mkdtemp(join(tmpdir(), "squasher-latest-static-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
   });
 
   afterEach(() => {
@@ -68,7 +68,7 @@ describe("latest run reader", () => {
   });
 
   async function latestFrom(dataDir: string) {
-    const server = createByterServer({ staticDir, dataDir });
+    const server = createSquasherServer({ staticDir, dataDir });
     await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
     const { port } = server.address() as AddressInfo;
     try {
@@ -80,7 +80,7 @@ describe("latest run reader", () => {
   }
 
   it("finds a record larger than the read window", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-latest-big-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-latest-big-"));
     // Comfortably past the 256 KB window, as a real three-file patch was.
     const record = recordFor({ delivery: "big-1", receivedAt: "2026-09-28T00:00:00.000Z", padBytes: 400 * 1024 });
     await writeFile(join(dataDir, "webhook-runs.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
@@ -97,7 +97,7 @@ describe("latest run reader", () => {
     // run whose patch carried whole files. The window covers only part of that last record,
     // so before the fix the endpoint answered 404 even though earlier records sat complete
     // just outside it.
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-latest-mixed-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-latest-mixed-"));
     const older = recordFor({
       delivery: "older",
       receivedAt: "2026-09-27T00:00:00.000Z",
@@ -117,7 +117,7 @@ describe("latest run reader", () => {
   it("keeps returning the newest record when several fit the window", async () => {
     // Guards the ordinary path the widening must not disturb: both records are complete in
     // the first window, and the newer one still wins.
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-latest-pair-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-latest-pair-"));
     const older = recordFor({
       delivery: "older",
       receivedAt: "2026-09-27T00:00:00.000Z",
@@ -132,12 +132,12 @@ describe("latest run reader", () => {
   });
 
   it("still reads a small file and reports an empty one as missing", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-latest-small-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-latest-small-"));
     const record = recordFor({ delivery: "small-1", receivedAt: "2026-09-28T00:00:00.000Z", padBytes: 16 });
     await writeFile(join(dataDir, "webhook-runs.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
     expect((await latestFrom(dataDir)).body.deliveryId).toBe("small-1");
 
-    const emptyDir = await mkdtemp(join(tmpdir(), "byter-latest-empty-"));
+    const emptyDir = await mkdtemp(join(tmpdir(), "squasher-latest-empty-"));
     await writeFile(join(emptyDir, "webhook-runs.jsonl"), "", "utf8");
     expect((await latestFrom(emptyDir)).status).toBe(404);
   });
@@ -151,8 +151,8 @@ describe("stranded approvals", () => {
     process.env.APPROVAL_TOKEN = "approval-token";
     delete process.env.DEEPSEEK_API_KEY;
     delete process.env.E2B_API_KEY;
-    staticDir = await mkdtemp(join(tmpdir(), "byter-stranded-static-"));
-    await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+    staticDir = await mkdtemp(join(tmpdir(), "squasher-stranded-static-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
   });
 
   afterEach(() => {
@@ -167,7 +167,7 @@ describe("stranded approvals", () => {
    * with the run unchanged, so the button stayed and the next click did the same.
    */
   it("settles a run whose harness no longer holds the paused call", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-stranded-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-stranded-"));
     const record = recordFor({ delivery: "stranded-1", receivedAt: "2026-09-28T00:00:00.000Z", padBytes: 64 });
     const patchHash = "a".repeat(64);
     (record.trueForge as Record<string, unknown>).session = { id: "sess-gone", title: null };
@@ -187,7 +187,7 @@ describe("stranded approvals", () => {
       subscribeToTurn: async () => []
     } as never;
 
-    const server = createByterServer({ staticDir, dataDir, trueForgeRuntime });
+    const server = createSquasherServer({ staticDir, dataDir, trueForgeRuntime });
     await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
     const { port } = server.address() as AddressInfo;
 

@@ -2,9 +2,9 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { approvalPayloadHash, type GitHubRestClientLike } from "@byter/github-mcp";
-import { buildByterAgentSpec, buildInitialUserMessage } from "@byter/agent";
-import { ByterHarness } from "../src/harness-runtime.js";
+import { approvalPayloadHash, type GitHubRestClientLike } from "@squasher/github-mcp";
+import { buildSquasherAgentSpec, buildInitialUserMessage } from "@squasher/agent";
+import { SquasherHarness } from "../src/harness-runtime.js";
 import { guardEventType, SessionStore } from "../src/session-store.js";
 import type { LlmClient, LlmResponse } from "../src/llm-client.js";
 import type { SandboxClientLike } from "../src/sandbox-client.js";
@@ -13,14 +13,14 @@ const writeArguments = {
   owner: "o",
   repo: "r",
   baseBranch: "main",
-  branchName: "byter/fix-7-abc1234567",
+  branchName: "squasher/fix-7-abc1234567",
   title: "Fix trailing escape crash",
   body: "Guards the tokenizer against a trailing backslash.",
   files: [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }]
 };
 
 const proofContract = {
-  kind: "byter.result",
+  kind: "squasher.result",
   status: "patch-ready",
   summary: "The reported tokenizer failure was reproduced three times and then fixed.",
   proof: {
@@ -95,8 +95,8 @@ function fakeGitHub(overrides: Partial<GitHubRestClientLike> = {}): GitHubRestCl
   } as unknown as GitHubRestClientLike;
 }
 
-async function startSession(harness: ByterHarness) {
-  const spec = buildByterAgentSpec({ modelName: "deepseek-v4-pro", modelProvider: "deepseek" });
+async function startSession(harness: SquasherHarness) {
+  const spec = buildSquasherAgentSpec({ modelName: "deepseek-v4-pro", modelProvider: "deepseek" });
   const created = (await harness.sessions.create({ agent: { spec } })) as { data: { id: string } };
   const turn = (await harness.sessions.createTurn(created.data.id, {
     input: [{ type: "user.message", content: "Analyze issue 7." }]
@@ -104,7 +104,7 @@ async function startSession(harness: ByterHarness) {
   return { sessionId: created.data.id, turnId: turn.data.id };
 }
 
-async function drain(harness: ByterHarness, sessionId: string, turnId: string) {
+async function drain(harness: SquasherHarness, sessionId: string, turnId: string) {
   const stream = await harness.sessions.subscribeToTurn(sessionId, turnId);
   const events: Array<Record<string, unknown>> = [];
   for await (const envelope of stream) {
@@ -113,13 +113,13 @@ async function drain(harness: ByterHarness, sessionId: string, turnId: string) {
   return events;
 }
 
-describe("byter harness runtime", () => {
+describe("squasher harness runtime", () => {
   it("returns a session id in the shape the agent runtime normalizes", async () => {
     const { llm } = scriptedLlm([textResponse("done")]);
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
 
     const created = (await harness.sessions.create({
-      agent: { spec: buildByterAgentSpec({ modelName: "m" }) }
+      agent: { spec: buildSquasherAgentSpec({ modelName: "m" }) }
     })) as { data: { id: string; title: string | null } };
 
     expect(created.data.id).toMatch(/^sess_/);
@@ -129,14 +129,14 @@ describe("byter harness runtime", () => {
   it("seeds the system prompt from the agent spec instructions", async () => {
     const { llm, complete } = scriptedLlm([textResponse("done")]);
     const store = new SessionStore({});
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
 
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);
 
     const messages = complete.mock.calls[0]?.[0] as Array<{ role: string; content: string }>;
     expect(messages[0]?.role).toBe("system");
-    expect(messages[0]?.content).toContain("You are Byter, CI for bug reports.");
+    expect(messages[0]?.content).toContain("You are Squasher, CI for bug reports.");
     expect(messages[1]?.content).toContain("Analyze issue 7.");
     expect(store.messages(sessionId)).not.toHaveLength(0);
   });
@@ -146,7 +146,7 @@ describe("byter harness runtime", () => {
       toolCallResponse([{ id: "call_1", name: "run_command", arguments: { command: "node repro.ts" } }]),
       textResponse("observed the failure")
     ]);
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
 
     const { sessionId, turnId } = await startSession(harness);
     const events = await drain(harness, sessionId, turnId);
@@ -163,7 +163,7 @@ describe("byter harness runtime", () => {
       toolCallResponse([{ id: "call_1", name: "read_issue", arguments: { owner: "o", repo: "r", issueNumber: 7 } }]),
       textResponse("gave up")
     ]);
-    const harness = new ByterHarness({
+    const harness = new SquasherHarness({
       client: fakeGitHub({ getIssue: vi.fn().mockRejectedValue(new Error("GitHub 404")) }),
       llm,
       sandbox: fakeSandbox()
@@ -179,12 +179,12 @@ describe("byter harness runtime", () => {
 
   it("pauses the GitHub write for approval without emitting turn.done", async () => {
     const { llm } = scriptedLlm([
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
     ]);
     const github = fakeGitHub();
     const store = new SessionStore({});
-    const harness = new ByterHarness({ client: github, llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: github, llm, sandbox: fakeSandbox(), store });
 
     const { sessionId, turnId } = await startSession(harness);
     const events = await drain(harness, sessionId, turnId);
@@ -213,12 +213,12 @@ describe("byter harness runtime", () => {
 
   it("executes the write on approval and reports the pull request receipt", async () => {
     const { llm } = scriptedLlm([
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }]),
       textResponse(JSON.stringify(proofContract))
     ]);
     const github = fakeGitHub();
-    const harness = new ByterHarness({ client: github, llm, sandbox: fakeSandbox() });
+    const harness = new SquasherHarness({ client: github, llm, sandbox: fakeSandbox() });
 
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);
@@ -244,12 +244,12 @@ describe("byter harness runtime", () => {
 
   it("rejects an approval whose stored payload no longer hashes to the paused value", async () => {
     const { llm } = scriptedLlm([
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
     ]);
     const github = fakeGitHub();
     const store = new SessionStore({});
-    const harness = new ByterHarness({ client: github, llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: github, llm, sandbox: fakeSandbox(), store });
 
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);
@@ -274,10 +274,10 @@ describe("byter harness runtime", () => {
 
   it("rejects an approval that references a different tool call", async () => {
     const { llm } = scriptedLlm([
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
     ]);
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
 
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);
@@ -293,11 +293,11 @@ describe("byter harness runtime", () => {
 
   it("denies the write without touching GitHub", async () => {
     const { llm } = scriptedLlm([
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
     ]);
     const github = fakeGitHub();
-    const harness = new ByterHarness({ client: github, llm, sandbox: fakeSandbox() });
+    const harness = new SquasherHarness({ client: github, llm, sandbox: fakeSandbox() });
 
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);
@@ -325,25 +325,25 @@ describe("byter harness runtime", () => {
   it("sends one corrective retry for a malformed proof contract and logs the failure", async () => {
     const broken = { ...proofContract, proof: { ...proofContract.proof, attempts: "1/3" } };
     const { llm, complete } = scriptedLlm([
-      toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: broken }]),
-      toolCallResponse([{ id: "call_2", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_1", name: "submit_squasher_result", arguments: broken }]),
+      toolCallResponse([{ id: "call_2", name: "submit_squasher_result", arguments: proofContract }]),
       textResponse("done")
     ]);
     const store = new SessionStore({});
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
 
     const { sessionId, turnId } = await startSession(harness);
     const events = await drain(harness, sessionId, turnId);
 
     const guardEvents = events.filter((event) => event.type === guardEventType);
     expect(guardEvents).toHaveLength(1);
-    expect(guardEvents[0]).toMatchObject({ outcome: "retrying", toolName: "submit_byter_result", attempt: 1 });
+    expect(guardEvents[0]).toMatchObject({ outcome: "retrying", toolName: "submit_squasher_result", attempt: 1 });
     expect(String(guardEvents[0]?.problem)).toContain("proof.attempts");
 
     // The correction message quoting the schema must reach the model.
     const secondCall = complete.mock.calls[1]?.[0] as Array<{ role: string; content: string }>;
     expect(secondCall.at(-1)?.role).toBe("user");
-    expect(secondCall.at(-1)?.content).toContain('"kind": "byter.result"');
+    expect(secondCall.at(-1)?.content).toContain('"kind": "squasher.result"');
 
     expect(events.at(-1)).toMatchObject({ type: "turn.done", state: { status: "completed" } });
   });
@@ -351,10 +351,10 @@ describe("byter harness runtime", () => {
   it("fails the turn after a second malformed structured output instead of coercing it", async () => {
     const broken = { ...proofContract, proof: { ...proofContract.proof, attempts: "1/3" } };
     const { llm } = scriptedLlm([
-      toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: broken }]),
-      toolCallResponse([{ id: "call_2", name: "submit_byter_result", arguments: broken }])
+      toolCallResponse([{ id: "call_1", name: "submit_squasher_result", arguments: broken }]),
+      toolCallResponse([{ id: "call_2", name: "submit_squasher_result", arguments: broken }])
     ]);
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
 
     const { sessionId, turnId } = await startSession(harness);
     const events = await drain(harness, sessionId, turnId);
@@ -373,11 +373,11 @@ describe("byter harness runtime", () => {
     );
     const { llm } = scriptedLlm(responses);
     const store = new SessionStore({});
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
 
     const created = (await harness.sessions.create({
       agent: {
-        spec: { ...buildByterAgentSpec({ modelName: "m" }), config: { iterationLimit: 3 } }
+        spec: { ...buildSquasherAgentSpec({ modelName: "m" }), config: { iterationLimit: 3 } }
       }
     })) as { data: { id: string } };
     const turn = (await harness.sessions.createTurn(created.data.id, {
@@ -396,7 +396,7 @@ describe("byter harness runtime", () => {
       Object.assign(new Error("Model rate limit exceeded after 3 attempts"), { name: "LlmRateLimitError" })
     );
     const llm = { complete } as unknown as LlmClient;
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
 
     const { sessionId, turnId } = await startSession(harness);
     const events = await drain(harness, sessionId, turnId);
@@ -410,10 +410,10 @@ describe("byter harness runtime", () => {
     const sandbox = fakeSandbox();
     const { llm } = scriptedLlm([
       toolCallResponse([{ id: "call_1", name: "run_command", arguments: { command: "node repro.ts" } }]),
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
     ]);
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox });
 
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);
@@ -435,10 +435,10 @@ describe("byter harness runtime", () => {
     const sandbox = fakeSandbox();
     const { llm } = scriptedLlm([
       toolCallResponse([{ id: "call_1", name: "run_command", arguments: { command: "echo hi" } }]),
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
     ]);
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox });
 
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);
@@ -454,15 +454,15 @@ describe("byter harness runtime", () => {
     // A paused write waits on a human, so the process that ran the turn is often gone by
     // the time approval arrives. Simulated here by discarding the harness and store and
     // rebuilding both from the same DATA_DIR.
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-store-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-store-"));
     const github = fakeGitHub();
 
     const first = scriptedLlm([
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
     ]);
     const originalStore = new SessionStore({ dataDir });
-    const original = new ByterHarness({ client: github, llm: first.llm, sandbox: fakeSandbox(), store: originalStore });
+    const original = new SquasherHarness({ client: github, llm: first.llm, sandbox: fakeSandbox(), store: originalStore });
 
     const { sessionId, turnId } = await startSession(original);
     await drain(original, sessionId, turnId);
@@ -472,7 +472,7 @@ describe("byter harness runtime", () => {
     // Nothing of the first process survives except DATA_DIR.
     const revivedStore = new SessionStore({ dataDir });
     expect(revivedStore.hasSession(sessionId)).toBe(false);
-    const revived = new ByterHarness({
+    const revived = new SquasherHarness({
       client: github,
       llm: scriptedLlm([textResponse(JSON.stringify(proofContract))]).llm,
       sandbox: fakeSandbox(),
@@ -493,14 +493,14 @@ describe("byter harness runtime", () => {
   });
 
   it("still rejects a hash mismatch after reloading a session from disk", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-store-"));
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-store-"));
     const github = fakeGitHub();
     const { llm } = scriptedLlm([
-      toolCallResponse([{ id: "call_submit", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_submit", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_write", name: "create_fix_pull_request", arguments: writeArguments }])
     ]);
     const store = new SessionStore({ dataDir });
-    const harness = new ByterHarness({ client: github, llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: github, llm, sandbox: fakeSandbox(), store });
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);
     await store.flush();
@@ -511,7 +511,7 @@ describe("byter harness runtime", () => {
     snapshot.pending.arguments.files = [{ path: "src/evil.ts", content: "malicious" }];
     await writeFile(snapshotPath, JSON.stringify(snapshot), "utf8");
 
-    const revived = new ByterHarness({
+    const revived = new SquasherHarness({
       client: github,
       llm,
       sandbox: fakeSandbox(),
@@ -529,8 +529,8 @@ describe("byter harness runtime", () => {
   });
 
   it("reports a genuinely unknown session rather than reviving nothing", async () => {
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-store-"));
-    const harness = new ByterHarness({
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-store-"));
+    const harness = new SquasherHarness({
       client: fakeGitHub(),
       llm: scriptedLlm([textResponse("x")]).llm,
       sandbox: fakeSandbox(),
@@ -546,22 +546,22 @@ describe("byter harness runtime", () => {
     // Reproduces a real live run: the agent wrote its own acceptance test for a
     // requested button, recorded a genuine 3/3 before/after, and returned patch-ready.
     const notReproduced = {
-      kind: "byter.result",
+      kind: "squasher.result",
       status: "not-reproduced",
       summary: "The report asks for a new button and describes no defect.",
       proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "0/3" },
       candidatePatch: null
     };
     const { llm, complete } = scriptedLlm([
-      toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: proofContract }]),
-      toolCallResponse([{ id: "call_2", name: "submit_byter_result", arguments: notReproduced }]),
+      toolCallResponse([{ id: "call_1", name: "submit_squasher_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_2", name: "submit_squasher_result", arguments: notReproduced }]),
       textResponse("done")
     ]);
     const github = fakeGitHub();
     const store = new SessionStore({});
-    const harness = new ByterHarness({ client: github, llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: github, llm, sandbox: fakeSandbox(), store });
 
-    const spec = buildByterAgentSpec({ modelName: "deepseek-flash" });
+    const spec = buildSquasherAgentSpec({ modelName: "deepseek-flash" });
     const created = (await harness.sessions.create({ agent: { spec } })) as { data: { id: string } };
     const featureRequestMessage = buildInitialUserMessage({
       issueUrl: "https://github.test/o/r/issues/2",
@@ -569,7 +569,7 @@ describe("byter harness runtime", () => {
       issueBody: "Could we add a second button? Nothing is broken right now, I would just like the extra button.",
       repository: "o/r",
       baseBranch: "main",
-      branchName: "byter/fix-2-abc"
+      branchName: "squasher/fix-2-abc"
     });
     const turn = (await harness.sessions.createTurn(created.data.id, {
       input: [{ type: "user.message", content: featureRequestMessage }]
@@ -600,14 +600,14 @@ describe("byter harness runtime", () => {
 
   it("still accepts a proven defect through the same path", async () => {
     const { llm } = scriptedLlm([
-      toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_1", name: "submit_squasher_result", arguments: proofContract }]),
       textResponse("done")
     ]);
     const store = new SessionStore({});
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
 
     const created = (await harness.sessions.create({
-      agent: { spec: buildByterAgentSpec({ modelName: "deepseek-flash" }) }
+      agent: { spec: buildSquasherAgentSpec({ modelName: "deepseek-flash" }) }
     })) as { data: { id: string } };
     const turn = (await harness.sessions.createTurn(created.data.id, {
       input: [
@@ -619,7 +619,7 @@ describe("byter harness runtime", () => {
             issueBody: "tokenizePattern('\\\\') throws TypeError: Cannot read properties of undefined.",
             repository: "o/r",
             baseBranch: "main",
-            branchName: "byter/fix-1-abc"
+            branchName: "squasher/fix-1-abc"
           })
         }
       ]
@@ -633,7 +633,7 @@ describe("byter harness runtime", () => {
 
   it("lists persisted events under a data wrapper for the agent runtime", async () => {
     const { llm } = scriptedLlm([textResponse("done")]);
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox() });
 
     const { sessionId, turnId } = await startSession(harness);
     await drain(harness, sessionId, turnId);

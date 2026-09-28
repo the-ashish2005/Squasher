@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { guardEventType, SessionStore, type HarnessSessionSpec } from "../src/session-store.js";
 
 const spec: HarnessSessionSpec = {
-  instructions: "You are Byter.",
+  instructions: "You are Squasher.",
   iterationLimit: 8,
   enabledTools: ["read_issue"],
   approvalRequiredTools: ["create_fix_pull_request"]
@@ -55,7 +55,7 @@ describe("harness session store", () => {
     const { store, sessionId, turnId } = newStore();
 
     const event = store.appendGuardEvent(sessionId, turnId, {
-      toolName: "submit_byter_result",
+      toolName: "submit_squasher_result",
       attempt: 1,
       outcome: "retrying",
       problem: 'Field "proof.attempts" was wrong.',
@@ -64,7 +64,7 @@ describe("harness session store", () => {
 
     expect(event.event.type).toBe(guardEventType);
     expect(event.event.outcome).toBe("retrying");
-    expect(event.event.toolName).toBe("submit_byter_result");
+    expect(event.event.toolName).toBe("submit_squasher_result");
     expect(String(event.event.rawText)).toHaveLength(8 * 1024);
   });
 
@@ -122,7 +122,7 @@ describe("harness session store", () => {
   it("keeps message history across turns so continuations resume the conversation", () => {
     const { store, sessionId } = newStore();
 
-    store.appendMessages(sessionId, [{ role: "system", content: "You are Byter." }]);
+    store.appendMessages(sessionId, [{ role: "system", content: "You are Squasher." }]);
     store.appendMessages(sessionId, [{ role: "user", content: "Analyze issue 1." }]);
 
     expect(store.messages(sessionId)).toHaveLength(2);

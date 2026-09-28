@@ -32,11 +32,11 @@ describe("GitHub webhook verification", () => {
         number: 7,
         title: "Parser crash",
         body: "Trailing escape breaks tokenizer",
-        html_url: "https://github.com/MAYANK-MAHAUR/Byter/issues/7"
+        html_url: "https://github.com/MAYANK-MAHAUR/Squasher/issues/7"
       },
       repository: {
-        name: "Byter",
-        full_name: "MAYANK-MAHAUR/Byter",
+        name: "Squasher",
+        full_name: "MAYANK-MAHAUR/Squasher",
         default_branch: "main",
         owner: { login: "MAYANK-MAHAUR" }
       }
@@ -55,16 +55,16 @@ describe("GitHub webhook verification", () => {
         number: 7,
         title: "Parser crash",
         body: "Trailing escape breaks tokenizer",
-        html_url: "https://github.com/MAYANK-MAHAUR/Byter/issues/7"
+        html_url: "https://github.com/MAYANK-MAHAUR/Squasher/issues/7"
       },
       comment: {
-        body: "/byter approve run-id abc",
+        body: "/squasher approve run-id abc",
         user: { login: "maintainer" },
         author_association: "OWNER"
       },
       repository: {
-        name: "Byter",
-        full_name: "MAYANK-MAHAUR/Byter",
+        name: "Squasher",
+        full_name: "MAYANK-MAHAUR/Squasher",
         default_branch: "main",
         owner: { login: "MAYANK-MAHAUR" }
       }

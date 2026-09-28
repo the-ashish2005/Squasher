@@ -16,7 +16,7 @@ const featureRequest = {
 
 // talkasab/peruse#45. Asks for cache-validation headers that do not exist yet: written in
 // bug-report form, with a reproduction command and root-cause reasoning, but the server
-// answers every request correctly. Byter classified this not-reproduced, which is the
+// answers every request correctly. Squasher classified this not-reproduced, which is the
 // report this change exists to fix.
 const improvementRequest = {
   title: "Serve app.js and index.html with cache validation headers",
@@ -54,8 +54,8 @@ const wrongOutputReport = {
   ].join("\n")
 };
 
-const bugProofResult = { kind: "byter.result", status: "patch-ready" };
-const implementedResult = { kind: "byter.result", status: "implemented-feature" };
+const bugProofResult = { kind: "squasher.result", status: "patch-ready" };
+const implementedResult = { kind: "squasher.result", status: "implemented-feature" };
 
 describe("issue scope classification", () => {
   it("treats a feature request with no failure artifact as a change request", () => {

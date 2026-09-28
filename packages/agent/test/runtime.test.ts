@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  ByterTrueForgeRuntime,
+  SquasherTrueForgeRuntime,
   TrueForgeInitialTurnError,
   buildInitialUserMessage,
   buildProofContractRecoveryMessage,
-  buildByterAgentSpec
+  buildSquasherAgentSpec
 } from "../src/index.js";
 
 const config = {
@@ -12,9 +12,9 @@ const config = {
   modelProvider: "agentrouter"
 };
 
-describe("Byter TrueForge runtime", () => {
+describe("Squasher TrueForge runtime", () => {
   it("builds an inline agent spec with sandbox and subagents enabled", () => {
-    const spec = buildByterAgentSpec(config);
+    const spec = buildSquasherAgentSpec(config);
 
     expect(spec.model.name).toBe("agentrouter/glm-5.3");
     expect(spec).not.toHaveProperty("responseFormat");
@@ -24,9 +24,9 @@ describe("Byter TrueForge runtime", () => {
     expect(spec.config.sandbox.enabled).toBe(true);
     expect(spec.mcpServers).toEqual([
       {
-        name: "byter-github",
+        name: "squasher-github",
         preload: true,
-        enableTools: ["read_issue", "read_file", "submit_byter_result", "create_fix_pull_request"],
+        enableTools: ["read_issue", "read_file", "submit_squasher_result", "create_fix_pull_request"],
         requireApprovalForTools: ["create_fix_pull_request"]
       }
     ]);
@@ -34,26 +34,26 @@ describe("Byter TrueForge runtime", () => {
 
   it("builds the initial issue analysis prompt", () => {
     const message = buildInitialUserMessage({
-      issueUrl: "https://github.com/MAYANK-MAHAUR/Byter/issues/1",
+      issueUrl: "https://github.com/MAYANK-MAHAUR/Squasher/issues/1",
       issueTitle: "Trailing escape crash",
       issueBody: "Tokenizer throws on a single backslash.",
-      repository: "MAYANK-MAHAUR/Byter",
+      repository: "MAYANK-MAHAUR/Squasher",
       baseBranch: "main",
-      branchName: "byter/fix-1-test",
+      branchName: "squasher/fix-1-test",
       baseSha: "abc123"
     });
 
-    expect(message).toContain("Repository: MAYANK-MAHAUR/Byter");
+    expect(message).toContain("Repository: MAYANK-MAHAUR/Squasher");
     expect(message).toContain("Base SHA: abc123");
-    expect(message).toContain("Reserved fix branch: byter/fix-1-test");
+    expect(message).toContain("Reserved fix branch: squasher/fix-1-test");
     expect(message).toContain("Require the same target failure 3/3");
-    expect(buildByterAgentSpec(config).instructions).toContain("node-v22.14.0-linux-x64.tar.gz");
-    expect(buildByterAgentSpec(config).instructions).toContain("submit_byter_result");
-    expect(buildByterAgentSpec(config).instructions).toContain("never paste repository source or test contents into base64 blobs");
-    expect(buildByterAgentSpec(config).instructions).toContain("concise GitHub-flavored Markdown");
-    expect(buildByterAgentSpec(config).instructions).toContain("opening and closing $$ delimiters on their own lines");
-    expect(buildByterAgentSpec(config).instructions).toContain("Do not use raw HTML");
-    expect(buildByterAgentSpec(config).instructions).toContain("immediately run that exact command two more times");
+    expect(buildSquasherAgentSpec(config).instructions).toContain("node-v22.14.0-linux-x64.tar.gz");
+    expect(buildSquasherAgentSpec(config).instructions).toContain("submit_squasher_result");
+    expect(buildSquasherAgentSpec(config).instructions).toContain("never paste repository source or test contents into base64 blobs");
+    expect(buildSquasherAgentSpec(config).instructions).toContain("concise GitHub-flavored Markdown");
+    expect(buildSquasherAgentSpec(config).instructions).toContain("opening and closing $$ delimiters on their own lines");
+    expect(buildSquasherAgentSpec(config).instructions).toContain("Do not use raw HTML");
+    expect(buildSquasherAgentSpec(config).instructions).toContain("immediately run that exact command two more times");
     expect(message).toContain("public-safe GitHub-flavored Markdown");
     expect(message).toContain("repeat the exact command immediately until 3/3 attempts");
   });
@@ -72,15 +72,15 @@ describe("Byter TrueForge runtime", () => {
         listEvents: vi.fn()
       }
     };
-    const runtime = new ByterTrueForgeRuntime(config, client);
+    const runtime = new SquasherTrueForgeRuntime(config, client);
 
     const result = await runtime.startSession({
-      issueUrl: "https://github.com/MAYANK-MAHAUR/Byter/issues/1",
+      issueUrl: "https://github.com/MAYANK-MAHAUR/Squasher/issues/1",
       issueTitle: "Bug",
       issueBody: "Breaks",
-      repository: "MAYANK-MAHAUR/Byter",
+      repository: "MAYANK-MAHAUR/Squasher",
       baseBranch: "main",
-      branchName: "byter/fix-1-test"
+      branchName: "squasher/fix-1-test"
     });
 
     expect(result.session.id).toBe("session_1");
@@ -110,7 +110,7 @@ describe("Byter TrueForge runtime", () => {
         listEvents: vi.fn()
       }
     };
-    const runtime = new ByterTrueForgeRuntime(config, client);
+    const runtime = new SquasherTrueForgeRuntime(config, client);
 
     await expect(runtime.requestProofContract("session_1")).resolves.toEqual({
       id: "turn_recovery",
@@ -125,7 +125,7 @@ describe("Byter TrueForge runtime", () => {
       expect.objectContaining({
         input: [expect.objectContaining({
           type: "user.message",
-          content: expect.stringContaining("valid byter.result object")
+          content: expect.stringContaining("valid squasher.result object")
         })]
       })
     );
@@ -145,7 +145,7 @@ describe("Byter TrueForge runtime", () => {
         listEvents: vi.fn()
       }
     };
-    const runtime = new ByterTrueForgeRuntime(config, client);
+    const runtime = new SquasherTrueForgeRuntime(config, client);
 
     await runtime.resolveToolApproval({
       sessionId: "session_1",
@@ -176,7 +176,7 @@ describe("Byter TrueForge runtime", () => {
         })
       }
     };
-    const runtime = new ByterTrueForgeRuntime(config, client);
+    const runtime = new SquasherTrueForgeRuntime(config, client);
 
     await expect(runtime.listSessionEvents("session_1")).resolves.toEqual([
       { sequenceNumber: 2, type: "sandbox.created", raw: { sequenceNumber: 2, event: { type: "sandbox.created" } } }
@@ -194,7 +194,7 @@ describe("Byter TrueForge runtime", () => {
         })
       }
     };
-    const runtime = new ByterTrueForgeRuntime(config, client);
+    const runtime = new SquasherTrueForgeRuntime(config, client);
 
     const events = await runtime.listSessionEvents("session_1");
 
@@ -211,16 +211,16 @@ describe("Byter TrueForge runtime", () => {
         listEvents: vi.fn()
       }
     };
-    const runtime = new ByterTrueForgeRuntime(config, client);
+    const runtime = new SquasherTrueForgeRuntime(config, client);
 
     await expect(
       runtime.startSession({
-        issueUrl: "https://github.com/MAYANK-MAHAUR/Byter/issues/1",
+        issueUrl: "https://github.com/MAYANK-MAHAUR/Squasher/issues/1",
         issueTitle: "Bug",
         issueBody: "Breaks",
-        repository: "MAYANK-MAHAUR/Byter",
+        repository: "MAYANK-MAHAUR/Squasher",
         baseBranch: "main",
-        branchName: "byter/fix-1-test"
+        branchName: "squasher/fix-1-test"
       })
     ).rejects.toMatchObject({
       name: "TrueForgeInitialTurnError",
@@ -242,16 +242,16 @@ describe("Byter TrueForge runtime", () => {
         listEvents: vi.fn()
       }
     };
-    const runtime = new ByterTrueForgeRuntime(config, client);
+    const runtime = new SquasherTrueForgeRuntime(config, client);
 
     try {
       await runtime.startSession({
-        issueUrl: "https://github.com/MAYANK-MAHAUR/Byter/issues/1",
+        issueUrl: "https://github.com/MAYANK-MAHAUR/Squasher/issues/1",
         issueTitle: "Bug",
         issueBody: "Breaks",
-        repository: "MAYANK-MAHAUR/Byter",
+        repository: "MAYANK-MAHAUR/Squasher",
         baseBranch: "main",
-        branchName: "byter/fix-1-test"
+        branchName: "squasher/fix-1-test"
       });
       throw new Error("Expected startSession to fail");
     } catch (error) {

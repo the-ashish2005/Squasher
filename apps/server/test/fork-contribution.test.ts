@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { signWebhookPayload } from "@byter/github";
-import { ByterTrueForgeRuntime } from "@byter/agent";
-import { ByterHarness } from "@byter/harness";
-import type { LlmClient, LlmResponse } from "@byter/harness";
-import { ContributionRegistry, createByterServer } from "../src/server.js";
+import { signWebhookPayload } from "@squasher/github";
+import { SquasherTrueForgeRuntime } from "@squasher/agent";
+import { SquasherHarness } from "@squasher/harness";
+import type { LlmClient, LlmResponse } from "@squasher/harness";
+import { ContributionRegistry, createSquasherServer } from "../src/server.js";
 
 /**
  * End-to-end cover for contributing to a repository the token cannot push to: the fix branch
@@ -21,7 +21,7 @@ const upstream = { owner: "upstream", repo: "project", fullName: "upstream/proje
 const patchFiles = [{ path: "src/paths.ts", content: "export const fixed = true;\n" }];
 
 const provenResult = {
-  kind: "byter.result",
+  kind: "squasher.result",
   status: "patch-ready",
   summary: "The trailing slash failure was reproduced 3/3 times and the patch fixes it.",
   proof: {
@@ -185,16 +185,16 @@ describe("fork-based contribution", () => {
     process.env.APPROVAL_TOKEN = "approval-token";
     delete process.env.DEEPSEEK_API_KEY;
     delete process.env.E2B_API_KEY;
-    delete process.env.BYTER_REQUIRE_TRIGGER_LABEL;
-    staticDir = await mkdtemp(join(tmpdir(), "byter-fork-static-"));
-    await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+    delete process.env.SQUASHER_REQUIRE_TRIGGER_LABEL;
+    staticDir = await mkdtemp(join(tmpdir(), "squasher-fork-static-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
   });
 
   afterEach(() => {
     delete process.env.GITHUB_WEBHOOK_SECRET;
     delete process.env.APPROVAL_TOKEN;
-    delete process.env.BYTER_CONTRIBUTION_MODE;
-    delete process.env.BYTER_UPSTREAM_ALLOWLIST;
+    delete process.env.SQUASHER_CONTRIBUTION_MODE;
+    delete process.env.SQUASHER_UPSTREAM_ALLOWLIST;
   });
 
   async function runIssue(
@@ -202,13 +202,13 @@ describe("fork-based contribution", () => {
     delivery: string,
     options: { withoutResolver?: boolean } = {}
   ) {
-    const dataDir = await mkdtemp(join(tmpdir(), "byter-fork-data-"));
-    const branchName = `byter/fix-${issueNumber}-${createHash("sha256").update(delivery).digest("hex").slice(0, 10)}`;
+    const dataDir = await mkdtemp(join(tmpdir(), "squasher-fork-data-"));
+    const branchName = `squasher/fix-${issueNumber}-${createHash("sha256").update(delivery).digest("hex").slice(0, 10)}`;
     const llm = scriptedLlm([
       toolCallResponse([
         { id: "c1", name: "run_command", arguments: { command: "node --experimental-strip-types repro.ts" } }
       ]),
-      toolCallResponse([{ id: "c2", name: "submit_byter_result", arguments: provenResult }]),
+      toolCallResponse([{ id: "c2", name: "submit_squasher_result", arguments: provenResult }]),
       toolCallResponse([
         {
           id: "c3",
@@ -230,7 +230,7 @@ describe("fork-based contribution", () => {
     // Mirrors how trueForgeRuntimeFromEnv wires the harness in production: the server's
     // contribution decision is what the harness consults before pausing a write.
     const contributions = new ContributionRegistry();
-    const harness = new ByterHarness({
+    const harness = new SquasherHarness({
       client: github.client as never,
       llm,
       sandbox: fakeSandbox(),
@@ -238,11 +238,11 @@ describe("fork-based contribution", () => {
         ? {}
         : { resolveWriteTarget: ({ owner, repo }) => contributions.decide(owner, repo) })
     });
-    const server = createByterServer({
+    const server = createSquasherServer({
       staticDir,
       dataDir,
       contributions,
-      trueForgeRuntime: new ByterTrueForgeRuntime({ modelName: "deepseek-flash" }, harness),
+      trueForgeRuntime: new SquasherTrueForgeRuntime({ modelName: "deepseek-flash" }, harness),
       githubClient: github.client as never
     });
     await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
@@ -287,8 +287,8 @@ describe("fork-based contribution", () => {
   }
 
   it("pauses a fork-bound write and opens the pull request from the fork on approval", async () => {
-    process.env.BYTER_CONTRIBUTION_MODE = "fork";
-    process.env.BYTER_UPSTREAM_ALLOWLIST = upstream.fullName;
+    process.env.SQUASHER_CONTRIBUTION_MODE = "fork";
+    process.env.SQUASHER_UPSTREAM_ALLOWLIST = upstream.fullName;
     const github = foreignRepoGitHub();
 
     const { latest, baseUrl, server, branchName } = await runIssue(github, "fork-run-1");
@@ -324,8 +324,8 @@ describe("fork-based contribution", () => {
   });
 
   it("discloses the automated contribution in the pull request body", async () => {
-    process.env.BYTER_CONTRIBUTION_MODE = "fork";
-    process.env.BYTER_UPSTREAM_ALLOWLIST = upstream.fullName;
+    process.env.SQUASHER_CONTRIBUTION_MODE = "fork";
+    process.env.SQUASHER_UPSTREAM_ALLOWLIST = upstream.fullName;
     const github = foreignRepoGitHub();
 
     const { latest, baseUrl, server } = await runIssue(github, "fork-run-2");
@@ -346,8 +346,8 @@ describe("fork-based contribution", () => {
   });
 
   it("refuses the write and forks nothing when the repository is not allowlisted", async () => {
-    process.env.BYTER_CONTRIBUTION_MODE = "fork";
-    delete process.env.BYTER_UPSTREAM_ALLOWLIST;
+    process.env.SQUASHER_CONTRIBUTION_MODE = "fork";
+    delete process.env.SQUASHER_UPSTREAM_ALLOWLIST;
     const github = foreignRepoGitHub();
 
     const { latest, server } = await runIssue(github, "fork-run-3");
@@ -358,7 +358,7 @@ describe("fork-based contribution", () => {
       };
 
       expect(record.contribution.mode).toBe("triage");
-      expect(record.contribution.reason).toContain("BYTER_UPSTREAM_ALLOWLIST");
+      expect(record.contribution.reason).toContain("SQUASHER_UPSTREAM_ALLOWLIST");
       expect(github.client.forkRepository).not.toHaveBeenCalled();
       expect(github.client.createBranch).not.toHaveBeenCalled();
 
@@ -370,8 +370,8 @@ describe("fork-based contribution", () => {
   });
 
   it("refuses the write when the project's contributing guide rejects automated patches", async () => {
-    process.env.BYTER_CONTRIBUTION_MODE = "fork";
-    process.env.BYTER_UPSTREAM_ALLOWLIST = upstream.fullName;
+    process.env.SQUASHER_CONTRIBUTION_MODE = "fork";
+    process.env.SQUASHER_UPSTREAM_ALLOWLIST = upstream.fullName;
     const github = foreignRepoGitHub({
       contributing: "# Contributing\n\nAI-generated pull requests are not accepted.\n"
     });
@@ -391,8 +391,8 @@ describe("fork-based contribution", () => {
   });
 
   it("refuses the approval when the harness never received the write-target policy", async () => {
-    process.env.BYTER_CONTRIBUTION_MODE = "fork";
-    process.env.BYTER_UPSTREAM_ALLOWLIST = upstream.fullName;
+    process.env.SQUASHER_CONTRIBUTION_MODE = "fork";
+    process.env.SQUASHER_UPSTREAM_ALLOWLIST = upstream.fullName;
     const github = foreignRepoGitHub();
 
     // A runtime injected without the resolver stamps no destination, so the paused write
@@ -423,8 +423,8 @@ describe("fork-based contribution", () => {
   });
 
   it("stays in triage for a foreign repository when fork mode is not enabled", async () => {
-    delete process.env.BYTER_CONTRIBUTION_MODE;
-    process.env.BYTER_UPSTREAM_ALLOWLIST = upstream.fullName;
+    delete process.env.SQUASHER_CONTRIBUTION_MODE;
+    process.env.SQUASHER_UPSTREAM_ALLOWLIST = upstream.fullName;
     const github = foreignRepoGitHub();
 
     const { latest, server } = await runIssue(github, "fork-run-5");

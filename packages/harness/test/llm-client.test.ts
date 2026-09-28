@@ -105,6 +105,44 @@ describe("llm client", () => {
     expect(create).toHaveBeenCalledTimes(3);
   });
 
+  it("retries a timed-out request and succeeds", async () => {
+    // A timeout carries no HTTP status. A status-only retry rule skipped it entirely, so a
+    // single transient timeout ended a live run that had already done its work.
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Request timed out."))
+      .mockResolvedValue({ choices: [{ message: { content: "recovered" }, finish_reason: "stop" }] });
+    const { client, sleep } = newClient(create);
+
+    const response = await client.complete([{ role: "user", content: "hi" }], []);
+
+    expect(response.text).toBe("recovered");
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a dropped connection", async () => {
+    for (const message of ["socket hang up", "ECONNRESET", "ETIMEDOUT", "getaddrinfo EAI_AGAIN api.deepseek.com"]) {
+      const create = vi
+        .fn()
+        .mockRejectedValueOnce(new Error(message))
+        .mockResolvedValue({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] });
+      const { client } = newClient(create);
+
+      await expect(client.complete([{ role: "user", content: "hi" }], []), message).resolves.toMatchObject({ text: "ok" });
+      expect(create, message).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it("gives up after the attempt limit when every request times out", async () => {
+    const create = vi.fn().mockRejectedValue(new Error("Request timed out."));
+    const { client } = newClient(create);
+
+    // Retried, not retried for ever: the turn still fails once the budget is spent.
+    await expect(client.complete([{ role: "user", content: "hi" }], [])).rejects.toBeInstanceOf(LlmRequestError);
+    expect(create).toHaveBeenCalledTimes(3);
+  });
+
   it("never sends tool_choice, which DeepSeek's models reject", async () => {
     const create = vi.fn().mockResolvedValue({
       choices: [{ message: { content: "ok", tool_calls: [] }, finish_reason: "stop" }]
@@ -119,6 +157,52 @@ describe("llm client", () => {
     expect(request).not.toHaveProperty("tool_choice");
     expect(request.model).toBe("deepseek-v4-pro");
     expect(Array.isArray(request.tools)).toBe(true);
+  });
+
+  it("does not retry permanent failures", async () => {
+    // Retrying a bad key or a malformed request cannot help, and hides the real cause
+    // behind a delay.
+    for (const status of [400, 401, 403, 404, 422]) {
+      const create = vi.fn().mockRejectedValue(statusError(status, `permanent ${status}`));
+      const { client, sleep } = newClient(create);
+
+      await expect(client.complete([{ role: "user", content: "hi" }], []), String(status)).rejects.toBeInstanceOf(
+        LlmRequestError
+      );
+      expect(create, String(status)).toHaveBeenCalledTimes(1);
+      expect(sleep, String(status)).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps retrying 429 and 5xx, and stops at the attempt limit", async () => {
+    for (const status of [429, 500, 502, 503]) {
+      const create = vi.fn().mockRejectedValue(statusError(status, `transient ${status}`));
+      const { client } = newClient(create);
+
+      await expect(client.complete([{ role: "user", content: "hi" }], []), String(status)).rejects.toBeInstanceOf(Error);
+      // Finite: three attempts, never an unbounded loop.
+      expect(create, String(status)).toHaveBeenCalledTimes(3);
+    }
+  });
+
+  it("preserves the final error detail after the budget is spent", async () => {
+    const create = vi.fn().mockRejectedValue(new Error("Request timed out."));
+    const { client } = newClient(create);
+
+    await expect(client.complete([{ role: "user", content: "hi" }], [])).rejects.toThrow("Request timed out.");
+  });
+
+  it("backs off between attempts rather than retrying immediately", async () => {
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("socket hang up"))
+      .mockRejectedValueOnce(statusError(503, "unavailable"))
+      .mockResolvedValue({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] });
+    const { client, sleep } = newClient(create);
+
+    await client.complete([{ role: "user", content: "hi" }], []);
+
+    expect(sleep.mock.calls.map((call) => call[0])).toEqual([1000, 2000]);
   });
 
   it("requires an api key when built from the environment", () => {

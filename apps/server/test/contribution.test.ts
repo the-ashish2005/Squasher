@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   configuredContributionMode,
-  findOpenByterPullRequest,
   isUpstreamAllowlisted,
+  maxOpenPullRequests,
   resolveContributionTarget,
   scanContributionPolicy,
+  scanOpenSquasherPullRequests,
   upstreamAllowlist
 } from "../src/contribution.js";
 
@@ -63,9 +64,9 @@ function clientFor(options: {
 describe("contribution mode configuration", () => {
   it("defaults to own so existing deployments are unchanged", () => {
     expect(configuredContributionMode({})).toBe("own");
-    expect(configuredContributionMode({ BYTER_CONTRIBUTION_MODE: "nonsense" })).toBe("own");
-    expect(configuredContributionMode({ BYTER_CONTRIBUTION_MODE: " Fork " })).toBe("fork");
-    expect(configuredContributionMode({ BYTER_CONTRIBUTION_MODE: "triage" })).toBe("triage");
+    expect(configuredContributionMode({ SQUASHER_CONTRIBUTION_MODE: "nonsense" })).toBe("own");
+    expect(configuredContributionMode({ SQUASHER_CONTRIBUTION_MODE: " Fork " })).toBe("fork");
+    expect(configuredContributionMode({ SQUASHER_CONTRIBUTION_MODE: "triage" })).toBe("triage");
   });
 
   it("fails closed when no allowlist is configured", () => {
@@ -73,8 +74,19 @@ describe("contribution mode configuration", () => {
     expect(isUpstreamAllowlisted("upstream", "project", [])).toBe(false);
   });
 
+  it("defaults the open pull request limit to one, and only accepts a positive whole number", () => {
+    expect(maxOpenPullRequests({})).toBe(1);
+    expect(maxOpenPullRequests({ SQUASHER_MAX_OPEN_PULL_REQUESTS: "3" })).toBe(3);
+    expect(maxOpenPullRequests({ BYTER_MAX_OPEN_PULL_REQUESTS: "3" })).toBe(3);
+
+    // A mistyped limit must not silently become "no limit".
+    for (const raw of ["0", "-2", "2.5", "many", ""]) {
+      expect(maxOpenPullRequests({ SQUASHER_MAX_OPEN_PULL_REQUESTS: raw }), raw).toBe(1);
+    }
+  });
+
   it("matches allowlist entries without case sensitivity", () => {
-    const allowlist = upstreamAllowlist({ BYTER_UPSTREAM_ALLOWLIST: " Upstream/Project , other/repo " });
+    const allowlist = upstreamAllowlist({ SQUASHER_UPSTREAM_ALLOWLIST: " Upstream/Project , other/repo " });
 
     expect(allowlist).toEqual(["upstream/project", "other/repo"]);
     expect(isUpstreamAllowlisted("UPSTREAM", "Project", allowlist)).toBe(true);
@@ -183,7 +195,7 @@ describe("contribution target resolution", () => {
     const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "fork", allowlist: [] });
 
     expect(target.mode).toBe("triage");
-    expect(target.reason).toContain("BYTER_UPSTREAM_ALLOWLIST");
+    expect(target.reason).toContain("SQUASHER_UPSTREAM_ALLOWLIST");
     expect(client.forkRepository).not.toHaveBeenCalled();
   });
 
@@ -233,7 +245,7 @@ describe("contribution target resolution", () => {
     const client = clientFor({
       push: false,
       openPullRequests: [
-        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "byter/fix-42", label: "contributor:byter/fix-42" } }
+        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42", label: "contributor:squasher/fix-42" } }
       ]
     });
 
@@ -241,6 +253,54 @@ describe("contribution target resolution", () => {
 
     expect(target.mode).toBe("triage");
     expect(target.existingPullRequestUrl).toBe("https://github.test/pull/4");
+    expect(target.reason).toContain("SQUASHER_MAX_OPEN_PULL_REQUESTS");
+    expect(client.forkRepository).not.toHaveBeenCalled();
+  });
+
+  it("allows a second pull request when the limit is raised", async () => {
+    // The default of one is a courtesy to maintainers receiving unsolicited pull requests,
+    // not a correctness rule, so an operator who knows it does not apply can raise it.
+    const client = clientFor({
+      push: false,
+      openPullRequests: [
+        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42", label: "contributor:squasher/fix-42" } }
+      ]
+    });
+
+    const target = await resolveContributionTarget({
+      client: client as never,
+      owner: "upstream",
+      repo: "project",
+      mode: "fork",
+      allowlist,
+      maxOpenPullRequests: 2
+    });
+
+    expect(target.mode).toBe("fork");
+    expect(client.forkRepository).toHaveBeenCalled();
+  });
+
+  it("still refuses once the raised limit is reached", async () => {
+    const client = clientFor({
+      push: false,
+      openPullRequests: [
+        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42", label: "contributor:squasher/fix-42" } },
+        { number: 5, html_url: "https://github.test/pull/5", state: "open", head: { ref: "byter/fix-45", label: "contributor:byter/fix-45" } }
+      ]
+    });
+
+    const target = await resolveContributionTarget({
+      client: client as never,
+      owner: "upstream",
+      repo: "project",
+      mode: "fork",
+      allowlist,
+      maxOpenPullRequests: 2
+    });
+
+    // Counts both prefixes: a pre-rename pull request occupies a slot too.
+    expect(target.mode).toBe("triage");
+    expect(target.reason).toContain("limit of 2");
     expect(client.forkRepository).not.toHaveBeenCalled();
   });
 
@@ -249,7 +309,7 @@ describe("contribution target resolution", () => {
       push: false,
       openPullRequests: [
         { number: 5, html_url: "https://github.test/pull/5", state: "open", head: { ref: "feature/x", label: "someone:feature/x" } },
-        { number: 6, html_url: "https://github.test/pull/6", state: "open", head: { ref: "byter/fix-1", label: "otheruser:byter/fix-1" } }
+        { number: 6, html_url: "https://github.test/pull/6", state: "open", head: { ref: "squasher/fix-1", label: "otheruser:squasher/fix-1" } }
       ]
     });
 
@@ -263,10 +323,29 @@ describe("contribution target resolution", () => {
       listPullRequests: vi.fn().mockRejectedValue(new Error("GitHub API 502 Bad Gateway"))
     };
 
-    // The sentinel makes the caller block rather than proceed on unknown state.
-    await expect(findOpenByterPullRequest(client as never, "upstream", "project", "contributor")).resolves.toContain(
-      "unknown"
-    );
+    const scan = await scanOpenSquasherPullRequests(client as never, "upstream", "project", "contributor");
+
+    // Unknown, not zero: reporting zero here is the direction that duplicates.
+    expect(scan.unreadable).toBe(true);
+    expect(scan.urls).toEqual([]);
+  });
+
+  it("blocks on an unreadable listing however high the limit is", async () => {
+    const client = clientFor({ push: false });
+    client.listPullRequests = vi.fn().mockRejectedValue(new Error("GitHub API 502 Bad Gateway"));
+
+    const target = await resolveContributionTarget({
+      client: client as never,
+      owner: "upstream",
+      repo: "project",
+      mode: "fork",
+      allowlist,
+      maxOpenPullRequests: 10
+    });
+
+    expect(target.mode).toBe("triage");
+    expect(target.reason).toContain("unknown");
+    expect(client.forkRepository).not.toHaveBeenCalled();
   });
 
   it("refuses when forking is disabled on the upstream repository", async () => {

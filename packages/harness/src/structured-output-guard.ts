@@ -1,8 +1,8 @@
-import { byterResultStatuses, provenResultStatuses } from "@byter/github-mcp";
+import { squasherResultStatuses, provenResultStatuses } from "@squasher/github-mcp";
 
 const placeholderPattern = /^(?:\.{3}|…|todo|tbd|n\/?a|placeholder|full file content)$/i;
 
-const resultStatuses = byterResultStatuses;
+const resultStatuses = squasherResultStatuses;
 
 /**
  * Must stay >= the `proof.attempts` clamp in `extractLiveProofResult`
@@ -205,17 +205,17 @@ function balancedJsonObjects(text: string): string[] {
 }
 
 /**
- * Mirrors `expectByterResult` in apps/github-mcp/src/tools.ts. Kept in step with it
+ * Mirrors `expectSquasherResult` in apps/github-mcp/src/tools.ts. Kept in step with it
  * deliberately: the guard must reject exactly what the tool would throw on, so a
  * recoverable formatting mistake becomes a retry instead of a failed run.
  */
-export const byterResultSchema: GuardSchema = {
-  name: "submit_byter_result",
+export const squasherResultSchema: GuardSchema = {
+  name: "submit_squasher_result",
 
   describe() {
     return [
       "{",
-      '  "kind": "byter.result",',
+      '  "kind": "squasher.result",',
       '  "status": "patch-ready" | "verified" | "implemented-feature" | "implemented-improvement" | "not-reproduced" | "not-actionable" | "blocked" | "failed",',
       '  "summary": string,',
       '  "proof": {',
@@ -250,8 +250,9 @@ export const byterResultSchema: GuardSchema = {
   validate(value) {
     const errors: string[] = [];
 
-    if (value.kind !== "byter.result") {
-      errors.push('Field "kind" must be exactly "byter.result".');
+    // squasher.result is the pre-rename kind, still accepted for sessions that predate it.
+    if (value.kind !== "squasher.result" && value.kind !== "byter.result") {
+      errors.push('Field "kind" must be exactly "squasher.result".');
     }
 
     const status = value.status;

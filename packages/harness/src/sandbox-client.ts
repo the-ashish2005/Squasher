@@ -44,7 +44,7 @@ export class E2bSandboxClient implements SandboxClientLike {
   static fromEnv(overrides: Partial<SandboxClientConfig> = {}): E2bSandboxClient {
     const apiKey = overrides.apiKey ?? process.env.E2B_API_KEY;
     if (!apiKey) {
-      throw new Error("E2B_API_KEY is required to start the Byter harness");
+      throw new Error("E2B_API_KEY is required to start the Squasher harness");
     }
     return new E2bSandboxClient({
       apiKey,

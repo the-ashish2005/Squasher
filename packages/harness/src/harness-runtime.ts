@@ -1,4 +1,4 @@
-import { approvalPayloadHash, type GitHubMcpWriteToolName, type GitHubRestClientLike } from "@byter/github-mcp";
+import { approvalPayloadHash, type GitHubMcpWriteToolName, type GitHubRestClientLike } from "@squasher/github-mcp";
 import {
   defaultIterationLimit,
   recordDeniedToolCall,
@@ -16,7 +16,7 @@ import {
 } from "./session-store.js";
 import { createToolDispatcher } from "./tool-dispatcher.js";
 
-export interface ByterHarnessOptions {
+export interface SquasherHarnessOptions {
   client: GitHubRestClientLike;
   llm: LlmClient;
   sandbox: SandboxClientLike;
@@ -35,10 +35,10 @@ export interface ByterHarnessOptions {
  * Self-contained replacement for the TrueForge SDK client.
  *
  * Satisfies the `TrueForgeClientLike` interface in packages/agent/src/types.ts, so
- * `ByterTrueForgeRuntime` can take it by dependency injection unchanged. The event
+ * `SquasherTrueForgeRuntime` can take it by dependency injection unchanged. The event
  * stream it produces is shaped for the parsers in apps/server/src/server.ts.
  */
-export class ByterHarness {
+export class SquasherHarness {
   readonly sessions: {
     create(request: unknown): Promise<unknown>;
     createTurn(sessionId: string, request: unknown): Promise<unknown>;
@@ -48,9 +48,9 @@ export class ByterHarness {
   };
 
   private readonly store: SessionStore;
-  private readonly options: ByterHarnessOptions;
+  private readonly options: SquasherHarnessOptions;
 
-  constructor(options: ByterHarnessOptions) {
+  constructor(options: SquasherHarnessOptions) {
     this.options = options;
     this.store = options.store ?? new SessionStore(options.dataDir ? { dataDir: options.dataDir } : {});
 
@@ -66,8 +66,8 @@ export class ByterHarness {
   static fromEnv(
     client: GitHubRestClientLike,
     options: { resolveWriteTarget?: WriteTargetResolver } = {}
-  ): ByterHarness {
-    return new ByterHarness({
+  ): SquasherHarness {
+    return new SquasherHarness({
       client,
       llm: LlmClient.fromEnv(),
       sandbox: E2bSandboxClient.fromEnv(),
@@ -116,7 +116,7 @@ export class ByterHarness {
         // The scope check needs the report verbatim; without it a feature request could
         // be accepted as a proven defect, so make the gap loud rather than silent.
         console.warn(
-          `Byter harness could not read the issue text from the initial message for session ${sessionId}; ` +
+          `Squasher harness could not read the issue text from the initial message for session ${sessionId}; ` +
             "the out-of-scope proof check is inactive for this run"
         );
       }
@@ -295,7 +295,7 @@ function parseSpec(request: unknown): HarnessSessionSpec {
     enabledTools: stringArray(mcpServer.enableTools) ?? [
       "read_issue",
       "read_file",
-      "submit_byter_result",
+      "submit_squasher_result",
       "create_fix_pull_request"
     ],
     approvalRequiredTools: stringArray(mcpServer.requireApprovalForTools) ?? ["create_fix_pull_request"]

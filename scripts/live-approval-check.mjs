@@ -21,13 +21,13 @@ for (const line of (await readFile(join(repoRoot, ".env"), "utf8")).split("\n"))
   if (match && !process.env[match[1]]) process.env[match[1]] = match[2];
 }
 
-const dataDir = await mkdtemp(join(tmpdir(), "byter-approve-"));
-const staticDir = await mkdtemp(join(tmpdir(), "byter-approve-static-"));
-await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+const dataDir = await mkdtemp(join(tmpdir(), "squasher-approve-"));
+const staticDir = await mkdtemp(join(tmpdir(), "squasher-approve-static-"));
+await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
 process.env.DATA_DIR = dataDir;
 process.env.STATIC_DIR = staticDir;
 
-const { createByterServer } = await import(join(repoRoot, "apps/server/dist/server.js"));
+const { createSquasherServer } = await import(join(repoRoot, "apps/server/dist/server.js"));
 const [owner, repoName] = targetRepo.split("/");
 
 const gh = async (path, init = {}) =>
@@ -44,7 +44,7 @@ const issue = await (await gh(`/repos/${targetRepo}/issues/${issueNumber}`)).jso
 const deliveryId = `approve-${randomUUID()}`;
 const payload = JSON.stringify({
   action: "labeled",
-  label: { name: process.env.BYTER_TRIGGER_LABEL ?? "byter:run" },
+  label: { name: process.env.SQUASHER_TRIGGER_LABEL ?? process.env.BYTER_TRIGGER_LABEL ?? "squasher:run" },
   issue: {
     number: issue.number,
     title: issue.title,
@@ -60,7 +60,7 @@ const payload = JSON.stringify({
   }
 });
 
-const server = createByterServer();
+const server = createSquasherServer();
 await new Promise((ready) => server.listen(0, "127.0.0.1", ready));
 const baseUrl = `http://127.0.0.1:${server.address().port}`;
 

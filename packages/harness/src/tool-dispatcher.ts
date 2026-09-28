@@ -5,11 +5,11 @@ import {
   type GitHubMcpToolName,
   type GitHubMcpToolResult,
   type GitHubRestClientLike
-} from "@byter/github-mcp";
+} from "@squasher/github-mcp";
 import type { ChatCompletionFunctionTool } from "openai/resources/chat/completions";
 import type { SandboxClientLike } from "./sandbox-client.js";
 import {
-  byterResultSchema,
+  squasherResultSchema,
   createFixPullRequestSchema,
   GuardValidationError,
   validateAndParse,
@@ -26,7 +26,7 @@ export const sandboxToolName = "run_command";
 
 /** Tools whose arguments are validated by the structured-output guard before running. */
 const guardedSchemas: Record<string, GuardSchema> = {
-  submit_byter_result: byterResultSchema,
+  submit_squasher_result: squasherResultSchema,
   create_fix_pull_request: createFixPullRequestSchema
 };
 
@@ -51,7 +51,7 @@ export interface ToolDispatcher {
 export function createToolDispatcher(options: ToolDispatcherOptions): ToolDispatcher {
   const githubTools = createGitHubMcpTools({ client: options.client });
   const enabled = new Set(
-    options.enabledTools ?? ["read_issue", "read_file", "submit_byter_result", "create_fix_pull_request"]
+    options.enabledTools ?? ["read_issue", "read_file", "submit_squasher_result", "create_fix_pull_request"]
   );
   enabled.add(sandboxToolName);
 
@@ -59,7 +59,7 @@ export function createToolDispatcher(options: ToolDispatcherOptions): ToolDispat
     tools() {
       const definitions: ChatCompletionFunctionTool[] = [];
 
-      for (const name of ["read_issue", "read_file", "submit_byter_result", "create_fix_pull_request"] as const) {
+      for (const name of ["read_issue", "read_file", "submit_squasher_result", "create_fix_pull_request"] as const) {
         if (!enabled.has(name)) continue;
         definitions.push({
           type: "function",
@@ -69,7 +69,7 @@ export function createToolDispatcher(options: ToolDispatcherOptions): ToolDispat
             parameters: inputSchemaFor(name) as Record<string, unknown>,
             // Server-validated strict mode; the guard still re-checks the semantic rules
             // that a JSON Schema cannot express.
-            strict: name === "submit_byter_result"
+            strict: name === "submit_squasher_result"
           }
         });
       }
@@ -187,8 +187,8 @@ function describeGitHubTool(name: GitHubMcpToolName): string {
       return "Read a GitHub issue by owner, repo, and number.";
     case "read_file":
       return "Read a repository file at an optional ref.";
-    case "submit_byter_result":
-      return "Submit the final Byter proof contract without mutating GitHub.";
+    case "submit_squasher_result":
+      return "Submit the final Squasher proof contract without mutating GitHub.";
     case "create_fix_pull_request":
       return "Create a fix branch with explicit file contents and open a draft pull request. Requires maintainer approval.";
     default:

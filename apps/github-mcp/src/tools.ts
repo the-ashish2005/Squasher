@@ -80,11 +80,11 @@ export interface ApprovalContext {
 }
 
 /**
- * Every status a Byter result may carry, and the single source of truth for the three
+ * Every status a Squasher result may carry, and the single source of truth for the three
  * places that validate it: this tool's argument check, the harness's structured-output
  * guard, and the server's result parser.
  *
- * Byter handles two kinds of actionable issue, and the status says which one was found:
+ * Squasher handles two kinds of actionable issue, and the status says which one was found:
  *
  * - patch-ready / verified        a reported defect was reproduced. "verified" is a
  *                                reproduction without a fix attached; "patch-ready" adds
@@ -98,7 +98,13 @@ export interface ApprovalContext {
  *                                ambiguous, unrelated to the project, or out of scope.
  * - blocked / failed             execution could not complete.
  */
-export const byterResultStatuses = [
+/** Proof `kind` used before the project was renamed from Squasher to Squasher. */
+export const legacyResultKind = "byter.result";
+
+/** Proof-submission tool name used before the rename. */
+export const legacyResultToolName = "submit_byter_result";
+
+export const squasherResultStatuses = [
   "patch-ready",
   "verified",
   "implemented-feature",
@@ -109,7 +115,7 @@ export const byterResultStatuses = [
   "failed"
 ] as const;
 
-export type ByterResultStatus = (typeof byterResultStatuses)[number];
+export type SquasherResultStatus = (typeof squasherResultStatuses)[number];
 
 /** Asserts a reported defect was reproduced. Requires failure-then-pass evidence. */
 export const bugProofStatuses: ReadonlySet<string> = new Set(["patch-ready", "verified"]);
@@ -134,7 +140,7 @@ export const provenResultStatuses: ReadonlySet<string> = new Set([
 export type GitHubMcpToolName =
   | "read_issue"
   | "read_file"
-  | "submit_byter_result"
+  | "submit_squasher_result"
   | "add_verified_label"
   | "comment_on_issue"
   | "create_fix_pull_request";
@@ -165,12 +171,12 @@ export function listGitHubTools(): Array<{ name: GitHubMcpToolName; description:
     { name: "read_issue", description: "Read a GitHub issue by owner, repo, and number.", requiresApproval: false },
     { name: "read_file", description: "Read a repository file at an optional ref.", requiresApproval: false },
     {
-      name: "submit_byter_result",
-      description: "Submit the final Byter proof contract without mutating GitHub.",
+      name: "submit_squasher_result",
+      description: "Submit the final Squasher proof contract without mutating GitHub.",
       requiresApproval: false
     },
-    { name: "add_verified_label", description: "Add byter:verified after proof is complete.", requiresApproval: true },
-    { name: "comment_on_issue", description: "Post a Byter evidence comment.", requiresApproval: true },
+    { name: "add_verified_label", description: "Add squasher:verified after proof is complete.", requiresApproval: true },
+    { name: "comment_on_issue", description: "Post a Squasher evidence comment.", requiresApproval: true },
     {
       name: "create_fix_pull_request",
       description: "Create a fix branch with explicit file contents and open a draft pull request.",
@@ -186,7 +192,14 @@ export function createGitHubMcpTools({ client, now, sleep }: GitHubMcpServerOpti
   };
 
   return {
-    async callTool(call: GitHubMcpToolCall): Promise<GitHubMcpToolResult> {
+    async callTool(incoming: GitHubMcpToolCall): Promise<GitHubMcpToolResult> {
+      // A session paused before the rename has submit_byter_result in its message history
+      // and may call it again on resume. Accept that spelling as the tool it became.
+      const call: GitHubMcpToolCall =
+        (incoming.name as string) === legacyResultToolName
+          ? { ...incoming, name: "submit_squasher_result" }
+          : incoming;
+
       switch (call.name) {
         case "read_issue": {
           const { owner, repo, issueNumber } = parseRepoIssueArgs(call.arguments);
@@ -207,13 +220,13 @@ export function createGitHubMcpTools({ client, now, sleep }: GitHubMcpServerOpti
         }
 
         case "read_file": {
-          const { owner, repo, path, ref } = parseReadFileArgs(call.arguments);
+          const { owner, repo, path, ref, ...range } = parseReadFileArgs(call.arguments);
           const file = await client.getFile(owner, repo, path, ref);
-          return textResult(JSON.stringify(file, null, 2));
+          return textResult(JSON.stringify(readFileWindow(file, range), null, 2));
         }
 
-        case "submit_byter_result": {
-          expectByterResult(call.arguments);
+        case "submit_squasher_result": {
+          expectSquasherResult(call.arguments);
           const isPatchReady = call.arguments.status === "patch-ready";
           return textResult(
             JSON.stringify({
@@ -231,8 +244,8 @@ export function createGitHubMcpTools({ client, now, sleep }: GitHubMcpServerOpti
         case "add_verified_label": {
           assertApproved(call.approval, approvalPayloadHash(call.name, call.arguments));
           const { owner, repo, issueNumber } = parseRepoIssueArgs(call.arguments);
-          await client.addLabels(owner, repo, issueNumber, ["byter:verified"]);
-          return textResult("Added byter:verified label.");
+          await client.addLabels(owner, repo, issueNumber, ["squasher:verified"]);
+          return textResult("Added squasher:verified label.");
         }
 
         case "comment_on_issue": {
@@ -263,7 +276,7 @@ export function createGitHubMcpTools({ client, now, sleep }: GitHubMcpServerOpti
             files: request.files.map((file) => ({ path: file.path, content: file.content }))
           });
           const commit = await client.createCommit(request.headOwner, request.repo, {
-            message: `Byter fix: ${request.title}`,
+            message: `Squasher fix: ${request.title}`,
             tree: tree.sha,
             parents: [base.commit.sha]
           });
@@ -309,6 +322,159 @@ export function approvalPayloadHash(name: GitHubMcpWriteToolName, args: Record<s
   return createHash("sha256").update(stableStringify(canonicalWritePayload(name, args))).digest("hex");
 }
 
+/**
+ * Hard ceiling on the decoded bytes any single read may return.
+ *
+ * One unbounded read is enough to end a run. Observed live on talkasab/peruse: reading a
+ * 42 KB source file returned 59,793 bytes in one tool response -- base64 is a third larger
+ * than the text it encodes, and JSON escaping adds more -- which pushed the conversation to
+ * 215 KB and timed out the next model request. A caller may ask for less than this; it
+ * cannot ask for more.
+ */
+export const maxReadFileBytes = 32 * 1024;
+
+export interface ReadFileWindowOptions {
+  /** First line to return, 1-based. Defaults to the start of the file. */
+  startLine?: number;
+  /** Last line to return, inclusive. Defaults to the end of the file. */
+  endLine?: number;
+  /** Byte ceiling for this window, clamped to maxReadFileBytes. */
+  maxBytes?: number;
+}
+
+export interface ReadFileWindow {
+  path: string;
+  sha: string;
+  size: number;
+  encoding: string;
+  content: string;
+  /** Total lines in the file, so a caller can tell where a window sits. */
+  totalLines?: number;
+  startLine?: number;
+  endLine?: number;
+  returnedBytes?: number;
+  /** True when this window reaches the end of the file. */
+  complete?: boolean;
+  /** True when the window stops short of what was asked for. */
+  truncated?: boolean;
+  /** Where to continue from, present only when content remains. */
+  nextStartLine?: number;
+  notice?: string;
+}
+
+/**
+ * Returns a bounded window of a repository file.
+ *
+ * Decoding matters as much as the bound: GitHub returns base64, which the model cannot read
+ * without spending tokens transcribing it, so passing it through was both larger than the
+ * file and less useful than it.
+ *
+ * Windows are line-based because source code is read in line ranges, with a byte ceiling on
+ * top because a single minified line can be larger than any sensible window. A window that
+ * stops short says so and names the line to continue from, so a large file is inspected in
+ * pieces rather than being unreachable past its first chunk.
+ */
+export function readFileWindow(
+  file: { path: string; sha: string; size?: number; encoding: string; content: string },
+  options: ReadFileWindowOptions = {}
+): ReadFileWindow {
+  const raw = file.encoding === "base64" ? Buffer.from(file.content, "base64") : Buffer.from(file.content, "utf8");
+  const size = typeof file.size === "number" ? file.size : raw.byteLength;
+  const base = { path: file.path, sha: file.sha, size };
+
+  // A NUL byte means this is not source text; a decoded blob would be noise.
+  if (raw.includes(0)) {
+    return {
+      ...base,
+      encoding: "none",
+      content: "",
+      complete: false,
+      notice: `Binary file, not returned. Fetch it in the sandbox if it is needed, and verify it against sha ${file.sha}.`
+    };
+  }
+
+  const text = raw.toString("utf8");
+  // Split after each newline so every piece keeps its own ending and reassembly is exact.
+  const lines = text.length > 0 ? text.split(/(?<=\n)/) : [];
+  const totalLines = lines.length;
+
+  const ceiling = Math.min(options.maxBytes ?? maxReadFileBytes, maxReadFileBytes);
+  const firstLine = Math.min(Math.max(options.startLine ?? 1, 1), Math.max(totalLines, 1));
+  const requestedLast = Math.min(options.endLine ?? totalLines, totalLines);
+
+  if (totalLines === 0) {
+    return { ...base, encoding: "utf8", content: "", totalLines: 0, startLine: 1, endLine: 0, returnedBytes: 0, complete: true };
+  }
+
+  if (firstLine > totalLines || requestedLast < firstLine) {
+    return {
+      ...base,
+      encoding: "utf8",
+      content: "",
+      totalLines,
+      startLine: firstLine,
+      endLine: firstLine - 1,
+      returnedBytes: 0,
+      complete: firstLine > totalLines,
+      notice: `Requested range is empty. The file has ${totalLines} lines.`
+    };
+  }
+
+  let content = "";
+  let bytes = 0;
+  let lastLine = firstLine - 1;
+  for (let line = firstLine; line <= requestedLast; line += 1) {
+    const piece = lines[line - 1] ?? "";
+    const pieceBytes = Buffer.byteLength(piece, "utf8");
+
+    if (bytes + pieceBytes > ceiling) {
+      if (bytes === 0) {
+        // A single line larger than the whole window: cut it on a character boundary so the
+        // model is not handed a broken code point.
+        const slice = new TextDecoder("utf-8").decode(Buffer.from(piece, "utf8").subarray(0, ceiling)).replace(/\uFFFD$/, "");
+        content = slice;
+        bytes = Buffer.byteLength(slice, "utf8");
+        lastLine = line;
+      }
+      break;
+    }
+
+    content += piece;
+    bytes += pieceBytes;
+    lastLine = line;
+  }
+
+  // A line cut mid-way must be re-read, not skipped, and never counts as complete: a
+  // minified bundle is one line, so a line-only test would call 32 KB of an 80 KB bundle
+  // the whole file.
+  const partialLine = bytes > 0 && lastLine >= firstLine && content !== lines.slice(firstLine - 1, lastLine).join("");
+  const reachedRequestedEnd = lastLine >= requestedLast && !partialLine;
+  const complete = reachedRequestedEnd && requestedLast >= totalLines;
+  const nextStartLine = complete ? undefined : partialLine ? lastLine : lastLine + 1;
+
+  return {
+    ...base,
+    encoding: "utf8",
+    content,
+    totalLines,
+    startLine: firstLine,
+    endLine: lastLine,
+    returnedBytes: bytes,
+    complete,
+    ...(complete ? {} : { truncated: true }),
+    ...(nextStartLine !== undefined && nextStartLine <= totalLines ? { nextStartLine } : {}),
+    ...(complete
+      ? {}
+      : {
+          notice:
+            `Lines ${firstLine}-${lastLine} of ${totalLines}${partialLine ? " (last line cut at the byte ceiling)" : ""}. ` +
+            `This is not the whole file: do not reconstruct it from what is shown, and do not treat the visible end as ` +
+            `the end of the file. Continue with startLine ${nextStartLine ?? lastLine + 1}, or materialise the whole ` +
+            `file in the sandbox and verify it against sha ${file.sha} before patching it.`
+        })
+  };
+}
+
 function textResult(text: string): GitHubMcpToolResult {
   return { content: [{ type: "text", text }] };
 }
@@ -334,7 +500,7 @@ function canonicalWritePayload(name: GitHubMcpWriteToolName, args: Record<string
         tool: name,
         arguments: {
           ...parseRepoIssueArgs(args),
-          labels: ["byter:verified"]
+          labels: ["squasher:verified"]
         }
       };
     }
@@ -391,8 +557,20 @@ function parseReadFileArgs(args: Record<string, unknown>) {
     owner: expectString(args.owner, "owner"),
     repo: expectString(args.repo, "repo"),
     path: expectString(args.path, "path"),
-    ref: typeof args.ref === "string" ? args.ref : undefined
+    ref: typeof args.ref === "string" ? args.ref : undefined,
+    ...(args.startLine !== undefined ? { startLine: expectPositiveInteger(args.startLine, "startLine") } : {}),
+    ...(args.endLine !== undefined ? { endLine: expectPositiveInteger(args.endLine, "endLine") } : {}),
+    ...(args.maxBytes !== undefined ? { maxBytes: expectPositiveInteger(args.maxBytes, "maxBytes") } : {})
   };
+}
+
+/** Rejects a bad range outright rather than silently reading from somewhere else. */
+function expectPositiveInteger(value: unknown, name: string): number {
+  const parsed = typeof value === "string" ? Number(value) : value;
+  if (typeof parsed !== "number" || !Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`Expected a positive whole number argument: ${name}`);
+  }
+  return parsed;
 }
 
 function parseCreatePullRequestArgs(args: Record<string, unknown>) {
@@ -461,12 +639,14 @@ function isNotFound(error: unknown): boolean {
   return Boolean(error) && typeof error === "object" && (error as { status?: number }).status === 404;
 }
 
-function expectByterResult(args: Record<string, unknown>): void {
-  if (args.kind !== "byter.result") {
-    throw new Error("Expected kind=byter.result");
+function expectSquasherResult(args: Record<string, unknown>): void {
+  // squasher.result is the current contract; squasher.result is what sessions paused before
+  // the rename still carry in their message history, so both are accepted.
+  if (args.kind !== "squasher.result" && args.kind !== legacyResultKind) {
+    throw new Error("Expected kind=squasher.result");
   }
-  if (typeof args.status !== "string" || !(byterResultStatuses as readonly string[]).includes(args.status)) {
-    throw new Error("Expected a valid Byter result status");
+  if (typeof args.status !== "string" || !(squasherResultStatuses as readonly string[]).includes(args.status)) {
+    throw new Error("Expected a valid Squasher result status");
   }
   // Identical rigor for a reproduced defect and an implemented change: the bar is
   // executed, repeated evidence either way.

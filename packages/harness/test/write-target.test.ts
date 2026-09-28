@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { approvalPayloadHash, type GitHubRestClientLike } from "@byter/github-mcp";
-import { buildByterAgentSpec } from "@byter/agent";
+import { approvalPayloadHash, type GitHubRestClientLike } from "@squasher/github-mcp";
+import { buildSquasherAgentSpec } from "@squasher/agent";
 import { contributionDisclosureMarker, withContributionDisclosure } from "../src/agent-loop.js";
-import { ByterHarness } from "../src/harness-runtime.js";
+import { SquasherHarness } from "../src/harness-runtime.js";
 import { SessionStore } from "../src/session-store.js";
 import type { LlmClient, LlmResponse } from "../src/llm-client.js";
 import type { SandboxClientLike } from "../src/sandbox-client.js";
@@ -11,14 +11,14 @@ const writeArguments = {
   owner: "upstream",
   repo: "project",
   baseBranch: "main",
-  branchName: "byter/fix-42-abc1234567",
+  branchName: "squasher/fix-42-abc1234567",
   title: "Fix trailing slash handling",
   body: "Guards lastSegment against a trailing slash.",
   files: [{ path: "src/paths.ts", content: "export const fixed = true;\n" }]
 };
 
 const proofContract = {
-  kind: "byter.result",
+  kind: "squasher.result",
   status: "patch-ready",
   summary: "The reported failure was reproduced three times and then fixed.",
   proof: {
@@ -92,8 +92,8 @@ function fakeGitHub(): GitHubRestClientLike {
 }
 
 /** Runs one turn where the model submits proof and then requests the gated write. */
-async function runWriteTurn(harness: ByterHarness) {
-  const spec = buildByterAgentSpec({ modelName: "deepseek-flash", modelProvider: "deepseek" });
+async function runWriteTurn(harness: SquasherHarness) {
+  const spec = buildSquasherAgentSpec({ modelName: "deepseek-flash", modelProvider: "deepseek" });
   const created = (await harness.sessions.create({ agent: { spec } })) as { data: { id: string } };
   const turn = (await harness.sessions.createTurn(created.data.id, {
     input: [{ type: "user.message", content: "Analyze issue 42." }]
@@ -110,7 +110,7 @@ async function runWriteTurn(harness: ByterHarness) {
 
 function writeScript() {
   return scriptedLlm([
-    toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: proofContract }]),
+    toolCallResponse([{ id: "call_1", name: "submit_squasher_result", arguments: proofContract }]),
     toolCallResponse([{ id: "call_2", name: "create_fix_pull_request", arguments: writeArguments }]),
     textResponse(JSON.stringify(proofContract))
   ]);
@@ -120,7 +120,7 @@ describe("write target policy", () => {
   it("leaves arguments untouched when no resolver is supplied", async () => {
     const store = new SessionStore({});
     const { llm } = writeScript();
-    const harness = new ByterHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
 
     const { sessionId } = await runWriteTurn(harness);
 
@@ -133,7 +133,7 @@ describe("write target policy", () => {
   it("stamps the fork owner into the paused arguments and the approval hash", async () => {
     const store = new SessionStore({});
     const { llm } = writeScript();
-    const harness = new ByterHarness({
+    const harness = new SquasherHarness({
       client: fakeGitHub(),
       llm,
       sandbox: fakeSandbox(),
@@ -153,7 +153,7 @@ describe("write target policy", () => {
   it("discloses the automated contribution in the body the approver sees", async () => {
     const store = new SessionStore({});
     const { llm } = writeScript();
-    const harness = new ByterHarness({
+    const harness = new SquasherHarness({
       client: fakeGitHub(),
       llm,
       sandbox: fakeSandbox(),
@@ -172,7 +172,7 @@ describe("write target policy", () => {
   it("does not disclose on a same-repository write", async () => {
     const store = new SessionStore({});
     const { llm } = writeScript();
-    const harness = new ByterHarness({
+    const harness = new SquasherHarness({
       client: fakeGitHub(),
       llm,
       sandbox: fakeSandbox(),
@@ -188,12 +188,12 @@ describe("write target policy", () => {
   it("refuses the write without pausing, and keeps the submitted proof", async () => {
     const store = new SessionStore({});
     const { llm } = writeScript();
-    const harness = new ByterHarness({
+    const harness = new SquasherHarness({
       client: fakeGitHub(),
       llm,
       sandbox: fakeSandbox(),
       store,
-      resolveWriteTarget: () => ({ allowed: false, reason: "upstream/project is not in BYTER_UPSTREAM_ALLOWLIST" })
+      resolveWriteTarget: () => ({ allowed: false, reason: "upstream/project is not in SQUASHER_UPSTREAM_ALLOWLIST" })
     });
 
     const { sessionId, events } = await runWriteTurn(harness);
@@ -206,7 +206,7 @@ describe("write target policy", () => {
       (event) => event.type === "tool.response" && String(event.content).includes("refused by contribution policy")
     );
     expect(refusal).toBeDefined();
-    expect(String(refusal?.content)).toContain("BYTER_UPSTREAM_ALLOWLIST");
+    expect(String(refusal?.content)).toContain("SQUASHER_UPSTREAM_ALLOWLIST");
 
     // The turn still finishes with the proof intact rather than failing.
     expect(events.at(-1)).toMatchObject({ type: "turn.done", state: { status: "completed" } });
@@ -215,7 +215,7 @@ describe("write target policy", () => {
   it("refuses the write when the policy lookup itself throws", async () => {
     const store = new SessionStore({});
     const { llm } = writeScript();
-    const harness = new ByterHarness({
+    const harness = new SquasherHarness({
       client: fakeGitHub(),
       llm,
       sandbox: fakeSandbox(),
@@ -259,7 +259,7 @@ describe("approval checkpoint lifetime", () => {
     const store = new SessionStore({});
     const github = fakeGitHub();
     github.createPullRequest = options.createPullRequest as never;
-    const harness = new ByterHarness({ client: github, llm: writeScript().llm, sandbox: fakeSandbox(), store });
+    const harness = new SquasherHarness({ client: github, llm: writeScript().llm, sandbox: fakeSandbox(), store });
 
     const { sessionId } = await runWriteTurn(harness);
     expect(store.pending(sessionId)).toBeDefined();
@@ -311,11 +311,11 @@ describe("approval checkpoint lifetime", () => {
     // Runs a sandbox command first, so there is a live sandbox for the pause to hold.
     const { llm } = scriptedLlm([
       toolCallResponse([{ id: "call_0", name: "run_command", arguments: { command: "node repro.ts" } }]),
-      toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_1", name: "submit_squasher_result", arguments: proofContract }]),
       toolCallResponse([{ id: "call_2", name: "create_fix_pull_request", arguments: writeArguments }]),
       textResponse(JSON.stringify(proofContract))
     ]);
-    const harness = new ByterHarness({ client: github, llm, sandbox, store });
+    const harness = new SquasherHarness({ client: github, llm, sandbox, store });
 
     const { sessionId } = await runWriteTurn(harness);
     expect(sandbox.createSandbox).toHaveBeenCalled();
@@ -342,7 +342,7 @@ describe("approval checkpoint lifetime", () => {
 
   it("clears the approval when the maintainer denies it", async () => {
     const store = new SessionStore({});
-    const harness = new ByterHarness({
+    const harness = new SquasherHarness({
       client: fakeGitHub(),
       llm: writeScript().llm,
       sandbox: fakeSandbox(),

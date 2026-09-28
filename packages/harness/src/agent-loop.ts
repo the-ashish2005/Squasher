@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { approvalPayloadHash, type GitHubMcpWriteToolName } from "@byter/github-mcp";
+import { approvalPayloadHash, type GitHubMcpWriteToolName } from "@squasher/github-mcp";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { LlmRateLimitError, type LlmClient } from "./llm-client.js";
 import {
   buildCorrectionMessage,
-  byterResultSchema,
+  squasherResultSchema,
   createFixPullRequestSchema,
   GuardValidationError,
   type GuardSchema
@@ -17,7 +17,7 @@ export const defaultIterationLimit = 64;
 export const mainThreadId = "main";
 
 const guardedSchemas: Record<string, GuardSchema> = {
-  submit_byter_result: byterResultSchema,
+  submit_squasher_result: squasherResultSchema,
   create_fix_pull_request: createFixPullRequestSchema
 };
 
@@ -56,7 +56,7 @@ export interface AgentLoopOptions {
  * becomes a `turn.done` error event that the server's existing handling recognises.
  *
  * Emits the event shapes consumed by `projectTrueForgeEvent`,
- * `extractSubmittedByterResult`, `extractTrueForgePendingApproval` and
+ * `extractSubmittedSquasherResult`, `extractTrueForgePendingApproval` and
  * `trueForgeTurnError` in apps/server/src/server.ts.
  */
 export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
@@ -147,7 +147,7 @@ export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
               role: "user",
               content:
                 "The gated GitHub write was refused by policy, not by a maintainer. Do not retry it. " +
-                "Return the same byter.result object as your final response so the evidence is preserved."
+                "Return the same squasher.result object as your final response so the evidence is preserved."
             }
           ]);
           continue;
@@ -167,7 +167,7 @@ export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
         // either direction: a defect claim for an issue that reported no failure, or an
         // implementation claim for one that did. Runs before the result is accepted, and so
         // before the issue can be labelled.
-        if (toolCall.name === "submit_byter_result") {
+        if (toolCall.name === "submit_squasher_result") {
           const problem = resultContractProblem(args, issueTextFor(store, sessionId));
           if (problem) {
             throw new GuardValidationError(toolCall.name, JSON.stringify(args).slice(0, 8 * 1024), problem);
@@ -275,7 +275,7 @@ export async function resumeApprovedToolCall(
     return false;
   }
 
-  // Let the model emit its closing byter.result message on this same turn.
+  // Let the model emit its closing squasher.result message on this same turn.
   await runAgentTurn(options);
   return true;
 }
@@ -384,14 +384,17 @@ async function resolveWriteTargetFor(
   };
 }
 
-export const contributionDisclosureMarker = "<!-- byter:disclosure -->";
+export const contributionDisclosureMarker = "<!-- squasher:disclosure -->";
+
+/** Marker used before the rename. Recognised so an existing body is not stamped twice. */
+export const legacyContributionDisclosureMarker = "<!-- byter:disclosure -->";
 
 /**
  * Appends an automated-contribution disclosure. Idempotent, so a resubmitted body is not
  * stamped twice.
  */
 export function withContributionDisclosure(body: string): string {
-  if (body.includes(contributionDisclosureMarker)) {
+  if (body.includes(contributionDisclosureMarker) || body.includes(legacyContributionDisclosureMarker)) {
     return body;
   }
 
@@ -400,7 +403,7 @@ export function withContributionDisclosure(body: string): string {
     "",
     "---",
     contributionDisclosureMarker,
-    "**Automated contribution.** This pull request was prepared by [Byter](https://github.com/the-ashish2005/Squasher), " +
+    "**Automated contribution.** This pull request was prepared by [Squasher](https://github.com/the-ashish2005/Squasher), " +
       "an automated agent that reproduces a reported defect in a sandbox before proposing a fix. " +
       "A human reviewed and approved this patch before it was opened.",
     "",

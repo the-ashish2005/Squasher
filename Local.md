@@ -1,24 +1,24 @@
-# Complete Guide: Running & Deploying Byter + TrueForge
+# Complete Guide: Running & Deploying Squasher + TrueForge
 
-This document is the exhaustive, zero-to-running operational and deployment guide for **Byter** built for the [WeMakeDevs TrueForge Agent Harness Hackathon](https://www.wemakedevs.org/hackathons/trueforge).
+This document is the exhaustive, zero-to-running operational and deployment guide for **Squasher** built for the [WeMakeDevs TrueForge Agent Harness Hackathon](https://www.wemakedevs.org/hackathons/trueforge).
 
 It provides complete, copy-paste-ready instructions for:
-1. **Local Development (Part 1)**: Zero-to-running local stack (TrueForge Harness + Byter Backend + Live React Dashboard + Smee Webhook Tunnel + One-Time UI Configuration).
-2. **Multi-Service Railway Deployment (Part 2)**: Full production cloud setup (Service 1: TrueForge Agent Harness + Service 2: Byter CI & Dashboard, connected via MCP and public webhooks).
+1. **Local Development (Part 1)**: Zero-to-running local stack (TrueForge Harness + Squasher Backend + Live React Dashboard + Smee Webhook Tunnel + One-Time UI Configuration).
+2. **Multi-Service Railway Deployment (Part 2)**: Full production cloud setup (Service 1: TrueForge Agent Harness + Service 2: Squasher CI & Dashboard, connected via MCP and public webhooks).
 3. **Reference Architecture & Troubleshooting (Parts 3 & 4)**: Network topology, port matrices, security screening rules, and edge-case resolution.
 
 ---
 
 ## Architecture Breakdown
 
-Byter operates as an autonomous CI system for bug reports using a decoupled **two-service architecture**:
+Squasher operates as an autonomous CI system for bug reports using a decoupled **two-service architecture**:
 
 ```
                                ┌─────────────────────────────────────────────────────────────┐
                                │                 Local or Railway Environment                │
                                │                                                             │
 ┌─────────────────┐           │   ┌────────────────────────┐      ┌─────────────────────┐   │
-│   GitHub Repo   │           │   │  Service 1: TrueForge  │      │   Service 2: Byter  │   │
+│   GitHub Repo   │           │   │  Service 1: TrueForge  │      │   Service 2: Squasher  │   │
 │   (Issues, PRs) │           │   │  - Agent Execution Loop│◄────►│  - Webhook Intake   │   │
 └────────┬────────┘           │   │  - OpenAI gpt-5.6-sol  │      │  - Verification FSM │   │
          │                    │   │  - Sandbox Execution   │      │  - GitHub MCP Server│   │
@@ -35,11 +35,11 @@ Byter operates as an autonomous CI system for bug reports using a decoupled **tw
 - **Service 1: TrueForge Agent Harness (`@truefoundry/trueforge`)**
   - Connects model inference (`openai/gpt-5.6-sol`) and manages multi-turn agent execution loops.
   - In Standalone mode (`STANDALONE=true`), manages an embedded SQLite session database and local process sandboxes without requiring external Postgres or Redis clusters.
-  - Queries Byter's GitHub MCP Server over HTTP JSON-RPC to inspect code and submit verified proof contracts.
-- **Service 2: Byter CI, Dashboard & GitHub MCP Server (`@byter/server`)**
+  - Queries Squasher's GitHub MCP Server over HTTP JSON-RPC to inspect code and submit verified proof contracts.
+- **Service 2: Squasher CI, Dashboard & GitHub MCP Server (`@squasher/server`)**
   - Ingests GitHub webhooks (`issues`, `issue_comment`) with HMAC-SHA256 signature verification and prompt injection screening.
   - Orchestrates a 20-state deterministic finite state machine (FSM) enforcing a **strict 3/3 target failure reproduction rule**.
-  - Hosts the remote GitHub Model Context Protocol (MCP) server providing read tools (`read_issue`, `read_file`, `submit_byter_result`) and gated write tools (`create_fix_pull_request`).
+  - Hosts the remote GitHub Model Context Protocol (MCP) server providing read tools (`read_issue`, `read_file`, `submit_squasher_result`) and gated write tools (`create_fix_pull_request`).
   - Serves the live React 19 observability dashboard and enforces a human-in-the-loop maintainer approval gate before publishing draft pull requests.
 
 ---
@@ -65,8 +65,8 @@ Ensure the following runtimes and credentials are ready on your machine:
 #### 2.1 Clone and Install
 
 ```bash
-git clone https://github.com/MAYANK-MAHAUR/Byter.git
-cd Byter
+git clone https://github.com/MAYANK-MAHAUR/Squasher.git
+cd Squasher
 pnpm install
 ```
 
@@ -76,13 +76,13 @@ The repository contains **7 packages** (1 root + 6 workspace packages):
 
 | # | Package Name | Workspace Directory | Role & Description | Test Files & Count |
 |---|---|---|---|---|
-| 1 | `byter` (root) | `.` | Monorepo orchestrator scripts (`verify`, `build`, `lint`, `typecheck`, `test`, `dev`, `start`) | Workspace delegation |
-| 2 | `@byter/core` | `packages/core` | 20-state FSM (`state-machine.ts`), prompt injection & dangerous shell scanner (`security.ts`), domain types | 2 files &rarr; **9 tests** |
-| 3 | `@byter/agent` | `packages/agent` | TrueForge SDK runtime (`runtime.ts`), Agent spec, native tool approval resume, and instructions generator (`byter-agent.ts`) | 1 file &rarr; **10 tests** |
-| 4 | `@byter/github` | `packages/github` | GitHub REST client (`client.ts`), HMAC-SHA256 webhook validator (`webhook.ts`), App auth (`app-auth.ts`) | 3 files &rarr; **14 tests** |
-| 5 | `@byter/github-mcp` | `apps/github-mcp` | Remote JSON-RPC 2.0 MCP server hosting 6 GitHub MCP tools (`http.ts`, `tools.ts`) | 2 files &rarr; **15 tests** |
-| 6 | `@byter/server` | `apps/server` | Production HTTP server: `/healthz`, `/mcp`, `/api/github/webhook`, `/api/approvals`, static SPA | 2 files &rarr; **29 tests** |
-| 7 | `@byter/web` | `apps/web` | React 19 + Vite dashboard: live triage view, evidence visualizer, markdown/LaTeX viewer, approval UI | 1 file &rarr; **2 tests** |
+| 1 | `squasher` (root) | `.` | Monorepo orchestrator scripts (`verify`, `build`, `lint`, `typecheck`, `test`, `dev`, `start`) | Workspace delegation |
+| 2 | `@squasher/core` | `packages/core` | 20-state FSM (`state-machine.ts`), prompt injection & dangerous shell scanner (`security.ts`), domain types | 2 files &rarr; **9 tests** |
+| 3 | `@squasher/agent` | `packages/agent` | TrueForge SDK runtime (`runtime.ts`), Agent spec, native tool approval resume, and instructions generator (`squasher-agent.ts`) | 1 file &rarr; **10 tests** |
+| 4 | `@squasher/github` | `packages/github` | GitHub REST client (`client.ts`), HMAC-SHA256 webhook validator (`webhook.ts`), App auth (`app-auth.ts`) | 3 files &rarr; **14 tests** |
+| 5 | `@squasher/github-mcp` | `apps/github-mcp` | Remote JSON-RPC 2.0 MCP server hosting 6 GitHub MCP tools (`http.ts`, `tools.ts`) | 2 files &rarr; **15 tests** |
+| 6 | `@squasher/server` | `apps/server` | Production HTTP server: `/healthz`, `/mcp`, `/api/github/webhook`, `/api/approvals`, static SPA | 2 files &rarr; **29 tests** |
+| 7 | `@squasher/web` | `apps/web` | React 19 + Vite dashboard: live triage view, evidence visualizer, markdown/LaTeX viewer, approval UI | 1 file &rarr; **2 tests** |
 
 #### 2.3 Run Automated Verification Suite
 
@@ -115,29 +115,29 @@ Copy-Item .env.example .env
 
 | Variable | Local Default | Description | Required |
 | :--- | :--- | :--- | :--- |
-| `PORT` | `8787` | HTTP port for Byter API & webhook intake server | Yes |
+| `PORT` | `8787` | HTTP port for Squasher API & webhook intake server | Yes |
 | `DATA_DIR` | `.data-local` | Directory path for JSONL persistence (`webhook-runs.jsonl`, `approvals.jsonl`) | Yes |
 | `APP_BASE_URL` | `http://127.0.0.1:8787` | Canonical base URL for dashboard and GitHub issue comment links | Yes |
 | `APPROVAL_TOKEN` | `local-approval-secret-token` | Bearer token authenticating maintainer approval requests | Yes |
 | `GITHUB_WEBHOOK_SECRET` | `local-webhook-secret` | Shared secret for HMAC-SHA256 signature verification | Yes |
-| `BYTER_API_TARGET` | `http://127.0.0.1:8787` | Proxy target for Vite dev server (`apps/web`) | Yes |
-| `VITE_BYTER_API_URL` | *(empty)* | Direct API URL (leave empty for relative proxy routing) | Optional |
+| `SQUASHER_API_TARGET` | `http://127.0.0.1:8787` | Proxy target for Vite dev server (`apps/web`) | Yes |
+| `VITE_SQUASHER_API_URL` | *(empty)* | Direct API URL (leave empty for relative proxy routing) | Optional |
 | `MODEL_PROVIDER` | `openai` | Model provider for TrueForge agent spec | Yes |
 | `MODEL_NAME` | `gpt-5.6-sol` | OpenAI model identifier | Yes |
 | `OPENAI_API_KEY` | `sk-...` | OpenAI API key with access to `gpt-5.6-sol` | Yes |
 | `TRUEFORGE_URL` | `http://localhost:3000` | Base URL of local TrueForge harness | Yes |
 | `TRUEFORGE_API_KEY` | `local-trueforge-key` | Token passed in headers to TrueForge | Yes |
-| `TRUEFORGE_MCP_SERVER_NAME` | `byter-github` | Identifier of MCP connector registered in TrueForge | Yes |
-| `MCP_AUTH_TOKEN` | `local-mcp-secret-token` | Shared secret Bearer token authenticating TrueForge calls to Byter's `/mcp` | Yes |
+| `TRUEFORGE_MCP_SERVER_NAME` | `squasher-github` | Identifier of MCP connector registered in TrueForge | Yes |
+| `MCP_AUTH_TOKEN` | `local-mcp-secret-token` | Shared secret Bearer token authenticating TrueForge calls to Squasher's `/mcp` | Yes |
 | `GITHUB_TOKEN` | `ghp_...` | GitHub Personal Access Token or App token with repo permissions | Yes |
-| `BYTER_REQUIRE_TRIGGER_LABEL` | `true` | When true, only triages issues with `BYTER_TRIGGER_LABEL` | Yes |
-| `BYTER_TRIGGER_LABEL` | `byter:run` | GitHub label required to trigger Byter | Yes |
+| `SQUASHER_REQUIRE_TRIGGER_LABEL` | `true` | When true, only triages issues with `SQUASHER_TRIGGER_LABEL` | Yes |
+| `SQUASHER_TRIGGER_LABEL` | `squasher:run` | GitHub label required to trigger Squasher | Yes |
 
 #### Copy-Paste `.env` Template
 
 ```env
 # =============================================================
-# 1. Byter Local Server & Persistence
+# 1. Squasher Local Server & Persistence
 # =============================================================
 PORT=8787
 DATA_DIR=.data-local
@@ -148,8 +148,8 @@ GITHUB_WEBHOOK_SECRET=local-webhook-secret
 # =============================================================
 # 2. Local Dashboard Web UI (Vite)
 # =============================================================
-BYTER_API_TARGET=http://127.0.0.1:8787
-VITE_BYTER_API_URL=
+SQUASHER_API_TARGET=http://127.0.0.1:8787
+VITE_SQUASHER_API_URL=
 
 # =============================================================
 # 3. Model Provider & OpenAI Credentials
@@ -163,15 +163,15 @@ OPENAI_API_KEY=<your-openai-api-key>
 # =============================================================
 TRUEFORGE_URL=http://localhost:3000
 TRUEFORGE_API_KEY=local-trueforge-key
-TRUEFORGE_MCP_SERVER_NAME=byter-github
+TRUEFORGE_MCP_SERVER_NAME=squasher-github
 MCP_AUTH_TOKEN=local-mcp-secret-token
 
 # =============================================================
 # 5. GitHub Integration & Trigger Policy
 # =============================================================
 GITHUB_TOKEN=<your-github-token>
-BYTER_REQUIRE_TRIGGER_LABEL=true
-BYTER_TRIGGER_LABEL=byter:run
+SQUASHER_REQUIRE_TRIGGER_LABEL=true
+SQUASHER_TRIGGER_LABEL=squasher:run
 ```
 
 ---
@@ -182,10 +182,10 @@ Open 4 separate terminal windows in your workspace root (`c:\Users\hp\Documents\
 
 ```
 ┌───────────────────────────────────────┬───────────────────────────────────────┐
-│ Terminal 1: TrueForge Agent Harness   │ Terminal 2: Byter Backend Server      │
+│ Terminal 1: TrueForge Agent Harness   │ Terminal 2: Squasher Backend Server      │
 │ http://localhost:3000                 │ http://127.0.0.1:8787                 │
 ├───────────────────────────────────────┼───────────────────────────────────────┤
-│ Terminal 3: Byter Live Dashboard      │ Terminal 4: Smee Webhook Proxy        │
+│ Terminal 3: Squasher Live Dashboard      │ Terminal 4: Smee Webhook Proxy        │
 │ http://127.0.0.1:5173                 │ Smee.io -> Localhost:8787             │
 └───────────────────────────────────────┴───────────────────────────────────────┘
 ```
@@ -206,17 +206,17 @@ TrueForge runs in Standalone mode with an embedded SQLite database:
 
 ---
 
-#### Terminal 2 — Start the Byter Backend Server
+#### Terminal 2 — Start the Squasher Backend Server
 
-Starts the Byter REST API, JSONL persistence engine, GitHub MCP server, and webhook receiver:
+Starts the Squasher REST API, JSONL persistence engine, GitHub MCP server, and webhook receiver:
 
 - **Windows PowerShell:**
   ```powershell
-  $env:PORT="8787"; $env:DATA_DIR=".data-local"; pnpm --filter @byter/server start
+  $env:PORT="8787"; $env:DATA_DIR=".data-local"; pnpm --filter @squasher/server start
   ```
 - **Linux / macOS Bash:**
   ```bash
-  PORT=8787 DATA_DIR=.data-local pnpm --filter @byter/server start
+  PORT=8787 DATA_DIR=.data-local pnpm --filter @squasher/server start
   ```
 - **Verification:**
   - PowerShell: `Invoke-RestMethod -Uri http://127.0.0.1:8787/healthz` (Returns `@{ok=True}`)
@@ -224,19 +224,19 @@ Starts the Byter REST API, JSONL persistence engine, GitHub MCP server, and webh
 
 ---
 
-#### Terminal 3 — Start the Byter Live Dashboard UI
+#### Terminal 3 — Start the Squasher Live Dashboard UI
 
 Launches the React 19 + Vite dashboard for live run visualization, proof inspection, and maintainer review:
 
 - **Windows PowerShell:**
   ```powershell
-  $env:BYTER_API_TARGET="http://127.0.0.1:8787"; pnpm dev
+  $env:SQUASHER_API_TARGET="http://127.0.0.1:8787"; pnpm dev
   ```
 - **Linux / macOS Bash:**
   ```bash
-  BYTER_API_TARGET=http://127.0.0.1:8787 pnpm dev
+  SQUASHER_API_TARGET=http://127.0.0.1:8787 pnpm dev
   ```
-- **Verification:** Open `http://127.0.0.1:5173` in your browser to view the Byter dashboard.
+- **Verification:** Open `http://127.0.0.1:5173` in your browser to view the Squasher dashboard.
 
 ---
 
@@ -266,7 +266,7 @@ Before triggering your first bug triage, open **`http://localhost:3000`** and co
 ```
 TrueForge Shell Header -> [Settings Icon]
   ├── [Models] -> OpenAI -> [Configure] -> Paste OPENAI_API_KEY -> [Create]
-  └── [Connectors] -> [+ Add MCP Server] -> byter-github (API Key Auth) -> [Add]
+  └── [Connectors] -> [+ Add MCP Server] -> squasher-github (API Key Auth) -> [Add]
 ```
 
 #### Step A: Configure OpenAI Model Provider (`Settings → Models`)
@@ -284,26 +284,26 @@ TrueForge Shell Header -> [Settings Icon]
 
 ---
 
-#### Step B: Register Byter GitHub MCP Server (`Settings → Connectors`)
+#### Step B: Register Squasher GitHub MCP Server (`Settings → Connectors`)
 
-TrueForge needs to query Byter's GitHub MCP server for issue data, file inspection, and proof submission:
+TrueForge needs to query Squasher's GitHub MCP server for issue data, file inspection, and proof submission:
 
 1. In the TrueForge Settings sidebar, click **Connectors** (`id="connectors"`, plug icon).
 2. Click the **+ Add MCP Server** button in the top right.
 3. Complete the **Add MCP server** form with exact values:
-   - **Name \*** (`id="mcp-server-name"`): Enter `byter-github` *(Must match `TRUEFORGE_MCP_SERVER_NAME`)*.
-   - **Description \*** (`id="mcp-server-description"`): Enter `Byter GitHub MCP Server`.
+   - **Name \*** (`id="mcp-server-name"`): Enter `squasher-github` *(Must match `TRUEFORGE_MCP_SERVER_NAME`)*.
+   - **Description \*** (`id="mcp-server-description"`): Enter `Squasher GitHub MCP Server`.
    - **URL \*** (`id="mcp-server-url"`): Enter `http://localhost:8787/mcp`.
    - **Auth type \*** (`name="mcp-auth-type"`): Select the **`API Key`** segmented radio pill.
    - **API key \*** (`id="mcp-server-api-key"`): Enter `Bearer local-mcp-secret-token` *(Must include the `Bearer ` prefix and match `MCP_AUTH_TOKEN`)*.
    - **Header name (optional)** (`id="mcp-server-header-name"`): Enter `Authorization` (or leave empty, defaults to `Authorization`).
 4. Click **Add**.
 5. **Verify MCP Discovery**:
-   - `byter-github` appears under **Configured** with a green **Connected** status dot.
-   - Click on the `byter-github` row to open `ConnectorDetails`. TrueForge automatically queries `tools/list` and displays all discovered tools:
+   - `squasher-github` appears under **Configured** with a green **Connected** status dot.
+   - Click on the `squasher-github` row to open `ConnectorDetails`. TrueForge automatically queries `tools/list` and displays all discovered tools:
      - `read_issue`: Fetches issue title, body, comments, and metadata.
      - `read_file`: Safely reads target files within repository boundaries.
-     - `submit_byter_result`: Submits structured reproduction proofs and candidate patches.
+     - `submit_squasher_result`: Submits structured reproduction proofs and candidate patches.
      - `add_verified_label`: Applies verified label once 3/3 target failure check passes.
      - `create_fix_pull_request`: Gated tool invoked only upon maintainer approval.
 
@@ -323,16 +323,16 @@ TrueForge needs to query Byter's GitHub MCP server for issue data, file inspecti
      - Check `[x] Issues` (actions: `opened`, `edited`, `reopened`, `labeled`).
      - Check `[x] Issue comments` (actions: `created`, for maintainer approval commands).
    - **Active**: Ensure checkbox is checked.
-4. Click **Add webhook**. GitHub will send a test ping, which Smee forwards to Byter returning HTTP 200.
+4. Click **Add webhook**. GitHub will send a test ping, which Smee forwards to Squasher returning HTTP 200.
 
 ---
 
 ### 7. End-to-End Bug Reproduction & Maintainer Approval Flow
 
-Byter executes a 4-stage lifecycle for every incoming bug report:
+Squasher executes a 4-stage lifecycle for every incoming bug report:
 
 ```
-[Issue Created + byter:run] 
+[Issue Created + squasher:run] 
        │
        ▼
 [Stage 1: Security Triage] ──(Pass)──► [Stage 2: TrueForge 3/3 Repro]
@@ -348,37 +348,37 @@ Byter executes a 4-stage lifecycle for every incoming bug report:
 ```
 
 #### Stage 1: Issue Trigger & Security Screening
-1. A developer opens an issue describing a bug and applies the `byter:run` label.
-2. Webhook arrives at Byter's `/api/github/webhook`.
-3. Byter verifies HMAC-SHA256 signature and applies a 60-second trigger deduplication window.
-4. Byter runs the security scanner (`packages/core/src/security.ts`):
+1. A developer opens an issue describing a bug and applies the `squasher:run` label.
+2. Webhook arrives at Squasher's `/api/github/webhook`.
+3. Squasher verifies HMAC-SHA256 signature and applies a 60-second trigger deduplication window.
+4. Squasher runs the security scanner (`packages/core/src/security.ts`):
    - Screens issue text for prompt injections, secret extraction instructions (`print env`, `show tokens`), base64 evasion, and malicious shell command strings.
    - If unsafe, transitions to `rejected`, posts an alert on GitHub, and halts execution.
-5. Byter applies the label `byter:triaging` (`#1d5fd1`) and posts an initial issue progress comment:
+5. Squasher applies the label `squasher:triaging` (`#1d5fd1`) and posts an initial issue progress comment:
    ```markdown
-   <!-- byter-run:run-1740936000-abc12345 -->
-   ### 🤖 Byter — Autonomous Bug Triage & Verification
+   <!-- squasher-run:run-1740936000-abc12345 -->
+   ### 🤖 Squasher — Autonomous Bug Triage & Verification
 
    - 🔍 **Status:** Analyzing issue and establishing TrueForge sandbox environment...
    - 📊 **Run ID:** `run-1740936000-abc12345`
-   - 🔗 **[Open Byter Live Dashboard →](http://127.0.0.1:5173)**
+   - 🔗 **[Open Squasher Live Dashboard →](http://127.0.0.1:5173)**
    ```
 
 #### Stage 2: Bug Reproduction & Verification in TrueForge
-1. Byter creates an isolated TrueForge session with `openai/gpt-5.6-sol`.
-2. TrueForge activates sandbox tools under `/tmp/byter-tools` and queries Byter's MCP server for issue data and source files.
+1. Squasher creates an isolated TrueForge session with `openai/gpt-5.6-sol`.
+2. TrueForge activates sandbox tools under `/tmp/squasher-tools` and queries Squasher's MCP server for issue data and source files.
 3. **Strict 3/3 Target Failure Check**: The agent constructs a minimal reproducer test and must observe the failure 3 consecutive times (`3/3 matching failures`) before attempting a fix.
 4. The agent writes a targeted patch, verifies the test passes, and runs regression suites.
-5. The agent calls `submit_byter_result` with the structured proof contract.
+5. The agent calls `submit_squasher_result` with the structured proof contract.
 
 #### Stage 3: Pausing at `awaiting-approval` Gate
 1. The agent submits the proof contract, requests `create_fix_pull_request`, and TrueForge emits `tool.approval_required` before the MCP server receives the write.
-2. Byter verifies that the pending TrueForge tool-call arguments hash to the same `patchHash = SHA256(canonical(patchArguments))` as the displayed candidate.
-3. Byter updates GitHub labels: removes `byter:triaging` and applies `byter:verified` (`#8250df`) and `byter:awaiting-approval` (`#d1242f`).
-4. Byter updates the GitHub issue comment with full verification evidence:
+2. Squasher verifies that the pending TrueForge tool-call arguments hash to the same `patchHash = SHA256(canonical(patchArguments))` as the displayed candidate.
+3. Squasher updates GitHub labels: removes `squasher:triaging` and applies `squasher:verified` (`#8250df`) and `squasher:awaiting-approval` (`#d1242f`).
+4. Squasher updates the GitHub issue comment with full verification evidence:
    ```markdown
-   <!-- byter-run:run-1740936000-abc12345 -->
-   ### 🤖 Byter — Bug Verified & Patch Ready (Awaiting Maintainer Approval)
+   <!-- squasher-run:run-1740936000-abc12345 -->
+   ### 🤖 Squasher — Bug Verified & Patch Ready (Awaiting Maintainer Approval)
 
    - ✅ **Reproduction:** 3/3 target failures observed before patch
    - ✅ **Validation:** Target test passes post-patch; 0 regressions detected
@@ -390,40 +390,40 @@ Byter executes a 4-stage lifecycle for every incoming bug report:
    > ⏸ **TrueForge is paused.** No branch, commit, or pull request has been created.
 
    👉 **[Review Evidence & Approve Patch on Dashboard →](http://127.0.0.1:5173)**  
-   *Maintainers can also reply with `approve` or `/byter approve` directly on this issue.*
+   *Maintainers can also reply with `approve` or `/squasher approve` directly on this issue.*
    ```
 
 #### Stage 4: Maintainer Approval & Draft PR Publication
 Maintainers can approve via two separate channels:
 - **Channel A (Dashboard UI)**: Open `http://127.0.0.1:5173`, inspect the unified diff and proof traces, and click **Approve Patch** (sends `POST /api/approvals` with `APPROVAL_TOKEN`).
-- **Channel B (GitHub Comment)**: A maintainer with `OWNER`, `admin`, `maintain`, or `write` permission comments `approve` or `/byter approve` on the issue.
+- **Channel B (GitHub Comment)**: A maintainer with `OWNER`, `admin`, `maintain`, or `write` permission comments `approve` or `/squasher approve` on the issue.
 
 **Outcome:**
-1. Byter verifies `patchHash` and records cryptographic receipt in `DATA_DIR/approvals.jsonl`.
-2. Byter sends a `user.tool_approval` decision to TrueForge for the exact stored thread and tool-call IDs. TrueForge resumes MCP write tool `create_fix_pull_request`:
-   - Creates git branch `byter/fix-<issueNumber>-<shortHash>`.
+1. Squasher verifies `patchHash` and records cryptographic receipt in `DATA_DIR/approvals.jsonl`.
+2. Squasher sends a `user.tool_approval` decision to TrueForge for the exact stored thread and tool-call IDs. TrueForge resumes MCP write tool `create_fix_pull_request`:
+   - Creates git branch `squasher/fix-<issueNumber>-<shortHash>`.
    - Commits the validated fix files.
    - Publishes a **Draft Pull Request** linked to the issue.
-3. Labels update: removes `byter:awaiting-approval` and applies `byter:pr-created` (`#1a7f37`).
-4. Byter posts final comment linking to the Draft PR.
+3. Labels update: removes `squasher:awaiting-approval` and applies `squasher:pr-created` (`#1a7f37`).
+4. Squasher posts final comment linking to the Draft PR.
 
 ---
 
 ## Part 2: Complete Multi-Service Railway Deployment Guide
 
-Deploying Byter to production on [Railway](https://railway.com/) uses **two interdependent services** in a single Railway project:
+Deploying Squasher to production on [Railway](https://railway.com/) uses **two interdependent services** in a single Railway project:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    Railway Project: byter-production                            │
+│                                    Railway Project: squasher-production                            │
 │                                                                                                 │
 │  ┌──────────────────────────────────────────────┐     ┌──────────────────────────────────────┐  │
-│  │ Service 1: trueforge (TrueForge Harness)     │     │ Service 2: byter (CI & Dashboard)    │  │
+│  │ Service 1: trueforge (TrueForge Harness)     │     │ Service 2: squasher (CI & Dashboard)    │  │
 │  │ - Port: 8790                                 │     │ - Port: 3000                         │  │
 │  │ - STANDALONE=true                            │◄────┼─ TRUEFORGE_URL                       │  │
 │  │ - /data volume (SQLite persistence)          │     │ - /data volume (JSONL persistence)   │  │
 │  │ - Public: trueforge-xxx.up.railway.app       │────►│ - MCP Server: /mcp                   │  │
-│  │                                              │     │ - Public: byter-xxx.up.railway.app   │  │
+│  │                                              │     │ - Public: squasher-xxx.up.railway.app   │  │
 │  └──────────────────────────────────────────────┘     └──────────────────▲───────────────────┘  │
 │                                                                          │                      │
 └──────────────────────────────────────────────────────────────────────────┼──────────────────────┘
@@ -439,7 +439,7 @@ Deploying Byter to production on [Railway](https://railway.com/) uses **two inte
 
 1. Sign in to [Railway](https://railway.com/).
 2. Click **+ New Project** &rarr; select **Empty Project**.
-3. Click on the project name in the top bar and rename it to `byter-production`.
+3. Click on the project name in the top bar and rename it to `squasher-production`.
 
 ---
 
@@ -476,15 +476,15 @@ Deploying Byter to production on [Railway](https://railway.com/) uses **two inte
 
 ---
 
-### Step 3: Deploy Service 2 (Byter CI & Dashboard)
+### Step 3: Deploy Service 2 (Squasher CI & Dashboard)
 
-1. In the same Railway project, click **+ Create** &rarr; **GitHub Repo** &rarr; select `MAYANK-MAHAUR/Byter`.
+1. In the same Railway project, click **+ Create** &rarr; **GitHub Repo** &rarr; select `MAYANK-MAHAUR/Squasher`.
 2. Click on the service card &rarr; open the **Settings** tab:
-   - **Service Name**: `byter`
+   - **Service Name**: `squasher`
    - **Root Directory**: `/` (Leave as root)
    - **Builder**: Automatically detected from `Dockerfile` and `railway.json`
    - **Health Check Path**: `/healthz`
-3. Go to the **Networking** tab &rarr; click **Generate Domain** (e.g., `https://byter-production-xxxx.up.railway.app`).
+3. Go to the **Networking** tab &rarr; click **Generate Domain** (e.g., `https://squasher-production-xxxx.up.railway.app`).
 4. Go to the **Volumes** tab &rarr; click **Add Volume**:
    - **Mount Path**: `/data` (Ensures `webhook-runs.jsonl` and `approvals.jsonl` persist across deployments).
 5. Go to the **Variables** tab and configure the production environment variables:
@@ -492,10 +492,10 @@ Deploying Byter to production on [Railway](https://railway.com/) uses **two inte
 | Variable | Production Value | Description |
 | :--- | :--- | :--- |
 | `NODE_ENV` | `production` | Production environment mode |
-| `PORT` | `3000` | Internal listening port for Byter server |
+| `PORT` | `3000` | Internal listening port for Squasher server |
 | `HOST` | `0.0.0.0` | Container bind address |
 | `DATA_DIR` | `/data` | Directory for persistent JSONL run storage on mounted volume |
-| `APP_BASE_URL` | `https://<your-byter-domain>.up.railway.app` | Public HTTPS domain for Byter service |
+| `APP_BASE_URL` | `https://<your-squasher-domain>.up.railway.app` | Public HTTPS domain for Squasher service |
 | `APPROVAL_TOKEN` | `<generate-secure-random-token>` | Secret Bearer token for maintainer approval API |
 | `GITHUB_WEBHOOK_SECRET` | `<generate-secure-webhook-secret>` | Secret for HMAC-SHA256 webhook signature validation |
 | `MODEL_PROVIDER` | `openai` | Model provider identifier |
@@ -503,37 +503,37 @@ Deploying Byter to production on [Railway](https://railway.com/) uses **two inte
 | `OPENAI_API_KEY` | `sk-proj-...` | OpenAI API key |
 | `TRUEFORGE_URL` | `https://<your-trueforge-domain>.up.railway.app` | Full HTTPS URL of deployed Service 1 (TrueForge) |
 | `TRUEFORGE_API_KEY` | `<generate-trueforge-key>` | Shared key for TrueForge communication |
-| `TRUEFORGE_MCP_SERVER_NAME` | `byter-github` | Identifier for MCP connector |
-| `MCP_AUTH_TOKEN` | `<generate-secure-mcp-token>` | Bearer token authenticating TrueForge MCP calls to Byter `/mcp` |
+| `TRUEFORGE_MCP_SERVER_NAME` | `squasher-github` | Identifier for MCP connector |
+| `MCP_AUTH_TOKEN` | `<generate-secure-mcp-token>` | Bearer token authenticating TrueForge MCP calls to Squasher `/mcp` |
 | `GITHUB_TOKEN` | `ghp_...` | GitHub Personal Access Token or App token with repo permissions |
-| `BYTER_REQUIRE_TRIGGER_LABEL` | `true` | Enforce trigger label requirement |
-| `BYTER_TRIGGER_LABEL` | `byter:run` | GitHub label required to trigger triage |
+| `SQUASHER_REQUIRE_TRIGGER_LABEL` | `true` | Enforce trigger label requirement |
+| `SQUASHER_TRIGGER_LABEL` | `squasher:run` | GitHub label required to trigger triage |
 
-6. Click **Deploy**. Railway will build the multi-stage container and start the Byter server.
+6. Click **Deploy**. Railway will build the multi-stage container and start the Squasher server.
 7. **Health Check Verification**:
    ```bash
-   curl -f https://<your-byter-domain>.up.railway.app/healthz
+   curl -f https://<your-squasher-domain>.up.railway.app/healthz
    ```
    *Expected response: `{"ok":true}`.*
 
 ---
 
-### Step 4: Connect Byter's GitHub MCP Server in Railway TrueForge UI
+### Step 4: Connect Squasher's GitHub MCP Server in Railway TrueForge UI
 
-Once both services are deployed on Railway, connect Byter's MCP tools inside the TrueForge interface:
+Once both services are deployed on Railway, connect Squasher's MCP tools inside the TrueForge interface:
 
 1. Open your deployed TrueForge UI at `https://<your-trueforge-domain>.up.railway.app`.
 2. Click **Settings** (gear icon in header/sidebar) &rarr; select **Models**:
    - Ensure **OpenAI** is configured with your `OPENAI_API_KEY` and shows `Connected` (green dot).
 3. In Settings, select **Connectors** &rarr; click **+ Add MCP Server**:
-   - **Name \***: `byter-github`
-   - **Description \***: `Byter GitHub MCP Server (Railway Production)`
-   - **URL \***: `https://<your-byter-domain>.up.railway.app/mcp`
+   - **Name \***: `squasher-github`
+   - **Description \***: `Squasher GitHub MCP Server (Railway Production)`
+   - **URL \***: `https://<your-squasher-domain>.up.railway.app/mcp`
    - **Auth type \***: Select **`API Key`** segmented radio pill.
    - **API key \***: Enter `Bearer <your-production-MCP_AUTH_TOKEN>` *(Must include `Bearer ` prefix)*.
    - **Header name (optional)**: `Authorization`.
 4. Click **Add**.
-5. Click on the newly added `byter-github` connector row to verify tools discovery (`read_issue`, `read_file`, `submit_byter_result`, `create_fix_pull_request`, `add_verified_label`).
+5. Click on the newly added `squasher-github` connector row to verify tools discovery (`read_issue`, `read_file`, `submit_squasher_result`, `create_fix_pull_request`, `add_verified_label`).
 
 ---
 
@@ -541,9 +541,9 @@ Once both services are deployed on Railway, connect Byter's MCP tools inside the
 
 1. In your GitHub repository, navigate to **Settings** &rarr; **Webhooks** &rarr; **Add webhook**.
 2. Fill in the webhook parameters:
-   - **Payload URL**: `https://<your-byter-domain>.up.railway.app/api/github/webhook`
+   - **Payload URL**: `https://<your-squasher-domain>.up.railway.app/api/github/webhook`
    - **Content type**: `application/json`
-   - **Secret**: The exact value of `GITHUB_WEBHOOK_SECRET` configured in Railway Byter Variables.
+   - **Secret**: The exact value of `GITHUB_WEBHOOK_SECRET` configured in Railway Squasher Variables.
    - **SSL verification**: `Enable SSL verification`.
    - **Which events would you like to trigger this webhook?**:
      - Select **Let me select individual events**.
@@ -562,14 +562,14 @@ Execute these verification commands from your terminal:
 # 1. Verify Service 1 (TrueForge) Health
 curl -f https://<your-trueforge-domain>.up.railway.app/healthz
 
-# 2. Verify Service 2 (Byter) Health
-curl -f https://<your-byter-domain>.up.railway.app/healthz
+# 2. Verify Service 2 (Squasher) Health
+curl -f https://<your-squasher-domain>.up.railway.app/healthz
 
-# 3. Test Byter Latest Runs API
-curl -f https://<your-byter-domain>.up.railway.app/api/runs/latest
+# 3. Test Squasher Latest Runs API
+curl -f https://<your-squasher-domain>.up.railway.app/api/runs/latest
 
-# 4. Test Byter Remote MCP Endpoint with Bearer Auth
-curl -X POST https://<your-byter-domain>.up.railway.app/mcp \
+# 4. Test Squasher Remote MCP Endpoint with Bearer Auth
+curl -X POST https://<your-squasher-domain>.up.railway.app/mcp \
   -H "Authorization: Bearer <your-production-MCP_AUTH_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -577,12 +577,12 @@ curl -X POST https://<your-byter-domain>.up.railway.app/mcp \
 ```
 
 #### Live End-to-End Test Procedure:
-1. Open a new issue titled `Test Bug: Tokenizer trailing backslash crash` on your GitHub repo and add label `byter:run`.
-2. Verify Byter adds label `byter:triaging` and posts progress comment with the live dashboard link.
-3. Open `https://<your-byter-domain>.up.railway.app` to observe live trace events streamed from TrueForge.
+1. Open a new issue titled `Test Bug: Tokenizer trailing backslash crash` on your GitHub repo and add label `squasher:run`.
+2. Verify Squasher adds label `squasher:triaging` and posts progress comment with the live dashboard link.
+3. Open `https://<your-squasher-domain>.up.railway.app` to observe live trace events streamed from TrueForge.
 4. Verify TrueForge runs 3/3 reproduction tests and transitions run to `awaiting-approval`.
 5. Post a comment `approve` on the GitHub issue (or click **Approve Patch** on the dashboard).
-6. Verify Byter creates the draft pull request, adds label `byter:pr-created`, and posts confirmation.
+6. Verify Squasher creates the draft pull request, adds label `squasher:pr-created`, and posts confirmation.
 
 ---
 
@@ -591,10 +591,10 @@ curl -X POST https://<your-byter-domain>.up.railway.app/mcp \
 | Component | Local Mode | Railway Production Mode | Protocol / Path | Purpose & Storage |
 | :--- | :--- | :--- | :--- | :--- |
 | **TrueForge Backend** | `http://localhost:3000` (Dev Proxy) / `8790` | `https://<trueforge-domain>.up.railway.app` (Port `8790`) | HTTP/WS, `/healthz`, `/api` | Model loop & SQLite DB (`/data/db/db.sqlite`) |
-| **Byter Server & API** | `http://127.0.0.1:8787` | `https://<byter-domain>.up.railway.app` (Port `3000`) | HTTP, `/healthz`, `/api/runs/*` | Webhooks, state machine, proof validation |
-| **GitHub MCP Server** | `http://localhost:8787/mcp` | `https://<byter-domain>.up.railway.app/mcp` | JSON-RPC 2.0 (`Bearer` Auth) | Tool provider queried by TrueForge |
-| **Byter Dashboard UI** | `http://127.0.0.1:5173` (Vite) | Served from Byter root `/` | React 19 SPA | Live trace visualizer & maintainer review |
-| **Webhook Ingestion** | Smee &rarr; `http://127.0.0.1:8787/api/github/webhook` | GitHub &rarr; `https://<byter-domain>.up.railway.app/api/github/webhook` | HMAC-SHA256 Signed POST | GitHub issue & comment event intake |
+| **Squasher Server & API** | `http://127.0.0.1:8787` | `https://<squasher-domain>.up.railway.app` (Port `3000`) | HTTP, `/healthz`, `/api/runs/*` | Webhooks, state machine, proof validation |
+| **GitHub MCP Server** | `http://localhost:8787/mcp` | `https://<squasher-domain>.up.railway.app/mcp` | JSON-RPC 2.0 (`Bearer` Auth) | Tool provider queried by TrueForge |
+| **Squasher Dashboard UI** | `http://127.0.0.1:5173` (Vite) | Served from Squasher root `/` | React 19 SPA | Live trace visualizer & maintainer review |
+| **Webhook Ingestion** | Smee &rarr; `http://127.0.0.1:8787/api/github/webhook` | GitHub &rarr; `https://<squasher-domain>.up.railway.app/api/github/webhook` | HMAC-SHA256 Signed POST | GitHub issue & comment event intake |
 | **Persistence Journal** | `.data-local/` | Mounted Volume `/data/` | JSONL append-only | `webhook-runs.jsonl`, `approvals.jsonl` |
 
 ---
@@ -607,8 +607,8 @@ curl -X POST https://<your-byter-domain>.up.railway.app/mcp \
 - **Fix:** In Railway Service 1 Variables, ensure `STANDALONE=true` is set. This directs TrueForge to use embedded SQLite (`/data/db/db.sqlite`) without requiring Postgres or Redis.
 
 ### 2. MCP Authentication Error (`401 MCP authentication required`)
-- **Symptom:** TrueForge fails to list tools or execute MCP actions against Byter's `/mcp` endpoint.
-- **Root Cause:** In TrueForge UI (`Settings → Connectors`), the `API key` field was populated with `<token>` instead of `Bearer <token>`. Byter's MCP server parses `Authorization.slice("Bearer ".length)` and rejects bare tokens.
+- **Symptom:** TrueForge fails to list tools or execute MCP actions against Squasher's `/mcp` endpoint.
+- **Root Cause:** In TrueForge UI (`Settings → Connectors`), the `API key` field was populated with `<token>` instead of `Bearer <token>`. Squasher's MCP server parses `Authorization.slice("Bearer ".length)` and rejects bare tokens.
 - **Fix:** Update the connector's `API key` field in TrueForge UI to `Bearer <MCP_AUTH_TOKEN>`.
 
 ### 3. GitHub Webhook Returns `401 Unauthorized` / `Invalid signature`
@@ -617,19 +617,19 @@ curl -X POST https://<your-byter-domain>.up.railway.app/mcp \
 - **Fix:** Ensure both values match character-for-character. Note that trailing spaces in environment variables will alter the HMAC digest.
 
 ### 4. Webhook Ignored ("Duplicate issue trigger suppressed")
-- **Symptom:** Applying a label or editing an issue does not trigger a new Byter run.
-- **Root Cause:** Byter enforces a 60-second duplicate trigger suppression window (`duplicateIssueTriggerWindowMs = 60_000`) for the same issue ID to prevent race conditions from concurrent GitHub webhook events.
+- **Symptom:** Applying a label or editing an issue does not trigger a new Squasher run.
+- **Root Cause:** Squasher enforces a 60-second duplicate trigger suppression window (`duplicateIssueTriggerWindowMs = 60_000`) for the same issue ID to prevent race conditions from concurrent GitHub webhook events.
 - **Fix:** Wait 60 seconds before re-triggering, or edit the issue title to create a distinct trigger key.
 
 ### 5. Issue Comment Approval Returns `403 Forbidden`
-- **Symptom:** Maintainer comments `approve` or `/byter approve` on GitHub, but Byter responds with an authorization error.
-- **Root Cause:** Byter validates collaborator permissions via GitHub API (`getCollaboratorPermission`). The commenter must have `OWNER`, `admin`, `maintain`, or `write` permission on the repository.
-- **Fix:** Ensure the comment is posted by an authorized repository collaborator, or approve via the Byter Dashboard UI using `APPROVAL_TOKEN`.
+- **Symptom:** Maintainer comments `approve` or `/squasher approve` on GitHub, but Squasher responds with an authorization error.
+- **Root Cause:** Squasher validates collaborator permissions via GitHub API (`getCollaboratorPermission`). The commenter must have `OWNER`, `admin`, `maintain`, or `write` permission on the repository.
+- **Fix:** Ensure the comment is posted by an authorized repository collaborator, or approve via the Squasher Dashboard UI using `APPROVAL_TOKEN`.
 
 ### 6. Security Scanner Rejection (`safeToExecute: false`)
 - **Symptom:** Issue run transitions to `security-review` &rarr; `rejected` without starting TrueForge.
-- **Root Cause:** The issue title or body triggered one of Byter's security heuristics (prompt injection markers, requests to dump `.env` or credentials, base64 payload strings, or forbidden shell invocations).
-- **Fix:** Review the issue description. Remove suspicious commands or extraction phrases. Byter strictly blocks potential jailbreaks to protect the sandbox.
+- **Root Cause:** The issue title or body triggered one of Squasher's security heuristics (prompt injection markers, requests to dump `.env` or credentials, base64 payload strings, or forbidden shell invocations).
+- **Fix:** Review the issue description. Remove suspicious commands or extraction phrases. Squasher strictly blocks potential jailbreaks to protect the sandbox.
 
 ### 7. OpenAI API Quota or Model Errors
 - **Symptom:** TrueForge reports `404 Model not found` or `429 Rate limit exceeded`.

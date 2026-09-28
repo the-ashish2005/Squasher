@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCorrectionMessage,
-  byterResultSchema,
+  squasherResultSchema,
   createFixPullRequestSchema,
   validateAndParse
 } from "../src/structured-output-guard.js";
 
 const validResult = {
-  kind: "byter.result",
+  kind: "squasher.result",
   status: "patch-ready",
   summary: "The reported tokenizer failure was reproduced three times and then fixed.",
   proof: {
@@ -25,11 +25,11 @@ const validResult = {
 
 describe("structured output guard", () => {
   it("accepts a valid raw JSON object", () => {
-    const result = validateAndParse(JSON.stringify(validResult), byterResultSchema);
+    const result = validateAndParse(JSON.stringify(validResult), squasherResultSchema);
 
     expect(result.valid).toBe(true);
     if (result.valid) {
-      expect(result.value.kind).toBe("byter.result");
+      expect(result.value.kind).toBe("squasher.result");
       expect(JSON.parse(result.cleanedJson).status).toBe("patch-ready");
     }
   });
@@ -48,7 +48,7 @@ describe("structured output guard", () => {
     };
     const raw = JSON.stringify(withFence);
 
-    const result = validateAndParse(raw, byterResultSchema);
+    const result = validateAndParse(raw, squasherResultSchema);
 
     expect(result.valid).toBe(true);
     if (result.valid) {
@@ -62,7 +62,7 @@ describe("structured output guard", () => {
   it("strips markdown code fences before parsing", () => {
     const wrapped = `\`\`\`json\n${JSON.stringify(validResult, null, 2)}\n\`\`\``;
 
-    const result = validateAndParse(wrapped, byterResultSchema);
+    const result = validateAndParse(wrapped, squasherResultSchema);
 
     expect(result.valid).toBe(true);
   });
@@ -70,13 +70,13 @@ describe("structured output guard", () => {
   it("recovers a JSON object surrounded by prose", () => {
     const wrapped = `Here is the proof contract you asked for.\n\n${JSON.stringify(validResult)}\n\nLet me know if you need more.`;
 
-    const result = validateAndParse(wrapped, byterResultSchema);
+    const result = validateAndParse(wrapped, squasherResultSchema);
 
     expect(result.valid).toBe(true);
   });
 
   it("fails cleanly on completely malformed text", () => {
-    const result = validateAndParse("I could not reproduce the bug, sorry.", byterResultSchema);
+    const result = validateAndParse("I could not reproduce the bug, sorry.", squasherResultSchema);
 
     expect(result.valid).toBe(false);
     if (!result.valid) {
@@ -86,7 +86,7 @@ describe("structured output guard", () => {
   });
 
   it("fails on truncated JSON without throwing", () => {
-    const result = validateAndParse('{"kind":"byter.result","status":"patch-ready"', byterResultSchema);
+    const result = validateAndParse('{"kind":"squasher.result","status":"patch-ready"', squasherResultSchema);
 
     expect(result.valid).toBe(false);
   });
@@ -94,7 +94,7 @@ describe("structured output guard", () => {
   it("rejects valid JSON that violates the schema", () => {
     const result = validateAndParse(
       JSON.stringify({ ...validResult, proof: { ...validResult.proof, attempts: "1/3" } }),
-      byterResultSchema
+      squasherResultSchema
     );
 
     expect(result.valid).toBe(false);
@@ -112,7 +112,7 @@ describe("structured output guard", () => {
           files: [{ path: "src/tokenizer.ts", content: "full file content" }]
         }
       }),
-      byterResultSchema
+      squasherResultSchema
     );
 
     expect(result.valid).toBe(false);
@@ -124,7 +124,7 @@ describe("structured output guard", () => {
   it("requires candidatePatch to be present even when null", () => {
     const { candidatePatch: _omitted, ...withoutPatch } = validResult;
 
-    const result = validateAndParse(JSON.stringify({ ...withoutPatch, status: "blocked" }), byterResultSchema);
+    const result = validateAndParse(JSON.stringify({ ...withoutPatch, status: "blocked" }), squasherResultSchema);
 
     expect(result.valid).toBe(false);
     if (!result.valid) {
@@ -135,13 +135,13 @@ describe("structured output guard", () => {
   it("accepts a non-positive status with a null candidate patch and relaxed proof", () => {
     const result = validateAndParse(
       JSON.stringify({
-        kind: "byter.result",
+        kind: "squasher.result",
         status: "not-reproduced",
         summary: "No failure observed.",
         proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "0/3" },
         candidatePatch: null
       }),
-      byterResultSchema
+      squasherResultSchema
     );
 
     expect(result.valid).toBe(true);
@@ -153,9 +153,9 @@ describe("structured output guard", () => {
         owner: "o",
         repo: "r",
         baseBranch: "main",
-        branchName: "byter/fix-1-abc",
+        branchName: "squasher/fix-1-abc",
         title: "Fix trailing escape crash",
-        body: "Verified by Byter.",
+        body: "Verified by Squasher.",
         files: [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }]
       }),
       createFixPullRequestSchema
@@ -184,7 +184,7 @@ describe("structured output guard", () => {
 
     const result = validateAndParse(
       JSON.stringify({ ...validResult, proof: { ...validResult.proof, attempts: buried } }),
-      byterResultSchema
+      squasherResultSchema
     );
 
     expect(result.valid).toBe(true);
@@ -196,7 +196,7 @@ describe("structured output guard", () => {
 
     const result = validateAndParse(
       JSON.stringify({ ...validResult, proof: { ...validResult.proof, attempts: tooLate } }),
-      byterResultSchema
+      squasherResultSchema
     );
 
     expect(result.valid).toBe(false);
@@ -208,19 +208,19 @@ describe("structured output guard", () => {
     // a 7.5 KB object, so the correction message must demand the complete object.
     const { status: _dropped, ...withoutStatus } = validResult;
 
-    const result = validateAndParse(JSON.stringify(withoutStatus), byterResultSchema);
+    const result = validateAndParse(JSON.stringify(withoutStatus), squasherResultSchema);
 
     expect(result.valid).toBe(false);
     if (!result.valid) expect(result.error).toContain('Field "status"');
-    expect(buildCorrectionMessage(byterResultSchema, "x")).toContain("COMPLETE object");
+    expect(buildCorrectionMessage(squasherResultSchema, "x")).toContain("COMPLETE object");
   });
 
   it("reports truncated JSON as truncation, not as missing schema fields", () => {
     // A large candidatePatch.body cut off mid-string: the outer object never closes,
     // but the nested patch object would parse on its own and mislead the correction.
-    const truncated = '{"kind":"byter.result","candidatePatch":{"title":"Fix it","body":"## Problem\\n\\nlong text';
+    const truncated = '{"kind":"squasher.result","candidatePatch":{"title":"Fix it","body":"## Problem\\n\\nlong text';
 
-    const result = validateAndParse(truncated, byterResultSchema);
+    const result = validateAndParse(truncated, squasherResultSchema);
 
     expect(result.valid).toBe(false);
     if (!result.valid) {
@@ -231,8 +231,8 @@ describe("structured output guard", () => {
 
   it("still reports a genuine schema violation when the outer object parses", () => {
     const result = validateAndParse(
-      JSON.stringify({ kind: "not.byter", status: "patch-ready" }),
-      byterResultSchema
+      JSON.stringify({ kind: "not.squasher", status: "patch-ready" }),
+      squasherResultSchema
     );
 
     expect(result.valid).toBe(false);
@@ -242,11 +242,11 @@ describe("structured output guard", () => {
   });
 
   it("quotes the expected schema and the specific problem in the correction message", () => {
-    const message = buildCorrectionMessage(byterResultSchema, 'Field "proof.attempts" must report at least 3 of 3.');
+    const message = buildCorrectionMessage(squasherResultSchema, 'Field "proof.attempts" must report at least 3 of 3.');
 
-    expect(message).toContain("submit_byter_result");
+    expect(message).toContain("submit_squasher_result");
     expect(message).toContain('Field "proof.attempts" must report at least 3 of 3.');
-    expect(message).toContain('"kind": "byter.result"');
+    expect(message).toContain('"kind": "squasher.result"');
     expect(message).toContain("no markdown fence");
   });
 });

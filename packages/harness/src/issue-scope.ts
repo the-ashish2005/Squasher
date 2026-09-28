@@ -1,5 +1,5 @@
 /**
- * Byter acts on two kinds of issue, and each has a different evidence contract:
+ * Squasher acts on two kinds of issue, and each has a different evidence contract:
  *
  * - A reported defect must be reproduced. Its proof is a failure observed 3/3 before a fix
  *   and a pass 3/3 after.
@@ -13,7 +13,7 @@
  * green Cancel button"): the agent said plainly that it was "a feature addition, not a
  * defect", authored its own acceptance test, recorded a genuine 3/3 before/after, and
  * returned patch-ready. Every command really ran, so nothing downstream could tell, and
- * the issue was labelled byter:verified — Byter's own trust label, asserting a defect that
+ * the issue was labelled byter:verified — Squasher's own trust label, asserting a defect that
  * never existed.
  *
  * Claiming a change for a defect. The mirror image, and the reason the first guard cannot
@@ -105,7 +105,7 @@ export interface IssueScopeVerdict {
    * asserting a reproduced defect must be refused.
    *
    * Retained under its original name because it means exactly what it did: a defect claim
-   * is out of scope for this issue. It no longer implies Byter will not act — a change
+   * is out of scope for this issue. It no longer implies Squasher will not act — a change
    * request is now actionable through the implementation path.
    */
   outOfScope: boolean;
@@ -143,7 +143,7 @@ const implementationStatuses = new Set(["implemented-feature", "implemented-impr
  *
  * Fails open for an issue it cannot classify: an unreadable or mixed-signal report blocks
  * neither path, because a false block costs a real fix and the reproduction contract in
- * `expectByterResult` still applies to every positive status regardless.
+ * `expectSquasherResult` still applies to every positive status regardless.
  */
 export function resultContractProblem(
   result: Record<string, unknown>,

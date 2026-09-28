@@ -6,11 +6,11 @@
     "outDir": "dist",
     "rootDir": "src",
     "paths": {
-      "@byter/agent": ["../../packages/agent/src/index.ts"],
-      "@byter/core": ["../../packages/core/src/index.js"],
-      "@byter/github-mcp": ["../github-mcp/src/index.ts"],
-      "@byter/github": ["../../packages/github/src/index.js"],
-      "@byter/harness": ["../../packages/harness/src/index.ts"]
+      "@squasher/agent": ["../../packages/agent/src/index.ts"],
+      "@squasher/core": ["../../packages/core/src/index.js"],
+      "@squasher/github-mcp": ["../github-mcp/src/index.ts"],
+      "@squasher/github": ["../../packages/github/src/index.js"],
+      "@squasher/harness": ["../../packages/harness/src/index.ts"]
     }
   },
   "references": [

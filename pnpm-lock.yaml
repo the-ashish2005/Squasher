@@ -29,19 +29,19 @@ importers:
 
   apps/server:
     dependencies:
-      '@byter/agent':
+      '@squasher/agent':
         specifier: workspace:*
         version: link:../../packages/agent
-      '@byter/core':
+      '@squasher/core':
         specifier: workspace:*
         version: link:../../packages/core
-      '@byter/github':
+      '@squasher/github':
         specifier: workspace:*
         version: link:../../packages/github
-      '@byter/github-mcp':
+      '@squasher/github-mcp':
         specifier: workspace:*
         version: link:../github-mcp
-      '@byter/harness':
+      '@squasher/harness':
         specifier: workspace:*
         version: link:../../packages/harness
       pg:
@@ -63,7 +63,7 @@ importers:
 
   apps/web:
     dependencies:
-      '@byter/core':
+      '@squasher/core':
         specifier: workspace:*
         version: link:../../packages/core
       katex:
@@ -121,7 +121,7 @@ importers:
 
   packages/agent:
     dependencies:
-      '@byter/core':
+      '@squasher/core':
         specifier: workspace:*
         version: link:../core
     devDependencies:
@@ -155,7 +155,7 @@ importers:
 
   packages/harness:
     dependencies:
-      '@byter/github-mcp':
+      '@squasher/github-mcp':
         specifier: workspace:*
         version: link:../../apps/github-mcp
       e2b:
@@ -165,7 +165,7 @@ importers:
         specifier: ^7.23.0
         version: 7.23.0(undici@8.10.2)
     devDependencies:
-      '@byter/agent':
+      '@squasher/agent':
         specifier: workspace:*
         version: link:../agent
       '@types/node':

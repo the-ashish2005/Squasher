@@ -1,5 +1,5 @@
 {
-  "name": "@byter/github-mcp",
+  "name": "@squasher/github-mcp",
   "version": "0.1.0",
   "private": true,
   "type": "module",

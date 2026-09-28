@@ -4,37 +4,38 @@ import { appendFile, mkdir, open, readFile, stat, unlink, writeFile } from "node
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ByterTrueForgeRuntime } from "@byter/agent";
+import { SquasherTrueForgeRuntime } from "@squasher/agent";
 import {
   approvalPayloadHash,
   bugProofStatuses,
-  byterResultStatuses,
+  squasherResultStatuses,
   createGitHubMcpHttpHandler,
   implementationStatuses,
   provenResultStatuses,
-  type ByterResultStatus,
+  type SquasherResultStatus,
   type GitHubRestClientLike
-} from "@byter/github-mcp";
+} from "@squasher/github-mcp";
 import type {
   ResolveToolApprovalInput,
-  StartByterSessionInput,
-  StartByterSessionResult,
+  StartSquasherSessionInput,
+  StartSquasherSessionResult,
   TrueForgeTurn,
   TrueForgeRuntimeEventListener,
   TrueForgeRuntimeEvent
-} from "@byter/agent";
-import { ByterHarness, defaultLlmModel, type WriteTargetDecision } from "@byter/harness";
+} from "@squasher/agent";
+import { SquasherHarness, defaultLlmModel, type WriteTargetDecision } from "@squasher/harness";
 import {
   resolveContributionTarget,
   type ContributionTarget
 } from "./contribution.js";
-import { canTransition, createRun, scanIssueText, transitionRun } from "@byter/core";
+import { brandedEnv } from "./env.js";
+import { canTransition, createRun, scanIssueText, transitionRun } from "@squasher/core";
 import {
   GitHubRestClient,
   parseIssueCommentWebhook,
   parseIssueWebhook,
   verifyGitHubWebhook
-} from "@byter/github";
+} from "@squasher/github";
 
 import { PostgresStore } from "./db.js";
 
@@ -47,14 +48,21 @@ const maxPatchFiles = 40;
 const maxPatchFileBytes = 512 * 1024;
 const maxPatchTotalBytes = 2 * 1024 * 1024;
 const maxHarnessEvents = 120;
+/**
+ * Silence that marks an event stream as hung. Generous on purpose: the gap between events
+ * is one model round trip plus one tool call, and bootstrapping a toolchain in the sandbox
+ * legitimately takes minutes. Only a stream that has produced nothing at all for this long
+ * is stuck.
+ */
+const defaultStreamIdleTimeoutMs = process.env.NODE_ENV === "test" ? 50 : 5 * 60_000;
 const maxHarnessTextBytes = 4 * 1024;
 const duplicateIssueTriggerWindowMs = 60_000;
 
-export interface ByterServerOptions {
+export interface SquasherServerOptions {
   staticDir?: string;
   dataDir?: string;
   postgresStore?: PostgresStore;
-  trueForgeRuntime?: ByterSessionStarter;
+  trueForgeRuntime?: SquasherSessionStarter;
   mcpHandler?: McpRequestHandler;
   githubClient?: GitHubRestClientLike;
   /**
@@ -90,7 +98,7 @@ interface TrueForgePendingApproval {
 }
 
 interface LiveProofResult {
-  status: ByterResultStatus;
+  status: SquasherResultStatus;
   summary: string;
   rootCauseSummary?: string;
   proposedFixSummary?: string;
@@ -114,7 +122,7 @@ interface HarnessTraceEvent {
   at: string;
   type: string;
   category: HarnessEventCategory;
-  source: "trueforge" | "byter";
+  source: "trueforge" | "squasher";
   status: "info" | "running" | "passed" | "failed";
   summary: string;
   toolName?: string;
@@ -129,8 +137,8 @@ interface HarnessTraceEvent {
   artifact?: string;
 }
 
-interface ByterSessionStarter {
-  startSession(input: StartByterSessionInput): Promise<StartByterSessionResult>;
+interface SquasherSessionStarter {
+  startSession(input: StartSquasherSessionInput): Promise<StartSquasherSessionResult>;
   requestProofContract?(sessionId: string): Promise<TrueForgeTurn>;
   resolveToolApproval?(input: ResolveToolApprovalInput): Promise<TrueForgeTurn>;
   subscribeToTurn?(sessionId: string, turnId: string, onEvent?: TrueForgeRuntimeEventListener): Promise<TrueForgeRuntimeEvent[]>;
@@ -147,8 +155,8 @@ interface PersistedWebhookRunRecord {
   dashboardUrl?: string;
   githubStatusComment?: { id?: number; url: string };
   githubComments?: Array<{ id?: number; url: string; kind: GitHubCommentKind; createdAt: string }>;
-  verifiedLabel?: { name: "byter:verified"; appliedAt?: string; error?: string };
-  approvalLabel?: { name: "byter:awaiting-approval"; appliedAt?: string; error?: string };
+  verifiedLabel?: { name: "squasher:verified"; appliedAt?: string; error?: string };
+  approvalLabel?: { name: "squasher:awaiting-approval"; appliedAt?: string; error?: string };
   lifecycleLabels?: Array<{ name: string; appliedAt?: string; error?: string }>;
   contribution?: ContributionTarget;
   run: ReturnType<typeof createRun>;
@@ -167,7 +175,7 @@ interface PersistedWebhookRunRecord {
   };
 }
 
-export function createByterServer(options: ByterServerOptions = {}): Server {
+export function createSquasherServer(options: SquasherServerOptions = {}): Server {
   const staticDir = resolve(options.staticDir ?? process.env.STATIC_DIR ?? defaultStaticDir());
   const dataDir = options.dataDir ?? process.env.DATA_DIR;
   const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.PGDATABASE_URL;
@@ -248,7 +256,7 @@ async function handleGitHubWebhook(
   request: IncomingMessage,
   response: ServerResponse,
   dataDir: string | undefined,
-  trueForgeRuntime: ByterSessionStarter | undefined,
+  trueForgeRuntime: SquasherSessionStarter | undefined,
   githubClient: GitHubRestClientLike | undefined,
   activeIssueTriggers: Set<string>,
   postgresStore?: PostgresStore,
@@ -343,7 +351,7 @@ async function processIssueWebhook(
   response: ServerResponse,
   dataDir: string | undefined,
   githubClient: GitHubRestClientLike | undefined,
-  trueForgeRuntime: ByterSessionStarter | undefined,
+  trueForgeRuntime: SquasherSessionStarter | undefined,
   activeIssueTriggers: Set<string>,
   isExplicitRetrigger = false,
   postgresStore?: PostgresStore,
@@ -459,7 +467,7 @@ function parseGitHubApprovalCommand(body: string | null): GitHubApprovalCommand 
   if (body?.trim().toLowerCase() === "approve") {
     return {};
   }
-  const match = body?.trim().match(/^\/byter\s+approve\s+(\S+)\s+([a-f0-9]{64})$/i);
+  const match = body?.trim().match(/^\/squasher\s+approve\s+(\S+)\s+([a-f0-9]{64})$/i);
   return match ? { runId: match[1], patchHash: match[2].toLowerCase() } : undefined;
 }
 
@@ -475,7 +483,7 @@ async function handleGitHubIssueCommentWebhook(
   response: ServerResponse,
   dataDir: string | undefined,
   githubClient: GitHubRestClientLike | undefined,
-  trueForgeRuntime: ByterSessionStarter | undefined,
+  trueForgeRuntime: SquasherSessionStarter | undefined,
   activeIssueTriggers: Set<string>,
   postgresStore?: PostgresStore
 ): Promise<void> {
@@ -491,12 +499,12 @@ async function handleGitHubIssueCommentWebhook(
     return;
   }
 
-  if (/(^|\n)\/byter\s+run(?:\s|$)/i.test(webhook.comment.body ?? "")) {
+  if (/(^|\n)\/squasher\s+run(?:\s|$)/i.test(webhook.comment.body ?? "")) {
     const issueWebhook: ReturnType<typeof parseIssueWebhook> = {
       action: "opened",
       issue: {
         ...webhook.issue,
-        body: webhook.issue.body ? `${webhook.issue.body}\n\n/byter run` : "/byter run"
+        body: webhook.issue.body ? `${webhook.issue.body}\n\n/squasher run` : "/squasher run"
       },
       repository: webhook.repository
     };
@@ -507,7 +515,7 @@ async function handleGitHubIssueCommentWebhook(
 
   const command = parseGitHubApprovalCommand(webhook.comment.body);
   if (!command) {
-    sendJson(response, 202, { ignored: true, reason: "No Byter approval command" });
+    sendJson(response, 202, { ignored: true, reason: "No Squasher approval command" });
     return;
   }
 
@@ -572,7 +580,7 @@ async function handleLatestRun(
   request: IncomingMessage,
   response: ServerResponse,
   dataDir: string | undefined,
-  trueForgeRuntime: ByterSessionStarter | undefined,
+  trueForgeRuntime: SquasherSessionStarter | undefined,
   postgresStore?: PostgresStore
 ): Promise<void> {
   if (request.method !== "GET") {
@@ -606,7 +614,7 @@ async function handleRun(
   response: ServerResponse,
   dataDir: string | undefined,
   runId: string,
-  trueForgeRuntime: ByterSessionStarter | undefined,
+  trueForgeRuntime: SquasherSessionStarter | undefined,
   postgresStore?: PostgresStore
 ): Promise<void> {
   if (request.method !== "GET") {
@@ -644,7 +652,7 @@ function publicRunPayload(value: unknown): unknown {
   const result = isRecord(trueForge.result)
     ? {
         ...trueForge.result,
-        ...(typeof trueForge.result.kind === "string" ? { kind: "byter.result" } : {}),
+        ...(typeof trueForge.result.kind === "string" ? { kind: "squasher.result" } : {}),
         ...(typeof trueForge.result.summary === "string" ? { summary: safePublicMarkdown(trueForge.result.summary) } : {}),
         ...(typeof trueForge.result.rootCauseSummary === "string" ? { rootCauseSummary: safePublicMarkdown(trueForge.result.rootCauseSummary) } : {}),
         ...(typeof trueForge.result.proposedFixSummary === "string" ? { proposedFixSummary: safePublicMarkdown(trueForge.result.proposedFixSummary) } : {}),
@@ -682,7 +690,7 @@ function publicRunPayload(value: unknown): unknown {
           ])
           ),
           id: `event-${index + 1}`,
-          source: publicEvent.source === "trueforge" ? "trueforge" : "byter",
+          source: publicEvent.source === "trueforge" ? "trueforge" : "squasher",
           ...(publicEvent.category === "session" ? { category: "agent" } : {}),
           ...(typeof publicEvent.type === "string"
             ? { type: publicEvent.type.replace(/session/gi, "run").replace(/turn/gi, "step") }
@@ -696,7 +704,7 @@ function publicRunPayload(value: unknown): unknown {
     : label;
   const lifecycleLabels = Array.isArray(value.lifecycleLabels)
     ? value.lifecycleLabels.map((label) => isRecord(label) && typeof label.name === "string"
-      ? { ...label, name: `byter:${label.name.split(":").at(-1)}` }
+      ? { ...label, name: `squasher:${label.name.split(":").at(-1)}` }
       : label)
     : value.lifecycleLabels;
 
@@ -706,8 +714,8 @@ function publicRunPayload(value: unknown): unknown {
     ...(typeof value.issueBody === "string" ? { issueBody: safePublicMarkdown(value.issueBody) } : {}),
     run: publicRun,
     trueForge: { ...trueForge, result, events },
-    verifiedLabel: normalizeLabel(value.verifiedLabel, "byter:verified"),
-    approvalLabel: normalizeLabel(value.approvalLabel, "byter:awaiting-approval"),
+    verifiedLabel: normalizeLabel(value.verifiedLabel, "squasher:verified"),
+    approvalLabel: normalizeLabel(value.approvalLabel, "squasher:awaiting-approval"),
     lifecycleLabels
   };
 }
@@ -726,12 +734,12 @@ function safePublicMarkdown(value: string): string {
 
 function normalizePublicBrandText(value: string): string {
   const legacyBrand = new RegExp(["repro", "smith"].join(""), "gi");
-  return value.replace(legacyBrand, "Byter");
+  return value.replace(legacyBrand, "Squasher");
 }
 
 function normalizePublicBranchName(value: string): string {
   const fixPrefix = value.indexOf("/fix-");
-  return fixPrefix >= 0 ? `byter${value.slice(fixPrefix)}` : value;
+  return fixPrefix >= 0 ? `squasher${value.slice(fixPrefix)}` : value;
 }
 
 function ensureDashboardUrl(value: unknown): unknown {
@@ -756,7 +764,7 @@ function decodeRunId(pathname: string): string {
 async function refreshLegacyHarnessTrace(
   dataDir: string | undefined,
   value: unknown,
-  trueForgeRuntime: ByterSessionStarter | undefined
+  trueForgeRuntime: SquasherSessionStarter | undefined
 ): Promise<unknown> {
   if (!dataDir || !trueForgeRuntime?.listSessionEvents || !isRecord(value) || !isRecord(value.trueForge)) {
     return value;
@@ -848,7 +856,7 @@ async function startTrueForgeSessionForIssue(
   webhook: ReturnType<typeof parseIssueWebhook>,
   deliveryId: string,
   safeToExecute: boolean,
-  trueForgeRuntime: ByterSessionStarter | undefined
+  trueForgeRuntime: SquasherSessionStarter | undefined
 ) {
   if (!safeToExecute) {
     return {
@@ -915,7 +923,7 @@ async function handleApproval(
   request: IncomingMessage,
   response: ServerResponse,
   dataDir: string | undefined,
-  trueForgeRuntime: ByterSessionStarter | undefined,
+  trueForgeRuntime: SquasherSessionStarter | undefined,
   githubClient: GitHubRestClientLike | undefined,
   postgresStore?: PostgresStore
 ): Promise<void> {
@@ -958,7 +966,7 @@ async function executeApproval(
   runId: string,
   actionId: ApprovalActionId,
   patchHash: string,
-  trueForgeRuntime: ByterSessionStarter | undefined,
+  trueForgeRuntime: SquasherSessionStarter | undefined,
   githubClient: GitHubRestClientLike | undefined,
   postgresStore?: PostgresStore
 ): Promise<ApprovalExecutionResult> {
@@ -1059,7 +1067,7 @@ async function executeApproval(
           at: receipt.savedAt,
           type: "approval.received",
           category: "approval",
-          source: "byter",
+          source: "squasher",
           status: actionId === "reject-run" ? "failed" : "passed",
           summary: actionId === "reject-run" ? "Maintainer rejected the candidate patch" : "Maintainer requested a diff review",
           artifact: actionId === "reject-run" ? "run stopped" : "write held"
@@ -1242,7 +1250,7 @@ async function executeApproval(
           at: new Date().toISOString(),
           type: "approval.received",
           category: "approval",
-          source: "byter",
+          source: "squasher",
           status: "passed",
           summary: "Maintainer approval resumed the TrueForge GitHub write",
           toolName: "create_fix_pull_request",
@@ -1342,57 +1350,73 @@ async function appendUpdatedLiveRecord(dataDir: string | undefined, record: Pers
 }
 
 const lifecycleLabelDefinitions = [
-  { name: "byter:triaging", color: "1d5fd1", description: "Byter is triaging this issue" },
-  { name: "byter:needs-info", color: "a85b00", description: "Byter needs more issue information" },
-  { name: "byter:not-reproduced", color: "6e7781", description: "Byter could not reproduce this issue" },
+  { name: "squasher:triaging", color: "1d5fd1", description: "Squasher is triaging this issue" },
+  { name: "squasher:needs-info", color: "a85b00", description: "Squasher needs more issue information" },
+  { name: "squasher:not-reproduced", color: "6e7781", description: "Squasher could not reproduce this issue" },
   {
-    name: "byter:not-actionable",
+    name: "squasher:not-actionable",
     color: "6e7781",
-    description: "Byter understood this request but did not build it"
+    description: "Squasher understood this request but did not build it"
   },
-  { name: "byter:security-review", color: "b42318", description: "Byter held this issue for security review" },
-  { name: "byter:pr-created", color: "1a7f37", description: "Byter created a draft pull request" },
+  { name: "squasher:security-review", color: "b42318", description: "Squasher held this issue for security review" },
+  { name: "squasher:pr-created", color: "1a7f37", description: "Squasher created a draft pull request" },
   // Reconciled here as well as applied by applyVerifiedLabel and
   // applyAwaitingApprovalLabel. Those only ever add, and each only retracts a label the
   // same record applied, so a second run over one issue used to leave the first run's
   // claims in place: an issue could carry byter:verified and byter:not-reproduced at
   // once, publicly asserting a proof that a later run had disproved.
-  { name: "byter:verified", color: "8250df", description: "Issue verified by reproducible evidence" },
+  { name: "squasher:verified", color: "8250df", description: "Issue verified by reproducible evidence" },
   // Kept distinct from byter:verified on purpose. That label asserts a reproduced defect,
-  // and an implemented change never reproduced anything; reusing it would make Byter's own
+  // and an implemented change never reproduced anything; reusing it would make Squasher's own
   // evidence claim mean two different things.
   {
-    name: "byter:implemented",
+    name: "squasher:implemented",
     color: "0969da",
-    description: "Byter implemented and verified the requested change"
+    description: "Squasher implemented and verified the requested change"
   },
   {
-    name: "byter:awaiting-approval",
+    name: "squasher:awaiting-approval",
     color: "d1242f",
     description: "Verified patch is waiting for maintainer approval"
   }
 ] as const;
 
 /**
- * The complete set of Byter labels the issue should carry right now. Anything defined
+ * Label names this application used before the rename. Not applied any more, only retracted,
+ * so a re-run cleans up what earlier runs left on an issue.
+ */
+const legacyLifecycleLabelNames = [
+  "byter:triaging",
+  "byter:needs-info",
+  "byter:not-reproduced",
+  "byter:not-actionable",
+  "byter:security-review",
+  "byter:pr-created",
+  "byter:verified",
+  "byter:implemented",
+  "byter:awaiting-approval"
+] as const;
+
+/**
+ * The complete set of Squasher labels the issue should carry right now. Anything defined
  * above and absent from this set is removed, so the labels always describe the latest
  * run rather than the union of every run.
  */
 function desiredLifecycleLabels(record: PersistedWebhookRunRecord): string[] {
-  if (!record.scan.safeToExecute) return ["byter:security-review"];
+  if (!record.scan.safeToExecute) return ["squasher:security-review"];
 
   const labels: string[] = [];
 
   // At most one status label, mirroring where the run actually is.
-  if (record.run.status === "pr-created") labels.push("byter:pr-created");
-  else if (record.run.status === "needs-info") labels.push("byter:needs-info");
-  else if (record.run.status === "not-reproduced") labels.push("byter:not-reproduced");
-  else if (record.run.status === "not-actionable") labels.push("byter:not-actionable");
+  if (record.run.status === "pr-created") labels.push("squasher:pr-created");
+  else if (record.run.status === "needs-info") labels.push("squasher:needs-info");
+  else if (record.run.status === "not-reproduced") labels.push("squasher:not-reproduced");
+  else if (record.run.status === "not-actionable") labels.push("squasher:not-actionable");
   else if (
     record.run.status !== "awaiting-approval" &&
     (record.run.status === "triaging" || record.trueForge.status === "started")
   ) {
-    labels.push("byter:triaging");
+    labels.push("squasher:triaging");
   }
 
   // Claims about the evidence, retracted as soon as they no longer hold. The run status
@@ -1401,8 +1425,8 @@ function desiredLifecycleLabels(record: PersistedWebhookRunRecord): string[] {
   // that run must not be labelled verified.
   if (provenRunStatuses.has(record.run.status) && hasGenuineProof(record.trueForge.result)) {
     const status = record.trueForge.result?.status;
-    labels.push(status && implementationStatuses.has(status) ? "byter:implemented" : "byter:verified");
-    if (record.run.status === "awaiting-approval") labels.push("byter:awaiting-approval");
+    labels.push(status && implementationStatuses.has(status) ? "squasher:implemented" : "squasher:verified");
+    if (record.run.status === "awaiting-approval") labels.push("squasher:awaiting-approval");
   }
 
   return labels;
@@ -1562,10 +1586,15 @@ async function syncLifecycleLabels(
   }
 
   if (githubClient.removeLabel) {
-    for (const definition of lifecycleLabelDefinitions) {
-      if (desired.includes(definition.name)) continue;
+    // Legacy names are retracted alongside the current ones. Issues labelled before the
+    // rename still carry byter:*, and dropping those names from reconciliation entirely
+    // would strand them there permanently -- an issue reading both byter:verified and
+    // squasher:not-reproduced, which is the contradiction reconciliation exists to prevent.
+    const retractable = [...lifecycleLabelDefinitions.map((definition) => definition.name), ...legacyLifecycleLabelNames];
+    for (const name of retractable) {
+      if (desired.includes(name)) continue;
       try {
-        await githubClient.removeLabel(owner, repo, issueNumber, definition.name);
+        await githubClient.removeLabel(owner, repo, issueNumber, name);
       } catch {
         // A missing label is already in the desired state.
       }
@@ -1596,7 +1625,7 @@ async function applyVerifiedLabel(
     const owner = record.run.issue.owner;
     const repo = record.run.issue.repo;
     const issueNumber = record.run.issue.issueNumber;
-    const labelName = "byter:verified";
+    const labelName = "squasher:verified";
     const labelColor = "8250df";
     try {
       await githubClient.updateLabel?.(owner, repo, labelName, labelColor, "Issue verified by reproducible evidence");
@@ -1613,12 +1642,12 @@ async function applyVerifiedLabel(
     await githubClient.updateLabel?.(owner, repo, labelName, labelColor, "Issue verified by reproducible evidence");
     return {
       ...record,
-      verifiedLabel: { name: "byter:verified", appliedAt: new Date().toISOString() }
+      verifiedLabel: { name: "squasher:verified", appliedAt: new Date().toISOString() }
     };
   } catch {
     return {
       ...record,
-      verifiedLabel: { name: "byter:verified", error: "GitHub did not accept the verified label request" }
+      verifiedLabel: { name: "squasher:verified", error: "GitHub did not accept the verified label request" }
     };
   }
 }
@@ -1641,7 +1670,7 @@ async function applyAwaitingApprovalLabel(
     const owner = record.run.issue.owner;
     const repo = record.run.issue.repo;
     const issueNumber = record.run.issue.issueNumber;
-    const labelName = "byter:awaiting-approval";
+    const labelName = "squasher:awaiting-approval";
     const labelColor = "d1242f";
     try {
       await githubClient.updateLabel?.(owner, repo, labelName, labelColor, "Verified patch is waiting for maintainer approval");
@@ -1664,7 +1693,7 @@ async function applyAwaitingApprovalLabel(
     return {
       ...record,
       approvalLabel: {
-        name: "byter:awaiting-approval",
+        name: "squasher:awaiting-approval",
         error: "GitHub did not accept the approval label request"
       }
     };
@@ -1684,7 +1713,7 @@ async function removeAwaitingApprovalLabel(
       record.run.issue.owner,
       record.run.issue.repo,
       record.run.issue.issueNumber,
-      "byter:awaiting-approval"
+      "squasher:awaiting-approval"
     );
     return { ...record, approvalLabel: undefined };
   } catch {
@@ -1834,19 +1863,19 @@ export function buildGitHubStatusComment(record: PersistedWebhookRunRecord, kind
   const reviewUrl = record.dashboardUrl ? `${record.dashboardUrl.replace(/\/$/, "")}/review` : "#";
   const runUrl = record.dashboardUrl ?? "#";
   const lines = [
-    `<!-- byter-run:${record.run.id} -->`,
-    `## Byter · ${status.label}`,
+    `<!-- squasher-run:${record.run.id} -->`,
+    `## Squasher · ${status.label}`,
     "",
     `Issue #${record.run.issue.issueNumber}: ${safeCommentText(record.issueTitle, 240)}`,
     `**Status:** ${status.detail}`,
     "",
-    `[Open Byter run →](${record.dashboardUrl ?? "#"})`
+    `[Open Squasher run →](${record.dashboardUrl ?? "#"})`
   ];
 
   if (!record.scan.safeToExecute || record.run.status === "security-review") {
     lines.push(
       "",
-      "Byter detected potentially unsafe reproduction instructions and held execution.",
+      "Squasher detected potentially unsafe reproduction instructions and held execution.",
       "",
       "**Execution:** Blocked",
       "**GitHub writes:** None",
@@ -1856,7 +1885,7 @@ export function buildGitHubStatusComment(record: PersistedWebhookRunRecord, kind
   } else if (record.run.status === "needs-info") {
     lines.push(
       "",
-      "Byter could not build a reliable reproduction from the current report.",
+      "Squasher could not build a reliable reproduction from the current report.",
       "",
       "**Next step:** Add the missing runtime, input, or expected-output details and trigger a new run.",
       "",
@@ -1865,7 +1894,7 @@ export function buildGitHubStatusComment(record: PersistedWebhookRunRecord, kind
   } else if (record.run.status === "not-reproduced") {
     lines.push(
       "",
-      "Byter built the reported environment but did not observe the claimed failure.",
+      "Squasher built the reported environment but did not observe the claimed failure.",
       "",
       `**Reproduction attempts:** ${safeCommentText(result?.proof?.attempts ?? "No matching failure observed", 180)}`,
       "",
@@ -1913,7 +1942,7 @@ export function buildGitHubStatusComment(record: PersistedWebhookRunRecord, kind
       "### Finding",
       safeCommentMarkdown(result.rootCauseSummary ?? summarizeCommentText(result.summary), 360),
       "",
-      "No candidate patch was returned, so Byter did not request repository write approval.",
+      "No candidate patch was returned, so Squasher did not request repository write approval.",
       `**[View verification evidence →](${runUrl})**`
     );
   } else if (record.run.status === "failed") {
@@ -2020,7 +2049,7 @@ function githubCommentStatus(record: PersistedWebhookRunRecord): { label: string
     return { label: "Fix proposed", detail: "Approved patch validated; draft pull request created." };
   }
   if (record.run.status === "needs-info") {
-    return { label: "Needs information", detail: "The issue needs more detail before Byter can reproduce it." };
+    return { label: "Needs information", detail: "The issue needs more detail before Squasher can reproduce it." };
   }
   if (record.run.status === "not-reproduced") {
     return { label: "Not reproduced", detail: "The reported failure was not observed in the investigated environment." };
@@ -2054,7 +2083,7 @@ function githubCommentStatus(record: PersistedWebhookRunRecord): { label: string
     }
     return { label: "Investigating", detail: "TrueForge is inspecting the issue and collecting executable evidence." };
   }
-  return { label: "Investigation queued", detail: "Byter accepted the signed issue and is preparing the investigation." };
+  return { label: "Investigation queued", detail: "Squasher accepted the signed issue and is preparing the investigation." };
 }
 
 async function findPersistedRunById(
@@ -2664,13 +2693,15 @@ function findTrueForgeToolCall(
 }
 
 interface ReconcileSessionEventsOptions {
-  trueForgeRuntime: ByterSessionStarter;
+  trueForgeRuntime: SquasherSessionStarter;
   sessionId: string;
   turnId?: string;
   persistTraceEvent?: TrueForgeRuntimeEventListener;
   isSettled?: (events: TrueForgeRuntimeEvent[]) => boolean;
   maxPollAttempts?: number;
   pollIntervalMs?: number;
+  /** How long the event stream may stay silent before it is treated as hung. */
+  idleTimeoutMs?: number;
   ignoreEvents?: TrueForgeRuntimeEvent[];
 }
 
@@ -2683,6 +2714,7 @@ async function reconcileSessionEvents(options: ReconcileSessionEventsOptions): P
     isSettled = isTrueForgeTurnSettled,
     maxPollAttempts = 60,
     pollIntervalMs = process.env.NODE_ENV === "test" ? 5 : 5000,
+    idleTimeoutMs = defaultStreamIdleTimeoutMs,
     ignoreEvents = []
   } = options;
 
@@ -2705,20 +2737,24 @@ async function reconcileSessionEvents(options: ReconcileSessionEventsOptions): P
   let streamError: unknown;
   if (turnId && trueForgeRuntime.subscribeToTurn) {
     try {
-      // subscribeToTurn has no timeout of its own: the harness's generator terminates
-      // once it yields a turn's terminal event, but only if that event is still in its
-      // in-memory history. A session reloaded from its snapshot after a restart starts
-      // with no history at all -- snapshots deliberately exclude events -- so
-      // re-subscribing to a turn from before the restart can wait on events that will
-      // never arrive and never resolve. Observed live: resuming an approval whose first
-      // attempt ran in a since-restarted process hung this call indefinitely. Bounding it
-      // to the same budget as the fallback poll below turns that hang into the ordinary,
-      // recoverable "did not settle" path instead of a stuck request.
-      const streamed = await withTimeout(
-        trueForgeRuntime.subscribeToTurn(sessionId, turnId, async (event) => {
-          await recordEvents([event]);
-        }),
-        maxPollAttempts * pollIntervalMs
+      // subscribeToTurn has no timeout of its own: the harness's generator terminates once
+      // it yields a turn's terminal event, but only if that event is still in its in-memory
+      // history. A session reloaded from its snapshot after a restart starts with no history
+      // at all -- snapshots deliberately exclude events -- so re-subscribing to a turn from
+      // before the restart waits on events that will never arrive.
+      //
+      // The bound is on silence, not on total duration. A total cap cannot tell a hung
+      // stream from a busy one, and killed a healthy run: an investigation that had made 34
+      // tool calls over ten minutes was cut off at a five minute ceiling. A stream still
+      // delivering events is working however long it has run; one that has delivered nothing
+      // for this long is hung.
+      const streamed = await withIdleTimeout(
+        (touch) =>
+          trueForgeRuntime.subscribeToTurn!(sessionId, turnId, async (event) => {
+            touch();
+            await recordEvents([event]);
+          }),
+        idleTimeoutMs
       );
       await recordEvents(streamed);
     } catch (err) {
@@ -2756,18 +2792,38 @@ async function reconcileSessionEvents(options: ReconcileSessionEventsOptions): P
 }
 
 /** Rejects with a distinguishable error if `promise` has not settled within `timeoutMs`. */
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+/**
+ * Runs `start`, rejecting only if it goes `idleMs` without reporting activity.
+ *
+ * `start` receives a `touch` callback and calls it on every sign of life. Work that keeps
+ * producing events runs as long as it needs; work that has produced nothing for `idleMs` is
+ * treated as hung.
+ */
+function withIdleTimeout<T>(start: (touch: () => void) => Promise<T>, idleMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms`)), timeoutMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      }
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const finish = (run: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      run();
+    };
+
+    const touch = () => {
+      if (settled) return;
+      clearTimeout(timer);
+      timer = setTimeout(
+        () => finish(() => reject(new Error(`No activity for ${idleMs}ms`))),
+        idleMs
+      );
+    };
+
+    touch();
+    start(touch).then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error))
     );
   });
 }
@@ -2782,7 +2838,7 @@ function runtimeEventKey(event: TrueForgeRuntimeEvent): string {
 async function monitorTrueForgeTurn(
   dataDir: string | undefined,
   record: PersistedWebhookRunRecord,
-  trueForgeRuntime: ByterSessionStarter,
+  trueForgeRuntime: SquasherSessionStarter,
   githubClient: GitHubRestClientLike | undefined,
   postgresStore?: PostgresStore
 ): Promise<void> {
@@ -2916,7 +2972,7 @@ async function monitorTrueForgeTurn(
           ? "TrueForge returned a patch without a matching native approval checkpoint"
           : turnError
             ? `TrueForge turn failed: ${turnError}`
-            : "TrueForge completed without a valid byter.result contract"
+            : "TrueForge completed without a valid squasher.result contract"
       );
     }
     const completedRecord: PersistedWebhookRunRecord = {
@@ -2934,7 +2990,7 @@ async function monitorTrueForgeTurn(
                   ? "TrueForge patch did not match a native approval checkpoint"
                   : turnError
                     ? `TrueForge turn failed: ${turnError}`
-                    : "TrueForge completed without a valid byter.result contract" }
+                    : "TrueForge completed without a valid squasher.result contract" }
           : { error: "TrueForge turn is still running; completion has not been observed" }),
         events: eventMetadata,
         ...(pendingApproval ? { pendingApproval } : {}),
@@ -3004,7 +3060,7 @@ function projectTrueForgeEvent(event: TrueForgeRuntimeEvent, fallbackIndex = 0):
         ...(typeof args.issueNumber === "number" ? { target: `issue #${args.issueNumber}` } : {}),
         ...(typeof args.command === "string" ? { command: redactHarnessText(args.command) } : {}),
         ...(typeof args.sandboxId === "string" ? { sandboxId: args.sandboxId } : {}),
-        ...(category === "mcp" ? { mcpServer: "byter-github" } : {}),
+        ...(category === "mcp" ? { mcpServer: "squasher-github" } : {}),
         ...(category === "subagent" ? { subagent: typeof args.name === "string" ? args.name : name } : {})
       }];
     });
@@ -3093,7 +3149,7 @@ function mergeHarnessEvents(existing: HarnessTraceEvent[], incoming: HarnessTrac
 
 function categoryForTool(name: string): HarnessEventCategory {
   if (name === "exec" || name === "shell" || name === "run_command") return "sandbox";
-  if (name === "read_issue" || name === "read_file" || name === "submit_byter_result" || name === "add_verified_label" || name === "comment_on_issue") return "mcp";
+  if (name === "read_issue" || name === "read_file" || name === "submit_squasher_result" || name === "add_verified_label" || name === "comment_on_issue") return "mcp";
   if (name.endsWith("create_fix_pull_request")) return "github";
   if (name.includes("subagent") || name.includes("delegate") || name === "task") return "subagent";
   return "agent";
@@ -3103,7 +3159,7 @@ function summaryForTool(name: string, args: Record<string, unknown>): string {
   if (name === "exec" || name === "shell" || name === "run_command") return "Running a command in the Daytona sandbox";
   if (name === "read_file") return `Reading ${typeof args.path === "string" ? redactHarnessText(args.path) : "a repository file"} through GitHub MCP`;
   if (name === "read_issue") return `Reading ${typeof args.issueNumber === "number" ? `issue #${args.issueNumber}` : "the GitHub issue"} through GitHub MCP`;
-  if (name === "submit_byter_result") return "Submitting the Byter proof contract";
+  if (name === "submit_squasher_result") return "Submitting the Squasher proof contract";
   if (name.endsWith("create_fix_pull_request")) return "Preparing the GitHub pull request write for approval";
   if (categoryForTool(name) === "subagent") return `Delegating ${typeof args.name === "string" ? args.name : "a focused task"}`;
   return `Calling ${name}`;
@@ -3178,7 +3234,7 @@ function redactHarnessText(value: string): string {
 }
 
 function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: PersistedWebhookRunRecord): LiveProofResult | undefined {
-  const submittedResult = extractSubmittedByterResult(events);
+  const submittedResult = extractSubmittedSquasherResult(events);
   const doneEvents = events.filter((event) => event.type === "turn.done").reverse();
   const streamedDeltaText = joinBoundedTexts(
     events
@@ -3204,7 +3260,7 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
       outputCount: outputTexts.length,
       outputLengths: outputTexts.map((output) => output.length),
       joinedLength: joinedOutput.length,
-      hasResultMarker: joinedOutput.includes("byter.result"),
+      hasResultMarker: joinedOutput.includes("squasher.result"),
       hasCandidatePatch: joinedOutput.includes("candidatePatch"),
       hasKnownStatus: /\"status\"\s*:\s*\"(?:patch-ready|verified|not-reproduced|blocked|failed)\"/.test(joinedOutput),
       hasJsonObject: joinedOutput.includes("{")
@@ -3222,7 +3278,7 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
     return undefined;
   }
   if (provenResultStatuses.has(status) && !submittedResult) {
-    console.error("TrueForge positive proof was not submitted through submit_byter_result");
+    console.error("TrueForge positive proof was not submitted through submit_squasher_result");
     return undefined;
   }
 
@@ -3266,7 +3322,7 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
   };
 }
 
-function extractSubmittedByterResult(events: TrueForgeRuntimeEvent[]): Record<string, unknown> | undefined {
+function extractSubmittedSquasherResult(events: TrueForgeRuntimeEvent[]): Record<string, unknown> | undefined {
   for (const event of [...events].reverse()) {
     if (event.type !== "model.message") continue;
     const raw = unwrapRuntimeEvent(event.raw);
@@ -3274,9 +3330,9 @@ function extractSubmittedByterResult(events: TrueForgeRuntimeEvent[]): Record<st
     const toolCalls = Array.isArray(raw.toolCalls) ? raw.toolCalls : Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
     for (const toolCall of [...toolCalls].reverse()) {
       if (!isRecord(toolCall) || !isRecord(toolCall.function)) continue;
-      if (typeof toolCall.function.name !== "string" || !toolCall.function.name.endsWith("submit_byter_result")) continue;
+      if (typeof toolCall.function.name !== "string" || !toolCall.function.name.endsWith("submit_squasher_result")) continue;
       const submitted = parseToolArguments(toolCall.function.arguments);
-      if (isByterResultContract(submitted)) return submitted;
+      if (isSquasherResultContract(submitted)) return submitted;
     }
   }
   return undefined;
@@ -3418,7 +3474,7 @@ function normalizeCandidatePatch(value: unknown, record: PersistedWebhookRunReco
 }
 
 function branchNameForIssue(issueNumber: number, deliveryId: string): string {
-  return `byter/fix-${issueNumber}-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 10)}`;
+  return `squasher/fix-${issueNumber}-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 10)}`;
 }
 
 function applyLiveProofResult(run: ReturnType<typeof createRun>, result: LiveProofResult) {
@@ -3429,11 +3485,11 @@ function applyLiveProofResult(run: ReturnType<typeof createRun>, result: LivePro
     const implemented = implementationStatuses.has(result.status);
     const narration: Partial<Record<string, string>> = implemented
       ? {
-          reproducing: "Byter inspected the repository for the requested change",
-          verified: "Byter confirmed the requested change is implementable here",
-          minimizing: "Byter scoped the change to the smallest surface",
-          fixing: "Byter implemented the requested change",
-          validating: "Byter verified the new behaviour and existing checks"
+          reproducing: "Squasher inspected the repository for the requested change",
+          verified: "Squasher confirmed the requested change is implementable here",
+          minimizing: "Squasher scoped the change to the smallest surface",
+          fixing: "Squasher implemented the requested change",
+          validating: "Squasher verified the new behaviour and existing checks"
         }
       : {};
 
@@ -3455,7 +3511,7 @@ function applyLiveProofResult(run: ReturnType<typeof createRun>, result: LivePro
   // Implemented and verified, but no patch survived normalization, so there is nothing to
   // approve. Recorded as verified work rather than dropped silently.
   if (implementationStatuses.has(result.status) && canTransition(run.status, "reproducing")) {
-    run = transitionRun(run, "reproducing", "Byter inspected the repository for the requested change");
+    run = transitionRun(run, "reproducing", "Squasher inspected the repository for the requested change");
     if (canTransition(run.status, "verified")) {
       return transitionRun(run, "verified", result.summary);
     }
@@ -3480,8 +3536,8 @@ function applyLiveProofResult(run: ReturnType<typeof createRun>, result: LivePro
 }
 
 function parseLiveResultStatus(value: unknown): LiveProofResult["status"] | undefined {
-  return typeof value === "string" && (byterResultStatuses as readonly string[]).includes(value)
-    ? (value as ByterResultStatus)
+  return typeof value === "string" && (squasherResultStatuses as readonly string[]).includes(value)
+    ? (value as SquasherResultStatus)
     : undefined;
 }
 
@@ -3504,7 +3560,7 @@ function contentText(value: unknown): string {
     if ("output" in value) return contentText(value.output);
     if ("delta" in value) return contentText(value.delta);
     if (isRecord(value.function) && typeof value.function.arguments === "string") return value.function.arguments;
-    if (value.kind === "byter.result" || isRecord(value.candidatePatch) || isCandidatePatchObject(value)) {
+    if (value.kind === "squasher.result" || isRecord(value.candidatePatch) || isCandidatePatchObject(value)) {
       return JSON.stringify(value);
     }
     return "";
@@ -3531,7 +3587,7 @@ function parseResultJson(text: string): Record<string, unknown> | undefined {
     try {
       const parsed = JSON.parse(candidate.trim()) as unknown;
       if (!isRecord(parsed)) continue;
-      if (isByterResultContract(parsed)) return parsed;
+      if (isSquasherResultContract(parsed)) return parsed;
     } catch {
       // Try the next bounded candidate.
     }
@@ -3574,10 +3630,10 @@ function isCandidatePatchObject(value: Record<string, unknown>): boolean {
   return typeof value.title === "string" && typeof value.body === "string" && Array.isArray(value.files);
 }
 
-function isByterResultContract(value: Record<string, unknown>): boolean {
+function isSquasherResultContract(value: Record<string, unknown>): boolean {
   const proof = isRecord(value.proof) ? value.proof : undefined;
   if (
-    value.kind !== "byter.result" ||
+    value.kind !== "squasher.result" ||
     !parseLiveResultStatus(value.status) ||
     typeof value.summary !== "string" ||
     !proof ||
@@ -3625,23 +3681,37 @@ function dashboardUrlFor(runId: string): string {
 }
 
 function requiresExplicitTrigger(): boolean {
-  return process.env.BYTER_REQUIRE_TRIGGER_LABEL === "true";
+  return brandedEnv("REQUIRE_TRIGGER_LABEL") === "true";
 }
 
+/** Applied by maintainers to opt an issue in. */
+const defaultTriggerLabel = "squasher:run";
+
+/**
+ * Pre-rename trigger label. Still honoured: repositories already carry byter:run on their
+ * issues and in their issue templates, and a rename that silently stopped triggering those
+ * would look like Squasher had simply stopped working.
+ */
+const legacyTriggerLabel = "byter:run";
+
 function triggerLabel(): string {
-  return process.env.BYTER_TRIGGER_LABEL?.trim() || "byter:run";
+  return brandedEnv("TRIGGER_LABEL")?.trim() || defaultTriggerLabel;
 }
 
 function hasTriggerLabel(webhook: ReturnType<typeof parseIssueWebhook>): boolean {
-  const target = triggerLabel().toLowerCase();
-  if (webhook.action === "labeled" && webhook.label?.name?.toLowerCase() === target) {
+  // The configured label plus the pre-rename one, so issues already labelled byter:run
+  // keep triggering.
+  const targets = new Set([triggerLabel().toLowerCase(), legacyTriggerLabel]);
+  if (webhook.action === "labeled" && targets.has(webhook.label?.name?.toLowerCase() ?? "")) {
     return true;
   }
-  return (webhook.issue.labels ?? []).some((label) => (typeof label === "string" ? label : label.name)?.toLowerCase() === target);
+  return (webhook.issue.labels ?? []).some((label) =>
+    targets.has((typeof label === "string" ? label : label.name)?.toLowerCase() ?? "")
+  );
 }
 
 function hasExplicitTrigger(webhook: ReturnType<typeof parseIssueWebhook>): boolean {
-  if (/(^|\n)\/byter\s+run(?:\s|$)/i.test(webhook.issue.body ?? "")) {
+  if (/(^|\n)\/squasher\s+run(?:\s|$)/i.test(webhook.issue.body ?? "")) {
     return true;
   }
   return hasTriggerLabel(webhook);
@@ -3723,17 +3793,17 @@ function githubMcpHandlerFromEnv(githubClient: GitHubRestClientLike | undefined)
 function trueForgeRuntimeFromEnv(
   githubClient: GitHubRestClientLike | undefined,
   contributions: ContributionRegistry
-): ByterSessionStarter | undefined {
+): SquasherSessionStarter | undefined {
   if (!githubClient || !process.env.DEEPSEEK_API_KEY || !process.env.E2B_API_KEY) {
     return undefined;
   }
 
-  return new ByterTrueForgeRuntime(
+  return new SquasherTrueForgeRuntime(
     {
       modelName: process.env.DEEPSEEK_MODEL ?? defaultLlmModel,
       modelProvider: process.env.MODEL_PROVIDER ?? "deepseek"
     },
-    ByterHarness.fromEnv(githubClient, {
+    SquasherHarness.fromEnv(githubClient, {
       resolveWriteTarget: ({ owner, repo }) => contributions.decide(owner, repo)
     })
   );
