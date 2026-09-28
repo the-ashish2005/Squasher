@@ -104,14 +104,18 @@ try {
   await new Promise((closed) => server.close(closed));
 }
 
-const sessionId = latest?.trueForge?.session?.id;
+// Read from the persisted record, not from `latest`: the API redacts trueForge.session,
+// trueForge.turn and pendingApproval from every public response (server.ts), so the
+// session id is only ever undefined there. Taking it from the API silently disabled the
+// filter below and let other runs' events back into the summary.
+const sessionId = await readRunSessionId(dataDir, deliveryId);
 const allEvents = await readHarnessEvents(dataDir);
 // harness-events.jsonl is DATA_DIR-wide, not run-scoped: with a fresh temp DATA_DIR (the
 // default) it only ever holds this run's events, but with LIVE_DATA_DIR pointed at a
 // shared directory it accumulates every run ever driven against that directory. Filtering
 // by the session id this run actually got back is what keeps the summary about this run.
 if (!sessionId) {
-  console.warn(`[run ${runLabel}] no session id was returned; the summary below is DATA_DIR-wide, not run-scoped`);
+  console.warn(`[run ${runLabel}] no session id was recorded; the summary below is DATA_DIR-wide, not run-scoped`);
 }
 const events = sessionId ? allEvents.filter((entry) => entry.sessionId === sessionId) : allEvents;
 const guardEvents = events.filter((entry) => entry.event?.type === "byter.structured_output.guard");
@@ -158,6 +162,23 @@ async function fetchIssue() {
   });
   if (!response.ok) throw new Error(`Could not read issue: HTTP ${response.status}`);
   return response.json();
+}
+
+/** Last persisted record for this delivery, which keeps the ids the API strips. */
+async function readRunSessionId(dir, delivery) {
+  try {
+    const lines = (await readFile(join(dir, "webhook-runs.jsonl"), "utf8")).trim().split("\n");
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      if (!lines[index]) continue;
+      const record = JSON.parse(lines[index]);
+      if (record.deliveryId === delivery && record.trueForge?.session?.id) {
+        return record.trueForge.session.id;
+      }
+    }
+  } catch {
+    // Fall through: the caller warns and reports a DATA_DIR-wide summary.
+  }
+  return undefined;
 }
 
 async function readHarnessEvents(dir) {
