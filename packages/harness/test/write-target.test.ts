@@ -252,3 +252,85 @@ describe("contribution disclosure", () => {
     expect(body).toContain("No maintainer requested this change");
   });
 });
+
+describe("approval checkpoint lifetime", () => {
+  /** Drives one run to a paused write, then resolves that approval. */
+  async function pauseThenApprove(options: { createPullRequest: ReturnType<typeof vi.fn> }) {
+    const store = new SessionStore({});
+    const github = fakeGitHub();
+    github.createPullRequest = options.createPullRequest as never;
+    const harness = new ByterHarness({ client: github, llm: writeScript().llm, sandbox: fakeSandbox(), store });
+
+    const { sessionId } = await runWriteTurn(harness);
+    expect(store.pending(sessionId)).toBeDefined();
+
+    const pending = store.pending(sessionId)!;
+    await harness.sessions.createTurn(sessionId, {
+      previousTurnId: pending.turnId,
+      input: [
+        {
+          type: "user.tool_approval",
+          toolCallId: pending.toolCallId,
+          approval: { status: "allow" }
+        }
+      ]
+    });
+
+    // The write runs detached from the approval response, so let it settle.
+    for (let attempt = 0; attempt < 200 && store.pending(sessionId) !== undefined; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (options.createPullRequest.mock.calls.length > 0) break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    return { store, sessionId, github };
+  }
+
+  it("keeps the approval pending when the write fails, so it can be retried", async () => {
+    // The real failure: the dashboard held a token with no access to the fork, GitHub
+    // answered 403, and the checkpoint was discarded anyway. Every later approval then
+    // reported no pending call and the verified patch could never be written.
+    const createPullRequest = vi.fn().mockRejectedValue(
+      new Error('GitHub API 403 Forbidden: {"message":"Resource not accessible by personal access token"}')
+    );
+    const { store, sessionId } = await pauseThenApprove({ createPullRequest });
+
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+    expect(store.pending(sessionId)).toBeDefined();
+    expect(store.pending(sessionId)?.name).toBe("create_fix_pull_request");
+  });
+
+  it("clears the approval once the write lands", async () => {
+    const createPullRequest = vi.fn().mockResolvedValue({ number: 3, html_url: "https://github.test/pull/3" });
+    const { store, sessionId } = await pauseThenApprove({ createPullRequest });
+
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+    expect(store.pending(sessionId)).toBeUndefined();
+  });
+
+  it("clears the approval when the maintainer denies it", async () => {
+    const store = new SessionStore({});
+    const harness = new ByterHarness({
+      client: fakeGitHub(),
+      llm: writeScript().llm,
+      sandbox: fakeSandbox(),
+      store
+    });
+    const { sessionId } = await runWriteTurn(harness);
+    const pending = store.pending(sessionId)!;
+
+    await harness.sessions.createTurn(sessionId, {
+      previousTurnId: pending.turnId,
+      input: [
+        {
+          type: "user.tool_approval",
+          toolCallId: pending.toolCallId,
+          approval: { status: "deny", reason: "Not wanted" }
+        }
+      ]
+    });
+
+    // A denial genuinely resolves the checkpoint: there is nothing left to write.
+    expect(store.pending(sessionId)).toBeUndefined();
+  });
+});

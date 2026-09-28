@@ -231,6 +231,15 @@ export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
  * Executes the approved write on a fresh turn, then lets the model finish the workflow.
  * Called after `harness-runtime` has verified the approval payload hash.
  */
+/**
+ * Runs the approved write, then lets the model close out the turn.
+ *
+ * Returns whether the write itself landed. The caller needs that to decide whether the
+ * approval checkpoint is resolved: a write that failed leaves the patch unwritten, and
+ * discarding the checkpoint for it strands the run with a verified patch it can never
+ * write and no way to try again. Anything after the write — the model's closing message —
+ * cannot un-resolve it, so this reports success as soon as the tool call returns.
+ */
 export async function resumeApprovedToolCall(
   options: AgentLoopOptions & {
     toolCallId: string;
@@ -238,7 +247,7 @@ export async function resumeApprovedToolCall(
     arguments: Record<string, unknown>;
     payloadHash: string;
   }
-): Promise<void> {
+): Promise<boolean> {
   const { store, sessionId, turnId, dispatcher } = options;
 
   try {
@@ -263,11 +272,12 @@ export async function resumeApprovedToolCall(
       content: JSON.stringify({ error: message })
     });
     failTurn(store, sessionId, turnId, `Approved GitHub write failed: ${message}`);
-    return;
+    return false;
   }
 
   // Let the model emit its closing byter.result message on this same turn.
   await runAgentTurn(options);
+  return true;
 }
 
 /** Denies the paused call and closes the turn without touching GitHub. */

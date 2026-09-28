@@ -170,16 +170,23 @@ export class ByterHarness {
 
     const spec = this.store.spec(sessionId);
     const turn = this.store.createTurn(sessionId, previousTurnId ?? pending.turnId);
-    this.store.clearPending(sessionId);
 
     if (!allowed) {
+      // A denial resolves the checkpoint: there is nothing left to write.
+      this.store.clearPending(sessionId);
       recordDeniedToolCall(this.store, sessionId, turn.id, pending.toolCallId, reason);
       await this.closeSandbox(sessionId);
       return { data: { id: turn.id, sessionId, state: { status: "completed" } } };
     }
 
-    void this.runTurn(sessionId, turn.id, spec, () =>
-      resumeApprovedToolCall({
+    // The pending call survives until the write actually lands. Clearing it when the
+    // attempt merely started meant any failure — a token without access to the fork, a
+    // fork GitHub had not finished creating — destroyed the only record of what had been
+    // approved, so every later approval answered "No harness tool call is awaiting
+    // approval for this session" and the run could never be written. Observed twice on
+    // real runs, against pure-css/pure and talkasab/peruse.
+    void this.runTurn(sessionId, turn.id, spec, async () => {
+      const written = await resumeApprovedToolCall({
         store: this.store,
         sessionId,
         turnId: turn.id,
@@ -191,8 +198,12 @@ export class ByterHarness {
         toolName: pending.name,
         arguments: pending.arguments,
         payloadHash: pending.payloadHash
-      })
-    );
+      });
+
+      if (written) {
+        this.store.clearPending(sessionId);
+      }
+    });
 
     return { data: { id: turn.id, sessionId, state: { status: "running" } } };
   }
