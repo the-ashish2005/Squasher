@@ -139,13 +139,52 @@ export class LlmClient {
  * no HTTP status, and retrying them is more clearly safe than retrying a 5xx, because the
  * request may never have reached the provider at all.
  */
+/**
+ * Messages transport failures arrive with when they never become an SDK error class.
+ *
+ * `terminated` is undici's own wording for a response stream dropped mid-flight, and it
+ * carries no status, no code and no other marker. Enumerating messages missed it once
+ * already and cost a live run at 134 seconds, so the `cause` chain is walked too: undici
+ * records the real reason there even when the surface message is a single word.
+ */
+const transientMessagePattern = /timed?\s*out|terminated|aborted|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|EAI_AGAIN|network|fetch failed/i;
+
+/** Node and undici error codes for a connection that failed in transit. */
+const transientCodes = new Set([
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "EAI_AGAIN",
+  "ENOTFOUND",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_ABORTED"
+]);
+
 function isConnectionError(error: unknown): boolean {
   if (error instanceof OpenAI.APIConnectionError) {
     return true;
   }
 
-  // Providers and undici surface timeouts that never become an SDK error class.
-  return error instanceof Error && /timed?\s*out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up|EAI_AGAIN/i.test(error.message);
+  // Walk the cause chain: the surface error is often a bare TypeError whose reason is
+  // recorded one or more levels down.
+  for (let current: unknown = error, depth = 0; current && depth < 5; depth += 1) {
+    if (current instanceof Error && transientMessagePattern.test(current.message)) {
+      return true;
+    }
+
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && transientCodes.has(code)) {
+      return true;
+    }
+
+    current = (current as { cause?: unknown }).cause;
+  }
+
+  return false;
 }
 
 function statusOf(error: unknown): number | undefined {

@@ -159,6 +159,44 @@ describe("llm client", () => {
     expect(Array.isArray(request.tools)).toBe(true);
   });
 
+  it("retries undici's bare terminated error", async () => {
+    // The exact failure that ended a live run at 134 seconds: undici drops the response
+    // stream and throws TypeError("terminated"), with no status, no code and no other
+    // marker. An enumerated message list missed it.
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("terminated"))
+      .mockResolvedValue({ choices: [{ message: { content: "recovered" }, finish_reason: "stop" }] });
+    const { client } = newClient(create);
+
+    await expect(client.complete([{ role: "user", content: "hi" }], [])).resolves.toMatchObject({ text: "recovered" });
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries on a transient reason recorded in the cause chain", async () => {
+    // undici reports the real reason under cause while the surface message stays generic.
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce(Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }) }))
+      .mockRejectedValueOnce(Object.assign(new Error("request failed"), { cause: { code: "UND_ERR_HEADERS_TIMEOUT" } }))
+      .mockResolvedValue({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] });
+    const { client } = newClient(create);
+
+    await expect(client.complete([{ role: "user", content: "hi" }], [])).resolves.toMatchObject({ text: "ok" });
+    expect(create).toHaveBeenCalledTimes(3);
+  });
+
+  it("still does not retry a permanent error hiding an unrelated cause", async () => {
+    // The cause walk must not turn a 401 into something retryable.
+    const create = vi.fn().mockRejectedValue(
+      Object.assign(statusError(401, "invalid api key"), { cause: new Error("authentication rejected") })
+    );
+    const { client } = newClient(create);
+
+    await expect(client.complete([{ role: "user", content: "hi" }], [])).rejects.toBeInstanceOf(LlmRequestError);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
   it("does not retry permanent failures", async () => {
     // Retrying a bad key or a malformed request cannot help, and hides the real cause
     // behind a delay.

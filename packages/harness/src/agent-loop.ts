@@ -489,7 +489,65 @@ function parseArguments(value: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function toChatMessages(messages: HarnessAgentMessage[]): ChatCompletionMessageParam[] {
+/**
+ * Bytes of tool output the conversation may carry before older results are elided.
+ *
+ * Bounding one response is not enough. Capping read_file at 32 KB stopped any single
+ * result from being huge and the agent simply read more often: a live run made 36 paged
+ * reads that together came to 179 KB, close to the 215 KB that had timed the request out
+ * before the cap existed. Each retry then resent that same conversation, so retrying made
+ * the failure slower rather than survivable.
+ */
+export const maxToolOutputBudgetBytes = 64 * 1024;
+
+/** What an elided tool result is replaced with, so the turn it belongs to still reads. */
+function elidedToolContent(content: string): string {
+  return (
+    `[Earlier tool result elided to keep this conversation within its size budget: ` +
+    `${Buffer.byteLength(content, "utf8").toLocaleString()} bytes. Re-run the tool if you need it again, ` +
+    `and prefer narrow reads.]`
+  );
+}
+
+/**
+ * Keeps the newest tool results verbatim and replaces older ones with a short stub once the
+ * budget is spent.
+ *
+ * Messages are never dropped, only shortened: a tool message must keep following the
+ * assistant message that requested it, or the provider rejects the whole conversation.
+ * Recent results are what the model is reasoning about; older reads have usually been
+ * summarised into its own messages already.
+ */
+function withBoundedToolOutput(messages: HarnessAgentMessage[], budgetBytes: number): HarnessAgentMessage[] {
+  let remaining = budgetBytes;
+  const bounded: HarnessAgentMessage[] = new Array(messages.length);
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.role !== "tool" || !message.content) {
+      bounded[index] = message;
+      continue;
+    }
+
+    const size = Buffer.byteLength(message.content, "utf8");
+    if (size <= remaining) {
+      remaining -= size;
+      bounded[index] = message;
+      continue;
+    }
+
+    remaining = 0;
+    bounded[index] = { ...message, content: elidedToolContent(message.content) };
+  }
+
+  return bounded;
+}
+
+function toChatMessages(
+  allMessages: HarnessAgentMessage[],
+  budgetBytes: number = maxToolOutputBudgetBytes
+): ChatCompletionMessageParam[] {
+  const messages = withBoundedToolOutput(allMessages, budgetBytes);
   return messages.map((message) => {
     if (message.role === "tool") {
       return {
