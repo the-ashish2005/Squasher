@@ -142,3 +142,69 @@ describe("latest run reader", () => {
     expect((await latestFrom(emptyDir)).status).toBe(404);
   });
 });
+
+describe("stranded approvals", () => {
+  let staticDir: string;
+
+  beforeEach(async () => {
+    process.env.GITHUB_WEBHOOK_SECRET = "webhook-secret";
+    process.env.APPROVAL_TOKEN = "approval-token";
+    delete process.env.DEEPSEEK_API_KEY;
+    delete process.env.E2B_API_KEY;
+    staticDir = await mkdtemp(join(tmpdir(), "byter-stranded-static-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Byter</main>", "utf8");
+  });
+
+  afterEach(() => {
+    delete process.env.GITHUB_WEBHOOK_SECRET;
+    delete process.env.APPROVAL_TOKEN;
+  });
+
+  /**
+   * Runs written before the approval checkpoint survived a failed write have no paused
+   * call left in the harness. The dashboard kept showing them as awaiting-approval, and
+   * every click answered "No harness tool call is awaiting approval for this session"
+   * with the run unchanged, so the button stayed and the next click did the same.
+   */
+  it("settles a run whose harness no longer holds the paused call", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "byter-stranded-"));
+    const record = recordFor({ delivery: "stranded-1", receivedAt: "2026-09-28T00:00:00.000Z", padBytes: 64 });
+    const patchHash = "a".repeat(64);
+    (record.trueForge as Record<string, unknown>).session = { id: "sess-gone", title: null };
+    (record.trueForge as Record<string, unknown>).pendingApproval = {
+      turnId: "turn-gone",
+      threadId: "main",
+      toolCallId: "call-gone",
+      toolName: "create_fix_pull_request",
+      payloadHash: patchHash
+    };
+    await writeFile(join(dataDir, "webhook-runs.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+
+    const trueForgeRuntime = {
+      resolveToolApproval: async () => {
+        throw new Error("No harness tool call is awaiting approval for this session");
+      },
+      subscribeToTurn: async () => []
+    } as never;
+
+    const server = createByterServer({ staticDir, dataDir, trueForgeRuntime });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    const { port } = server.address() as AddressInfo;
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/approvals`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer approval-token" },
+        body: JSON.stringify({ actionId: "approve-pr", runId: record.run.id, patchHash })
+      });
+      expect(response.status).toBe(502);
+
+      // The run stops offering an approval it can never honour, and says why.
+      const latest = await fetch(`http://127.0.0.1:${port}/api/runs/latest`).then((r) => r.json());
+      expect(latest.run.status).toBe("failed");
+      expect(latest.run.events.at(-1).message).toContain("cannot be resumed");
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+});

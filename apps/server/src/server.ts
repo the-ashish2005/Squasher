@@ -1151,14 +1151,30 @@ async function executeApproval(
       pollIntervalMs: process.env.NODE_ENV === "test" ? 5 : 1000
     });
   } catch (error) {
-    const failedReceipt = buildApprovalReceipt(
-      runId,
-      actionId,
-      patchHash,
-      "write-failed",
-      error instanceof Error ? error.message : "TrueForge approval resume failed"
-    );
+    const message = error instanceof Error ? error.message : "TrueForge approval resume failed";
+    const failedReceipt = buildApprovalReceipt(runId, actionId, patchHash, "write-failed", message);
     await appendApprovalReceipt(dataDir, failedReceipt, postgresStore);
+
+    // The harness has no record of the paused call, so no approval can ever resume this
+    // run: retrying only repeats this. Runs written before the checkpoint survived a
+    // failed write are in exactly this state. Settle the run instead of leaving it
+    // advertising an approval button that fails on every click with nothing to show why.
+    if (/no harness tool call is awaiting approval/i.test(message)) {
+      const strandedRecord: PersistedWebhookRunRecord = {
+        ...liveRecord,
+        run: canTransition(liveRecord.run.status, "failed")
+          ? transitionRun(
+              liveRecord.run,
+              "failed",
+              "The approved write cannot be resumed: the harness no longer holds the paused tool call. Re-run the issue to produce a fresh patch."
+            )
+          : liveRecord.run,
+        trueForge: { ...liveRecord.trueForge, pendingApproval: undefined }
+      };
+      const labelled = await syncLifecycleLabels(strandedRecord, githubClient);
+      await appendUpdatedLiveRecord(dataDir, labelled, postgresStore);
+    }
+
     return { statusCode: 502, body: { error: failedReceipt.message } };
   }
 
