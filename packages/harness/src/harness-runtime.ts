@@ -202,7 +202,14 @@ export class ByterHarness {
 
       if (written) {
         this.store.clearPending(sessionId);
+        return;
       }
+
+      // runTurn tears the sandbox down only when nothing is pending, which is what keeps
+      // it alive across the original pause. Now that a failed write leaves the checkpoint
+      // open, that teardown no longer fires, so close it here: a retry replays the GitHub
+      // write and has no use for a sandbox, and the pause it waits on can last hours.
+      await this.closeSandbox(sessionId);
     });
 
     return { data: { id: turn.id, sessionId, state: { status: "running" } } };

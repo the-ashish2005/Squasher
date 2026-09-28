@@ -300,6 +300,38 @@ describe("approval checkpoint lifetime", () => {
     expect(store.pending(sessionId)?.name).toBe("create_fix_pull_request");
   });
 
+  it("releases the sandbox when the write fails, even though the approval stays open", async () => {
+    // Keeping the checkpoint open skips runTurn's teardown, which only fires when nothing
+    // is pending. A retry replays the GitHub write and needs no sandbox, so holding one
+    // for a pause that may last hours would be a leak.
+    const store = new SessionStore({});
+    const sandbox = fakeSandbox();
+    const github = fakeGitHub();
+    github.createPullRequest = vi.fn().mockRejectedValue(new Error("GitHub API 403 Forbidden")) as never;
+    // Runs a sandbox command first, so there is a live sandbox for the pause to hold.
+    const { llm } = scriptedLlm([
+      toolCallResponse([{ id: "call_0", name: "run_command", arguments: { command: "node repro.ts" } }]),
+      toolCallResponse([{ id: "call_1", name: "submit_byter_result", arguments: proofContract }]),
+      toolCallResponse([{ id: "call_2", name: "create_fix_pull_request", arguments: writeArguments }]),
+      textResponse(JSON.stringify(proofContract))
+    ]);
+    const harness = new ByterHarness({ client: github, llm, sandbox, store });
+
+    const { sessionId } = await runWriteTurn(harness);
+    expect(sandbox.createSandbox).toHaveBeenCalled();
+    const pending = store.pending(sessionId)!;
+    await harness.sessions.createTurn(sessionId, {
+      previousTurnId: pending.turnId,
+      input: [{ type: "user.tool_approval", toolCallId: pending.toolCallId, approval: { status: "allow" } }]
+    });
+    for (let attempt = 0; attempt < 200 && (sandbox.closeSandbox as ReturnType<typeof vi.fn>).mock.calls.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(store.pending(sessionId)).toBeDefined();
+    expect(sandbox.closeSandbox).toHaveBeenCalled();
+  });
+
   it("clears the approval once the write lands", async () => {
     const createPullRequest = vi.fn().mockResolvedValue({ number: 3, html_url: "https://github.test/pull/3" });
     const { store, sessionId } = await pauseThenApprove({ createPullRequest });
