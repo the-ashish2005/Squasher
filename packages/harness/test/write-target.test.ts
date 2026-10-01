@@ -169,6 +169,25 @@ describe("write target policy", () => {
     expect(body).toContain("Please close it without hesitation");
   });
 
+  it("discloses on a same-repository write when the repository's policy requires it", async () => {
+    const store = new SessionStore({});
+    const { llm } = writeScript();
+    const harness = new SquasherHarness({
+      client: fakeGitHub(),
+      llm,
+      sandbox: fakeSandbox(),
+      store,
+      resolveWriteTarget: () => ({ allowed: true, headOwner: "upstream", disclose: true })
+    });
+
+    const { sessionId } = await runWriteTurn(harness);
+    const pending = store.pending(sessionId);
+
+    expect(String(pending?.arguments.body)).toContain("Automated contribution");
+    // Still a same-repository write: no fork owner is stamped.
+    expect(pending?.arguments.headOwner).toBeUndefined();
+  });
+
   it("does not disclose on a same-repository write", async () => {
     const store = new SessionStore({});
     const { llm } = writeScript();

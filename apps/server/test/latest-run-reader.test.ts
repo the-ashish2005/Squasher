@@ -166,10 +166,21 @@ describe("stranded approvals", () => {
    * every click answered "No harness tool call is awaiting approval for this session"
    * with the run unchanged, so the button stayed and the next click did the same.
    */
-  it("settles a run whose harness no longer holds the paused call", async () => {
+  it("settles a run whose harness no longer holds the paused call, keeping the verified patch", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "squasher-stranded-"));
     const record = recordFor({ delivery: "stranded-1", receivedAt: "2026-09-28T00:00:00.000Z", padBytes: 64 });
     const patchHash = "a".repeat(64);
+    // A real awaiting-approval record carries evidence that was verified at completion.
+    Object.assign(record.trueForge.result as Record<string, unknown>, {
+      proofVerified: true,
+      proof: {
+        before: "The new header test failed 3/3 before the change.",
+        after: "The same test passed 3/3 after the change.",
+        regressions: "The existing suite passed alongside it.",
+        attempts: "3/3 matching executions"
+      },
+      requirements: [{ requirement: "Serve app.js with an ETag", verdict: "pass", evidence: "The header test observed an ETag 3/3." }]
+    });
     (record.trueForge as Record<string, unknown>).session = { id: "sess-gone", title: null };
     (record.trueForge as Record<string, unknown>).pendingApproval = {
       turnId: "turn-gone",
@@ -199,10 +210,17 @@ describe("stranded approvals", () => {
       });
       expect(response.status).toBe(502);
 
-      // The run stops offering an approval it can never honour, and says why.
+      // CASE H: the run stops offering an approval it can never honour and says why, but
+      // the lost write is a contribution problem -- the verified patch survives it.
       const latest = await fetch(`http://127.0.0.1:${port}/api/runs/latest`).then((r) => r.json());
-      expect(latest.run.status).toBe("failed");
+      expect(latest.run.status).toBe("patch-ready");
       expect(latest.run.events.at(-1).message).toContain("cannot be resumed");
+      expect(latest.trueForge.pendingApproval).toBeUndefined();
+      expect(latest.trueForge.result.candidatePatch.files[0].path).toBe("server/index.js");
+      expect(latest.statuses.implementation.status).toBe("verified");
+      expect(latest.statuses.contribution.status).toBe("blocked");
+      expect(latest.statuses.contribution.reason).toContain("cannot be resumed");
+      expect(latest.outcome.kind).toBe("contribution-blocked");
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
     }

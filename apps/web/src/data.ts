@@ -49,6 +49,77 @@ export interface HarnessTraceEvent {
   artifact?: string;
 }
 
+/**
+ * The server's account of how a run ended, derived from the persisted record. Mirrors
+ * RunOutcome in apps/server/src/run-outcome.ts; the dashboard renders it and adds nothing.
+ */
+export interface RunOutcome {
+  kind: string;
+  tone: "success" | "warning" | "danger" | "active";
+  gate: { eyebrow: string; title: string };
+  headline: string;
+  statement: { text: string; source: OutcomeSource };
+  change: {
+    created: boolean;
+    title: string;
+    reasons: string[];
+    pullRequest?: { number: number; url: string };
+    branch?: string;
+    target?: string;
+    files: string[];
+    verification: Array<{ label: string; text: string }>;
+  };
+  checks: Array<{ id: string; label: string; state: "done" | "failed" | "info" | "not-observed" | "discrepancy"; detail: string; source: OutcomeSource }>;
+  trace: { retained: number; truncated: boolean };
+  findings: string[];
+  rootCause: { established: boolean; text: string; source?: OutcomeSource };
+  nextStep: { text: string; source: "agent" | "server" };
+  implementation?: RunStatusView;
+  contribution?: RunStatusView & { action?: string };
+  requirements?: Array<{ requirement: string; verdict: string; evidence?: string; ownership?: { status: string; by: string } }>;
+  /** Claims from the discussion and what the repository showed. */
+  claims?: Array<{ claim: string; verdict: string; evidence: string }>;
+}
+
+export interface WorkspaceRequirement {
+  requirement: string;
+  verdict: string;
+  evidence?: string;
+  codeEvidence?: Array<{ path: string; excerpt: string }>;
+  executedCommand?: string;
+  ownership?: { status: string; by: string };
+}
+
+/** Mirrors PolicySummary in apps/server/src/policy-summary.ts. */
+export interface PolicySummaryView {
+  verdict: "prohibited" | "unclear" | "human-action-required" | "disclosure-required" | "allowed" | "no-policy-found" | "not-scanned";
+  label: string;
+  detail: string;
+  nextStep: string;
+  automaticContributionAllowed: boolean;
+  signals: Array<{ kind: string; path: string; excerpt: string }>;
+}
+
+/** Mirrors ChangeRequest in apps/server/src/workspace.ts. */
+export interface ChangeRequestView {
+  id: string;
+  runId: string;
+  text: string;
+  createdAt: string;
+  patchHash?: string;
+  status: "recorded";
+}
+
+/** One of the two statuses the server reports: engineering, and contribution. */
+export interface RunStatusView {
+  status: string;
+  label: string;
+  reason: string;
+  action?: string;
+}
+
+export type OutcomeSource = "server" | "trace" | "agent";
+
 export interface HarnessState {
   model: string;
   provider: string;
@@ -59,6 +130,8 @@ export interface HarnessState {
   trace: HarnessTraceEvent[];
   mcpCalls: number;
   sandboxExecutions: number;
+  /** True when earlier trace events were dropped, making the counts above lower bounds. */
+  traceTruncated: boolean;
   subagents: number;
   dashboardUrl?: string;
   statusCommentUrl?: string;
@@ -89,11 +162,27 @@ export interface DashboardRun extends ReproRun {
     verifiedAt: string;
     body?: string;
   };
-  patchDiff?: Array<{ path: string; before: string; after: string }>;
+  patchDiff?: Array<{ path: string; before: string; after: string; change?: "added" | "modified" }>;
   pullRequest?: { number: number; url: string };
+  /** The agent's acceptance criteria, as submitted. */
+  requirements?: WorkspaceRequirement[];
+  /** Claims from the discussion, checked against the repository. */
+  discussionClaims?: Array<{ claim: string; verdict: string; evidence: string }>;
+  /** The agent's own per-file explanation. Absent on runs from before it existed. */
+  fileChanges?: Array<{ path: string; summary: string; requirements?: string[] }>;
+  /** The issue's comment thread as the agent saw it. */
+  issueDiscussion?: string;
+  /** What the repository's documents say about contributions like this one. */
+  policy?: PolicySummaryView;
+  /** Changes a human asked for in the workspace. Recorded only: Squasher does not apply them yet. */
+  changeRequests?: ChangeRequestView[];
+  /** Engineering and contribution, reported separately by the server. */
+  statuses?: { implementation: RunStatusView; contribution: RunStatusView };
   /** Where an approved write would land, so the approver sees the destination before deciding. */
   contribution?: {
     mode: "own" | "fork" | "triage";
+    /** Whether an approved write may land at all. */
+    writable: boolean;
     reason: string;
     /** Human-readable "head → base", present only when a write is possible. */
     writeTarget?: string;
@@ -107,6 +196,9 @@ export interface DashboardRun extends ReproRun {
   approvals: ApprovalAction[];
   security: SecurityScanResult;
   quarantinedReports: QuarantinedReport[];
+  outcome?: RunOutcome;
+  /** The harness's own error text, shown verbatim under technical details. */
+  harnessError?: string;
 }
 
 interface WebhookRunRecord {
@@ -121,8 +213,14 @@ interface WebhookRunRecord {
   // Records written before the rename carry the byter: spelling.
   verifiedLabel?: { name: "squasher:verified" | "byter:verified"; appliedAt?: string; error?: string };
     approvalLabel?: { name: "squasher:awaiting-approval" | "byter:awaiting-approval"; appliedAt?: string; error?: string };
+  statuses?: { implementation: RunStatusView; contribution: RunStatusView };
+  issueDiscussion?: string;
+  policy?: PolicySummaryView;
+  changeRequests?: ChangeRequestView[];
   contribution?: {
     mode?: "own" | "fork" | "triage";
+    /** Absent on records from before it existed, where mode "triage" meant not writable. */
+    writable?: boolean;
     headOwner?: string;
     upstreamPushAccess?: boolean;
     reason?: string;
@@ -133,6 +231,7 @@ interface WebhookRunRecord {
   baseBranch?: string;
   run: ReproRun;
   scan: SecurityScanResult;
+  outcome?: RunOutcome;
   trueForge?: {
     status?: string;
     reason?: string;
@@ -148,7 +247,10 @@ interface WebhookRunRecord {
       rootCauseSummary?: string;
       proposedFixSummary?: string;
       baseSha?: string;
-      patchDiff?: Array<{ path: string; before: string; after: string }>;
+      patchDiff?: Array<{ path: string; before: string; after: string; change?: "added" | "modified" }>;
+      requirements?: WorkspaceRequirement[];
+      discussionClaims?: Array<{ claim: string; verdict: string; evidence: string }>;
+      fileChanges?: Array<{ path: string; summary: string; requirements?: string[] }>;
       proof?: { before?: string; after?: string; regressions?: string; attempts?: string };
       candidatePatch?: {
         title: string;
@@ -183,10 +285,12 @@ function describeContribution(
       ? `${contribution.headOwner}:${branchName ?? "fix branch"}`
       : `${record.repository}:${branchName ?? "fix branch"}`;
 
+  const writable = contribution.writable ?? contribution.mode !== "triage";
   return {
     mode: contribution.mode,
+    writable,
     reason: contribution.reason ?? "",
-    ...(contribution.mode === "triage" ? {} : { writeTarget: `${head} → ${base}` }),
+    ...(writable ? { writeTarget: `${head} → ${base}` } : {}),
     ...(contribution.forkUrl ? { forkUrl: contribution.forkUrl } : {}),
     ...(contribution.policyFindings?.length ? { policyFindings: contribution.policyFindings } : {})
   };
@@ -201,7 +305,7 @@ export function apiUrl(path: string): string {
 
 export async function fetchDashboardRun(fetchImpl: typeof fetch = fetch): Promise<DashboardRun> {
   const runId = typeof window !== "undefined" && window.location.pathname.startsWith("/runs/")
-    ? window.location.pathname.slice("/runs/".length).replace(/\/review\/?$/, "")
+    ? window.location.pathname.slice("/runs/".length).replace(/\/(?:review|workspace)\/?$/, "")
     : undefined;
   const endpoint = runId ? `/api/runs/${encodeURIComponent(decodeURIComponent(runId))}` : "/api/runs/latest";
   const liveResponse = await fetchImpl(apiUrl(endpoint), { cache: "no-store" });
@@ -268,8 +372,17 @@ export function toDashboardRunFromWebhook(record: WebhookRunRecord): DashboardRu
       }
       : {}),
     ...(liveResult?.patchDiff ? { patchDiff: liveResult.patchDiff } : {}),
+    ...(liveResult?.requirements ? { requirements: liveResult.requirements } : {}),
+    ...(liveResult?.discussionClaims ? { discussionClaims: liveResult.discussionClaims } : {}),
+    ...(liveResult?.fileChanges ? { fileChanges: liveResult.fileChanges } : {}),
+    ...(record.issueDiscussion ? { issueDiscussion: record.issueDiscussion } : {}),
+    ...(record.policy ? { policy: record.policy } : {}),
+    ...(record.changeRequests ? { changeRequests: record.changeRequests } : {}),
     ...(pullRequest ? { pullRequest } : {}),
     ...(contribution ? { contribution } : {}),
+    ...(record.outcome ? { outcome: record.outcome } : {}),
+    ...(record.statuses ? { statuses: record.statuses } : {}),
+    ...(record.trueForge?.error ? { harnessError: publicSafeMarkdown(record.trueForge.error) } : {}),
     ...(liveResult?.proof ? { proof: compactProof(liveResult.proof) } : {}),
     tests: buildLiveTests(liveResult?.proof, trace),
     harness: {
@@ -278,10 +391,15 @@ export function toDashboardRunFromWebhook(record: WebhookRunRecord): DashboardRu
       sessionId: record.trueForge?.session?.id,
       turnId: record.trueForge?.turn?.id,
       status: harnessStatusFor(record.run.status, trueForgeStatus, liveResult?.status),
-      currentTask: currentTaskFor(record.run.status, liveResult?.summary ? publicSafeMarkdown(liveResult.summary) : undefined),
+      // A finished run is described by its outcome; the stage text is for runs in flight.
+      currentTask: record.outcome && record.outcome.kind !== "in-progress"
+        ? record.outcome.headline
+        : currentTaskFor(record.run.status, liveResult?.summary ? publicSafeMarkdown(liveResult.summary) : undefined),
       trace,
-      mcpCalls: trace.filter((event) => event.category === "mcp" && event.type !== "mcp.initialize").length,
-      sandboxExecutions: trace.filter((event) => event.category === "sandbox" && (event.command || event.sandboxId || event.stdout || event.stderr)).length,
+      // Calls only: counting responses too reported every call twice.
+      mcpCalls: trace.filter((event) => event.category === "mcp" && event.type === "model.message" && Boolean(event.toolName)).length,
+      sandboxExecutions: trace.filter((event) => event.category === "sandbox" && Boolean(event.command)).length,
+      traceTruncated: record.outcome?.trace.truncated ?? false,
       subagents: trace.filter((event) => event.category === "subagent").length,
       dashboardUrl: record.dashboardUrl,
       statusCommentUrl: latestComment?.url,
@@ -456,7 +574,7 @@ function currentTaskFor(runStatus: RunStatus, summary?: string): string {
   if (runStatus === "pr-created") return "Pull request receipt recorded";
   if (runStatus === "failed" || runStatus === "rejected") return summary ?? "Run stopped before repository mutation";
   if (runStatus === "patch-ready" || runStatus === "validating") return "Validating the candidate patch against the reproduction";
-  if (runStatus === "reproducing" || runStatus === "verified") return "Reproducing the issue in the Daytona sandbox";
+  if (runStatus === "reproducing") return "Reproducing the issue in the sandbox";
   if (runStatus === "environment-building") return "Preparing the disposable execution environment";
   return "Triaging the GitHub issue";
 }
@@ -536,4 +654,19 @@ function formatWebhookTime(value: string): string {
     minute: "2-digit",
     hour12: false
   }).format(new Date(value));
+}
+
+/** Tones for the two server statuses. A blocked contribution is a warning, never a failure. */
+export function implementationTone(status: string): string {
+  if (status === "failed") return "danger";
+  if (status === "verified" || status === "reproduced") return "success";
+  if (status === "running") return "active";
+  return "warning";
+}
+
+export function contributionTone(status: string): string {
+  if (["submitted", "approved", "merged"].includes(status)) return "success";
+  if (["not_started", "awaiting_approval"].includes(status)) return "active";
+  if (status === "not_applicable") return "neutral";
+  return "warning";
 }

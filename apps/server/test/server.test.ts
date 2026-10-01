@@ -516,7 +516,11 @@ describe("Squasher production server", () => {
       expect(response.status).toBe(202);
 
       let latest: any;
-      for (let attempt = 0; attempt < 200; attempt += 1) {
+      // A wall-clock deadline rather than a fixed count: two recovery turns and several
+      // simulated stream drops occasionally needed more than the ~1s a count of 200 gave
+      // when the whole suite ran in parallel. It still stops as soon as the run pauses.
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
         latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
         if (latest.run.status === "awaiting-approval") break;
         await new Promise((resolve) => setTimeout(resolve, 5));
@@ -616,7 +620,93 @@ describe("Squasher production server", () => {
     }
   });
 
-  it("rejects a positive patch result without the mandatory TrueForge approval checkpoint", async () => {
+  it("asks for a corrected result when the model drops right after the guard refused a submission", async () => {
+    // Replays a live run on drkrillo/good-first-issues#164: the guard refused a result whose
+    // attempts field lacked "3/3", the next model call failed with a connection error, and the
+    // server took the refused submission as final and failed the run. The refused submission
+    // must not count, and a transient model failure must earn a continuation turn.
+    const staticDir = await mkdtemp(join(tmpdir(), "squasher-static-"));
+    const liveDataDir = await mkdtemp(join(tmpdir(), "squasher-data-"));
+    await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
+    const result = (attempts: string) => JSON.stringify({
+      kind: "squasher.result",
+      status: "patch-ready",
+      summary: "The focused reproducer failed before the tokenizer fix and passed after it.",
+      proof: { before: "3/3 failed with the reported TypeError", after: "3/3 passed after the fix", regressions: "The focused regression suite passed", attempts },
+      candidatePatch: {
+        title: "Guard the trailing escape",
+        body: "Stops the tokenizer reading past the end.",
+        files: [{ path: "src/tokenizer.ts", content: "export const fixed = true;\n" }]
+      }
+    });
+    const firstTurn = [
+      ...executableProofEvents("refused", 1),
+      submittedResultEvent("refused", 3, result("executed three times before and after, identical each time")),
+      { sequenceNumber: 4, type: "squasher.structured_output.guard", raw: { event: {
+        type: "squasher.structured_output.guard",
+        toolName: "submit_squasher_result",
+        attempt: 1,
+        outcome: "retrying",
+        problem: "Field \"proof.attempts\" must report at least 3 of 3 matching executions"
+      } } },
+      { sequenceNumber: 5, type: "turn.done", raw: { event: { type: "turn.done", state: { status: "error", message: "Model request failed: Connection error." } } } }
+    ];
+    const continuation = [
+      submittedResultEvent("corrected", 6, result("3/3 before-fix failures, 3/3 after-fix passes")),
+      { sequenceNumber: 7, type: "turn.done", raw: { event: { type: "turn.done", state: { status: "done" } } } }
+    ];
+    const trueForgeRuntime = {
+      startSession: vi.fn().mockResolvedValue({
+        session: { id: "session-refused", title: null },
+        turn: { id: "turn-refused-1", sessionId: "session-refused", status: "running" }
+      }),
+      requestProofContract: vi.fn().mockResolvedValue({ id: "turn-refused-2", sessionId: "session-refused", status: "running" }),
+      subscribeToTurn: vi.fn().mockImplementation(async (_session: string, turnId: string) =>
+        turnId === "turn-refused-1" ? firstTurn : continuation
+      )
+    };
+    const server = createSquasherServer({ staticDir, dataDir: liveDataDir, trueForgeRuntime });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    const isolatedBaseUrl = `http://127.0.0.1:${address.port}`;
+    const payload = JSON.stringify({
+      action: "opened",
+      issue: { number: 31, title: "Tokenizer crash", body: "It throws a TypeError on a trailing backslash.", html_url: "https://github.test/o/r/issues/31" },
+      repository: { name: "r", full_name: "o/r", default_branch: "main", owner: { login: "o" } }
+    });
+
+    try {
+      await fetch(`${isolatedBaseUrl}/api/github/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-GitHub-Event": "issues",
+          "X-GitHub-Delivery": "delivery-refused-31",
+          "X-Hub-Signature-256": signWebhookPayload(payload, "webhook-secret")
+        },
+        body: payload
+      });
+      let latest: any;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
+        if (latest.trueForge.status === "completed" && trueForgeRuntime.requestProofContract.mock.calls.length > 0) break;
+        if (latest.run.status === "failed") break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      expect(trueForgeRuntime.requestProofContract).toHaveBeenCalledTimes(1);
+      expect(latest.trueForge.result.proof.attempts).toBe("3/3 before-fix failures, 3/3 after-fix passes");
+      expect(latest.run.status).toBe("patch-ready");
+      expect(latest.statuses.implementation.status).toBe("verified");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
+  it("keeps a verified patch that has no approval checkpoint, and still refuses to write it", async () => {
+    // This used to fail the run: a patch with no checkpoint was read as a broken contract.
+    // The engineering is verified either way; what the missing checkpoint takes away is
+    // only the contribution, which must stay impossible.
     const staticDir = await mkdtemp(join(tmpdir(), "squasher-static-"));
     const liveDataDir = await mkdtemp(join(tmpdir(), "squasher-data-"));
     await writeFile(join(staticDir, "index.html"), "<main>Squasher</main>", "utf8");
@@ -674,13 +764,23 @@ describe("Squasher production server", () => {
       let latest: any;
       for (let attempt = 0; attempt < 200; attempt += 1) {
         latest = await fetch(`${isolatedBaseUrl}/api/runs/latest`).then((latestResponse) => latestResponse.json());
-        if (latest.run.status === "failed") break;
+        if (latest.trueForge.status === "completed") break;
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
-      expect(latest.run.status).toBe("failed");
-      expect(latest.trueForge.error).toContain("native approval checkpoint");
-      expect(githubClient.addLabels).not.toHaveBeenCalledWith("o", "r", 24, ["squasher:verified"]);
-      expect(githubClient.updateIssueComment.mock.calls.at(-1)?.[3]).toContain("complete proof-and-approval contract");
+      expect(latest.run.status).toBe("patch-ready");
+      expect(latest.statuses.implementation.status).toBe("verified");
+      expect(latest.statuses.contribution.status).toBe("blocked");
+      expect(latest.statuses.contribution.reason).toContain("No approval checkpoint");
+      expect(latest.trueForge.result.candidatePatch.files[0].path).toBe("demo/buggy-parser/src/tokenizer.ts");
+      expect(latest.trueForge.pendingApproval).toBeUndefined();
+      // Never awaiting approval, so nothing can be approved and nothing is written.
+      expect(githubClient.addLabels).not.toHaveBeenCalledWith("o", "r", 24, ["squasher:awaiting-approval"]);
+      const approval = await fetch(`${isolatedBaseUrl}/api/approvals`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer approval-token" },
+        body: JSON.stringify({ actionId: "approve-pr", runId: latest.run.id, patchHash: latest.trueForge.result.candidatePatch.hash })
+      });
+      expect(approval.status).toBe(409);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     }

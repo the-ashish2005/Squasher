@@ -20,7 +20,9 @@ const allowedTransitions: Record<RunStatus, RunStatus[]> = {
   validating: ["patch-ready", "fix-failed", "failed"],
   "fix-failed": [],
   "patch-ready": ["awaiting-approval", "failed"],
-  "awaiting-approval": ["approved", "rejected", "failed"],
+  // Back to patch-ready when the paused write can no longer be resumed: the approval step
+  // is lost, but the verified patch is not, so the run must not read as an engineering failure.
+  "awaiting-approval": ["approved", "rejected", "patch-ready", "failed"],
   approved: ["pr-created", "failed"],
   "pr-created": []
 };

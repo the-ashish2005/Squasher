@@ -135,11 +135,22 @@ export class SquasherHarness {
         dispatcher: this.dispatcherFor(sessionId, turn.id),
         iterationLimit: spec.iterationLimit,
         approvalRequiredTools: spec.approvalRequiredTools,
+        readRepositoryFile: (owner, repo, path, ref) => this.readRepositoryFile(owner, repo, path, ref),
         ...(this.options.resolveWriteTarget ? { resolveWriteTarget: this.options.resolveWriteTarget } : {})
       })
     );
 
     return { data: { id: turn.id, sessionId, state: { status: "running" } } };
+  }
+
+  /** A file's text at the given ref, or undefined when it does not exist there. */
+  private async readRepositoryFile(owner: string, repo: string, path: string, ref?: string): Promise<string | undefined> {
+    try {
+      const file = await this.options.client.getFile(owner, repo, path, ref);
+      return (file.encoding === "base64" ? Buffer.from(file.content, "base64") : Buffer.from(file.content, "utf8")).toString("utf8");
+    } catch {
+      return undefined;
+    }
   }
 
   private async startApprovalTurn(
@@ -295,6 +306,7 @@ function parseSpec(request: unknown): HarnessSessionSpec {
     enabledTools: stringArray(mcpServer.enableTools) ?? [
       "read_issue",
       "read_file",
+      "read_repository_instructions",
       "submit_squasher_result",
       "create_fix_pull_request"
     ],
@@ -310,9 +322,19 @@ function parseSpec(request: unknown): HarnessSessionSpec {
  */
 function parseIssueText(content: string): HarnessIssueText | undefined {
   const title = /^Title:[ \t]*(.+)$/m.exec(content)?.[1]?.trim();
-  const body = /^Issue body:\n([\s\S]*?)(?:\n\nRequired proof path:|$)/m.exec(content)?.[1]?.trim();
+  // The discussion follows the body in the same message; it is context for the agent, not
+  // part of what the reporter reported, so it stays out of the scope check.
+  const body = /^Issue body:\n([\s\S]*?)(?:\n\n(?:Issue discussion|Required proof path):|$)/m.exec(content)?.[1]?.trim();
   if (!title || body === undefined) return undefined;
-  return { title, body };
+  const repository = /^Repository:[ \t]*([^\s/]+)\/([^\s/]+)[ \t]*$/m.exec(content);
+  const baseSha = /^Base SHA:[ \t]*([0-9a-f]{7,40})[ \t]*$/m.exec(content)?.[1];
+  const baseBranch = /^Base branch:[ \t]*(\S+)[ \t]*$/m.exec(content)?.[1];
+  const ref = baseSha ?? baseBranch;
+  return {
+    title,
+    body,
+    ...(repository ? { repository: { owner: repository[1]!, repo: repository[2]!, ...(ref ? { ref } : {}) } } : {})
+  };
 }
 
 function firstInput(request: unknown): Record<string, unknown> {

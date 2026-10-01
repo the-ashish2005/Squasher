@@ -114,6 +114,25 @@ async function dispatchRequest(
   return errorResponse(request.id, -32601, "MCP method not found");
 }
 
+const codeEvidenceSchema = {
+  type: "array",
+  description: "Repository excerpts establishing the verdict. Each excerpt must occur verbatim (whitespace aside) in that file on the base branch; it is checked.",
+  items: {
+    type: "object",
+    additionalProperties: false,
+    required: ["path", "excerpt"],
+    properties: {
+      path: { type: "string" },
+      excerpt: { type: "string", description: "At least 12 characters, quoted from the file." }
+    }
+  }
+};
+
+const executedCommandSchema = {
+  type: "string",
+  description: "A sandbox command you actually ran in this session whose output establishes the verdict; it is checked against what ran."
+};
+
 export function inputSchemaFor(name: GitHubMcpToolName) {
   switch (name) {
     case "read_issue":
@@ -125,6 +144,16 @@ export function inputSchemaFor(name: GitHubMcpToolName) {
           owner: { type: "string" },
           repo: { type: "string" },
           issueNumber: { type: "integer", minimum: 1 }
+        }
+      };
+    case "read_repository_instructions":
+      return {
+        type: "object",
+        required: ["owner", "repo"],
+        properties: {
+          owner: { type: "string" },
+          repo: { type: "string" },
+          ref: { type: "string", description: "Branch or commit to read from. Defaults to the default branch." }
         }
       };
     case "read_file":
@@ -174,6 +203,94 @@ export function inputSchemaFor(name: GitHubMcpToolName) {
             ]
           },
           summary: { type: "string" },
+          rootCauseSummary: {
+            type: "string",
+            description:
+              "One or two sentences naming the cause you established. Omit when no cause was established."
+          },
+          nextStep: {
+            type: "string",
+            description: "One sentence on what the maintainer should do next. Omit when nothing is needed."
+          },
+          findings: {
+            type: "array",
+            maxItems: 8,
+            items: { type: "string" },
+            description: "Short factual statements of what you checked and what you observed."
+          },
+          requirements: {
+            type: "array",
+            description:
+              "Acceptance criteria taken from the issue and its discussion, one per concrete capability (split a broad claim such as 'sorting exists' into each column or behaviour), each with a verdict against the final code. Required for implemented-feature and implemented-improvement; recommended for every status.",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["requirement", "verdict", "evidence"],
+              properties: {
+                requirement: { type: "string" },
+                verdict: {
+                  type: "string",
+                  enum: ["pass", "fail", "already-implemented", "missing", "out-of-scope"],
+                  description:
+                    "Technical state only. pass: built and verified in this run. fail: attempted and not working. already-implemented: the repository already does it (needs codeEvidence or executedCommand). missing: the repository does not do it and this run did not build it. out-of-scope: not part of this issue."
+                },
+                evidence: {
+                  type: "string",
+                  description: "The observed behaviour or concrete code that establishes the verdict, not your own assurance."
+                },
+                codeEvidence: codeEvidenceSchema,
+                executedCommand: executedCommandSchema,
+                ownership: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["status", "by"],
+                  description:
+                    "Whose work this is per the discussion, separate from its technical state. reserved: the maintainer will do it or split it out. offered: the maintainer offered it to someone. claimed: someone said they will do it. Owned work is never built in this run.",
+                  properties: {
+                    status: { type: "string", enum: ["reserved", "offered", "claimed"] },
+                    by: { type: "string", description: "Who holds it, for example @maintainer or @reporter." },
+                    basis: { type: "string", description: "The comment that establishes it." }
+                  }
+                }
+              }
+            }
+          },
+          fileChanges: {
+            type: "array",
+            description:
+              "One entry per file in candidatePatch: what changed in it, why, and which requirements (exact requirement text) it satisfies. Shown to the maintainer reviewing the patch.",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["path", "summary"],
+              properties: {
+                path: { type: "string" },
+                summary: { type: "string", description: "What changed in this file and why." },
+                requirements: { type: "array", items: { type: "string" }, description: "Exact texts of the requirements this change satisfies." }
+              }
+            }
+          },
+          discussionClaims: {
+            type: "array",
+            description:
+              "Claims from the issue or its discussion that affect whether the work is needed (for example 'sorting already exists'), each checked against the repository. Comments are context, not proof: keep the claim and what the code shows side by side.",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["claim", "verdict", "evidence"],
+              properties: {
+                claim: { type: "string", description: "What was claimed, and by whom." },
+                verdict: {
+                  type: "string",
+                  enum: ["confirmed", "partly-confirmed", "contradicted", "unverified"],
+                  description: "confirmed and partly-confirmed need codeEvidence or executedCommand."
+                },
+                evidence: { type: "string", description: "What the repository actually shows, including any part of the claim that does not hold." },
+                codeEvidence: codeEvidenceSchema,
+                executedCommand: executedCommandSchema
+              }
+            }
+          },
           proof: {
             type: "object",
             additionalProperties: false,
@@ -298,6 +415,7 @@ function expectToolName(value: unknown): GitHubMcpToolName {
   if (
     value === "read_issue" ||
     value === "read_file" ||
+    value === "read_repository_instructions" ||
     value === "submit_squasher_result" ||
     value === "add_verified_label" ||
     value === "comment_on_issue" ||

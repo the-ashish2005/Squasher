@@ -11,11 +11,43 @@ export interface GitHubIssue {
   body: string | null;
   html_url: string;
   state: string;
+  labels?: Array<{ name: string } | string>;
+  assignees?: Array<{ login: string }>;
+  comments?: number;
 }
 
 export interface GitHubIssueComment {
   id: number;
   html_url: string;
+}
+
+/** One comment in an issue's discussion, as read back from GitHub. */
+export interface GitHubIssueDiscussionComment {
+  id: number;
+  html_url: string;
+  body: string | null;
+  created_at: string;
+  updated_at?: string;
+  user: { login: string } | null;
+  /** OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, ... */
+  author_association?: string;
+}
+
+export interface GitHubPullRequestDetail {
+  number: number;
+  html_url: string;
+  state: string;
+  merged?: boolean;
+  merged_at?: string | null;
+  closed_at?: string | null;
+  draft?: boolean;
+}
+
+export interface GitHubPullRequestReview {
+  id: number;
+  state: string;
+  submitted_at?: string;
+  user: { login: string } | null;
 }
 
 export interface GitHubContentFile {
@@ -70,6 +102,7 @@ export interface GitHubPullRequestSummary {
   html_url: string;
   state: string;
   draft?: boolean;
+  body?: string | null;
   head: { ref: string; label: string };
 }
 
@@ -181,6 +214,38 @@ export class GitHubRestClient {
     }
 
     return this.request<GitHubPullRequestSummary[]>(`${repoBasePath(owner, repo)}/pulls?${params.toString()}`);
+  }
+
+  /**
+   * Reads an issue's discussion, oldest first. Pages until `limit` comments are collected,
+   * so a long thread is read from its start rather than cut at GitHub's default page.
+   */
+  async listIssueComments(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    options: { limit?: number } = {}
+  ): Promise<GitHubIssueDiscussionComment[]> {
+    const limit = options.limit ?? 100;
+    const comments: GitHubIssueDiscussionComment[] = [];
+    for (let page = 1; comments.length < limit && page <= 10; page += 1) {
+      const batch = await this.request<GitHubIssueDiscussionComment[]>(
+        `${repoBasePath(owner, repo)}/issues/${validateIssueNumber(issueNumber)}/comments?per_page=100&page=${page}`
+      );
+      comments.push(...batch);
+      if (batch.length < 100) break;
+    }
+    return comments.slice(0, limit);
+  }
+
+  async getPullRequest(owner: string, repo: string, pullNumber: number): Promise<GitHubPullRequestDetail> {
+    return this.request<GitHubPullRequestDetail>(`${repoBasePath(owner, repo)}/pulls/${validateIssueNumber(pullNumber)}`);
+  }
+
+  async listPullRequestReviews(owner: string, repo: string, pullNumber: number): Promise<GitHubPullRequestReview[]> {
+    return this.request<GitHubPullRequestReview[]>(
+      `${repoBasePath(owner, repo)}/pulls/${validateIssueNumber(pullNumber)}/reviews?per_page=100`
+    );
   }
 
   async createIssueComment(

@@ -51,7 +51,13 @@ export interface ToolDispatcher {
 export function createToolDispatcher(options: ToolDispatcherOptions): ToolDispatcher {
   const githubTools = createGitHubMcpTools({ client: options.client });
   const enabled = new Set(
-    options.enabledTools ?? ["read_issue", "read_file", "submit_squasher_result", "create_fix_pull_request"]
+    options.enabledTools ?? [
+      "read_issue",
+      "read_file",
+      "read_repository_instructions",
+      "submit_squasher_result",
+      "create_fix_pull_request"
+    ]
   );
   enabled.add(sandboxToolName);
 
@@ -59,7 +65,13 @@ export function createToolDispatcher(options: ToolDispatcherOptions): ToolDispat
     tools() {
       const definitions: ChatCompletionFunctionTool[] = [];
 
-      for (const name of ["read_issue", "read_file", "submit_squasher_result", "create_fix_pull_request"] as const) {
+      for (const name of [
+        "read_issue",
+        "read_file",
+        "read_repository_instructions",
+        "submit_squasher_result",
+        "create_fix_pull_request"
+      ] as const) {
         if (!enabled.has(name)) continue;
         definitions.push({
           type: "function",
@@ -184,9 +196,11 @@ async function runInSandbox(options: ToolDispatcherOptions, args: Record<string,
 function describeGitHubTool(name: GitHubMcpToolName): string {
   switch (name) {
     case "read_issue":
-      return "Read a GitHub issue by owner, repo, and number.";
+      return "Read a GitHub issue by owner, repo, and number, including its comment discussion. Maintainer comments can change or narrow what the issue asks for.";
     case "read_file":
       return "Read a repository file at an optional ref.";
+    case "read_repository_instructions":
+      return "Read the repository's contributor and agent guidance (AGENTS.md, CLAUDE.md, CONTRIBUTING, PR template, README) for build, test, style and contribution rules.";
     case "submit_squasher_result":
       return "Submit the final Squasher proof contract without mutating GitHub.";
     case "create_fix_pull_request":

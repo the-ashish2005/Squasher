@@ -27,9 +27,11 @@
     "remark-math": "^6.0.0"
   },
   "devDependencies": {
+    "@types/jsdom": "^30.0.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^6.1.0",
+    "jsdom": "^25",
     "vite": "^8.2.2",
     "vitest": "^2.1.1"
   }

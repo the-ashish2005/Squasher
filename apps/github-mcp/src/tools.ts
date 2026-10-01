@@ -1,3 +1,11 @@
+import {
+  assertsExistingBehaviour,
+  claimVerdicts,
+  hasRepositoryEvidence,
+  minimumExcerptLength,
+  ownershipStatuses,
+  requirementVerdicts
+} from "./claims.js";
 import { createHash } from "node:crypto";
 
 export interface GitHubRestClientLike {
@@ -7,6 +15,8 @@ export interface GitHubRestClientLike {
     body: string | null;
     html_url: string;
     state: string;
+    labels?: Array<{ name: string } | string>;
+    comments?: number;
   }>;
   getFile(owner: string, repo: string, path: string, ref?: string): Promise<{
     path: string;
@@ -71,7 +81,32 @@ export interface GitHubRestClientLike {
     owner: string,
     repo: string,
     query?: { state?: "open" | "closed" | "all"; head?: string }
-  ): Promise<Array<{ number: number; html_url: string; state: string; head: { ref: string; label: string } }>>;
+  ): Promise<Array<{ number: number; html_url: string; state: string; body?: string | null; head: { ref: string; label: string } }>>;
+  listIssueComments?(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    options?: { limit?: number }
+  ): Promise<
+    Array<{
+      id: number;
+      html_url?: string;
+      body: string | null;
+      created_at: string;
+      user: { login: string } | null;
+      author_association?: string;
+    }>
+  >;
+  getPullRequest?(
+    owner: string,
+    repo: string,
+    pullNumber: number
+  ): Promise<{ number: number; html_url: string; state: string; merged?: boolean; merged_at?: string | null; draft?: boolean }>;
+  listPullRequestReviews?(
+    owner: string,
+    repo: string,
+    pullNumber: number
+  ): Promise<Array<{ id: number; state: string; submitted_at?: string; user: { login: string } | null }>>;
 }
 
 export interface ApprovalContext {
@@ -140,6 +175,7 @@ export const provenResultStatuses: ReadonlySet<string> = new Set([
 export type GitHubMcpToolName =
   | "read_issue"
   | "read_file"
+  | "read_repository_instructions"
   | "submit_squasher_result"
   | "add_verified_label"
   | "comment_on_issue"
@@ -168,8 +204,18 @@ export interface GitHubMcpServerOptions {
 
 export function listGitHubTools(): Array<{ name: GitHubMcpToolName; description: string; requiresApproval: boolean }> {
   return [
-    { name: "read_issue", description: "Read a GitHub issue by owner, repo, and number.", requiresApproval: false },
+    {
+      name: "read_issue",
+      description: "Read a GitHub issue by owner, repo, and number, including its comment discussion.",
+      requiresApproval: false
+    },
     { name: "read_file", description: "Read a repository file at an optional ref.", requiresApproval: false },
+    {
+      name: "read_repository_instructions",
+      description:
+        "Read the repository's own guidance for contributors and agents: CONTRIBUTING, AGENTS.md, CLAUDE.md, pull request templates and the README.",
+      requiresApproval: false
+    },
     {
       name: "submit_squasher_result",
       description: "Submit the final Squasher proof contract without mutating GitHub.",
@@ -204,6 +250,22 @@ export function createGitHubMcpTools({ client, now, sleep }: GitHubMcpServerOpti
         case "read_issue": {
           const { owner, repo, issueNumber } = parseRepoIssueArgs(call.arguments);
           const issue = await client.getIssue(owner, repo, issueNumber);
+          // The discussion is where maintainers say what already exists, what they want
+          // instead, and how the work should be split. Reading the body alone once led to a
+          // patch re-implementing sorting the repository owner had said already existed.
+          let discussion: IssueDiscussion;
+          try {
+            discussion = selectIssueDiscussion(
+              client.listIssueComments ? await client.listIssueComments(owner, repo, issueNumber, { limit: 200 }) : []
+            );
+          } catch (error) {
+            discussion = {
+              comments: [],
+              total: 0,
+              omitted: 0,
+              error: `Comments could not be read: ${error instanceof Error ? error.message : String(error)}`
+            };
+          }
           return textResult(
             JSON.stringify(
               {
@@ -211,12 +273,23 @@ export function createGitHubMcpTools({ client, now, sleep }: GitHubMcpServerOpti
                 title: issue.title,
                 body: issue.body,
                 state: issue.state,
-                url: issue.html_url
+                url: issue.html_url,
+                labels: (issue.labels ?? []).map((label) => (typeof label === "string" ? label : label.name)),
+                commentCount: discussion.total,
+                ...(discussion.omitted > 0 ? { commentsOmitted: discussion.omitted } : {}),
+                ...(discussion.error ? { commentsError: discussion.error } : {}),
+                comments: discussion.comments
               },
               null,
               2
             )
           );
+        }
+
+        case "read_repository_instructions": {
+          const { owner, repo } = parseRepoArgs(call.arguments);
+          const ref = typeof call.arguments.ref === "string" && call.arguments.ref.trim() ? call.arguments.ref.trim() : undefined;
+          return textResult(JSON.stringify(await readRepositoryInstructions(client, owner, repo, ref), null, 2));
         }
 
         case "read_file": {
@@ -227,14 +300,14 @@ export function createGitHubMcpTools({ client, now, sleep }: GitHubMcpServerOpti
 
         case "submit_squasher_result": {
           expectSquasherResult(call.arguments);
-          const isPatchReady = call.arguments.status === "patch-ready";
+          const hasPatch = call.arguments.candidatePatch !== null && typeof call.arguments.candidatePatch === "object";
           return textResult(
             JSON.stringify({
               accepted: true,
-              ...(isPatchReady
+              ...(hasPatch
                 ? {
                     instruction:
-                      "For a patch-ready result, you MUST now immediately call the create_fix_pull_request MCP tool with owner, repo, baseBranch, branchName, title, body, and files (with the exact array matching candidatePatch.files) to initiate the maintainer approval checkpoint."
+                      "For a result with a candidatePatch, you MUST now immediately call the create_fix_pull_request MCP tool with owner, repo, baseBranch, branchName, title, body, and files (with the exact array matching candidatePatch.files) to initiate the maintainer approval checkpoint. If contribution policy declines that write, do not retry it: the verified patch is kept either way."
                   }
                 : {})
             })
@@ -544,6 +617,170 @@ function sortValue(value: unknown): unknown {
   return value;
 }
 
+function parseRepoArgs(args: Record<string, unknown>) {
+  return {
+    owner: expectString(args.owner, "owner"),
+    repo: expectString(args.repo, "repo")
+  };
+}
+
+/** One discussion comment, as handed to the agent. */
+export interface IssueDiscussionComment {
+  author: string;
+  /** GitHub's association: OWNER, MEMBER and COLLABORATOR speak for the project. */
+  association: string;
+  maintainer: boolean;
+  createdAt: string;
+  body: string;
+  truncated?: boolean;
+}
+
+export interface IssueDiscussion {
+  comments: IssueDiscussionComment[];
+  total: number;
+  /** Comments left out of a long thread, from its middle. */
+  omitted: number;
+  error?: string;
+}
+
+const maintainerAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+const maxDiscussionComments = 40;
+const maxDiscussionCommentChars = 2_000;
+const maxDiscussionChars = 24 * 1024;
+
+/**
+ * Bounds an issue's discussion for the model. A long thread keeps its opening comments,
+ * which carry the original context, and its most recent ones, which carry the current
+ * decision; the middle is dropped and counted. Every maintainer comment is kept whatever
+ * its position, because a maintainer's word is what changes the requirement.
+ */
+export function selectIssueDiscussion(
+  raw: Array<{ body: string | null; created_at: string; user: { login: string } | null; author_association?: string }>
+): IssueDiscussion {
+  const all = raw.map((comment) => {
+    const association = (comment.author_association ?? "NONE").toUpperCase();
+    const body = (comment.body ?? "").trim();
+    const truncated = body.length > maxDiscussionCommentChars;
+    return {
+      author: comment.user?.login ?? "ghost",
+      association,
+      maintainer: maintainerAssociations.has(association),
+      createdAt: comment.created_at,
+      body: truncated ? `${body.slice(0, maxDiscussionCommentChars)}…` : body,
+      ...(truncated ? { truncated: true } : {})
+    };
+  });
+
+  let keep = new Set<number>();
+  if (all.length <= maxDiscussionComments) {
+    keep = new Set(all.map((_, index) => index));
+  } else {
+    all.forEach((comment, index) => {
+      if (index < 8 || index >= all.length - (maxDiscussionComments - 8) || comment.maintainer) keep.add(index);
+    });
+  }
+
+  // Then the byte budget, dropping the oldest non-maintainer comments after the opening few.
+  const indices = [...keep].sort((a, b) => a - b);
+  const size = () => indices.reduce((sum, index) => sum + (all[index]?.body.length ?? 0) + 120, 0);
+  while (size() > maxDiscussionChars) {
+    const drop = indices.findIndex((index, position) => position >= 3 && !all[index]?.maintainer);
+    if (drop < 0) break;
+    indices.splice(drop, 1);
+  }
+
+  return {
+    comments: indices.map((index) => all[index]!),
+    total: all.length,
+    omitted: all.length - indices.length
+  };
+}
+
+/** Renders a bounded discussion as plain text for the run's opening message. */
+export function formatIssueDiscussion(discussion: IssueDiscussion): string {
+  if (discussion.total === 0) {
+    return discussion.error ? `(${discussion.error})` : "(no comments)";
+  }
+
+  const lines = discussion.comments.map((comment) => {
+    const role = comment.maintainer ? `${comment.association}, maintainer` : comment.association;
+    return `--- @${comment.author} (${role}) at ${comment.createdAt}\n${comment.body || "(empty)"}`;
+  });
+  if (discussion.omitted > 0) {
+    lines.push(`--- ${discussion.omitted} further comment(s) were omitted to keep this bounded; call read_issue for the rest.`);
+  }
+  return lines.join("\n\n");
+}
+
+/**
+ * Where repositories keep guidance for contributors and for agents, in reading order. The
+ * README comes last and is cut shorter: it is mostly for users, and its development
+ * section is usually near the end of the other documents' coverage anyway.
+ */
+export const repositoryInstructionPaths = [
+  "AGENTS.md",
+  "CLAUDE.md",
+  ".github/copilot-instructions.md",
+  "CONTRIBUTING.md",
+  ".github/CONTRIBUTING.md",
+  "docs/CONTRIBUTING.md",
+  ".github/PULL_REQUEST_TEMPLATE.md",
+  ".github/pull_request_template.md",
+  "DEVELOPMENT.md",
+  "docs/development.md",
+  "README.md"
+];
+
+const maxInstructionFileChars = 12 * 1024;
+const maxReadmeChars = 8 * 1024;
+const maxInstructionTotalChars = 40 * 1024;
+
+export async function readRepositoryInstructions(
+  client: Pick<GitHubRestClientLike, "getFile">,
+  owner: string,
+  repo: string,
+  ref?: string
+): Promise<{
+  found: Array<{ path: string; content: string; truncated: boolean; totalChars: number }>;
+  missing: string[];
+  unreadable: Array<{ path: string; error: string }>;
+  notice: string;
+}> {
+  const found: Array<{ path: string; content: string; truncated: boolean; totalChars: number }> = [];
+  const missing: string[] = [];
+  const unreadable: Array<{ path: string; error: string }> = [];
+  let budget = maxInstructionTotalChars;
+
+  for (const path of repositoryInstructionPaths) {
+    let text: string;
+    try {
+      const file = await client.getFile(owner, repo, path, ref);
+      text = (file.encoding === "base64" ? Buffer.from(file.content, "base64") : Buffer.from(file.content, "utf8")).toString("utf8");
+    } catch (error) {
+      if (isNotFound(error)) missing.push(path);
+      else unreadable.push({ path, error: error instanceof Error ? error.message : String(error) });
+      continue;
+    }
+
+    const limit = Math.min(path === "README.md" ? maxReadmeChars : maxInstructionFileChars, budget);
+    if (limit <= 0) {
+      found.push({ path, content: "", truncated: true, totalChars: text.length });
+      continue;
+    }
+    const truncated = text.length > limit;
+    found.push({ path, content: truncated ? text.slice(0, limit) : text, truncated, totalChars: text.length });
+    budget -= Math.min(text.length, limit);
+  }
+
+  return {
+    found,
+    missing,
+    unreadable,
+    notice:
+      "Use these for build, test, style and contribution rules. Where a document is truncated, read the rest with read_file or in the sandbox clone. Do not invent rules that are not written here."
+  };
+}
+
 function parseRepoIssueArgs(args: Record<string, unknown>) {
   return {
     owner: expectString(args.owner, "owner"),
@@ -653,6 +890,14 @@ function expectSquasherResult(args: Record<string, unknown>): void {
   const positiveProof = provenResultStatuses.has(args.status);
   if (positiveProof) expectMeaningfulText(args.summary, "summary", 20);
   else expectString(args.summary, "summary");
+  // Optional explanation fields: absent is fine, but a present value must be usable text.
+  if (args.rootCauseSummary !== undefined) expectString(args.rootCauseSummary, "rootCauseSummary");
+  if (args.nextStep !== undefined) expectString(args.nextStep, "nextStep");
+  if (args.findings !== undefined) {
+    if (!Array.isArray(args.findings) || args.findings.some((finding) => typeof finding !== "string")) {
+      throw new Error("Expected findings to be an array of strings");
+    }
+  }
   if (!args.proof || typeof args.proof !== "object" || Array.isArray(args.proof)) {
     throw new Error("Expected proof object");
   }
@@ -670,6 +915,10 @@ function expectSquasherResult(args: Record<string, unknown>): void {
     expectString(proof.regressions, "proof.regressions");
     expectString(proof.attempts, "proof.attempts");
   }
+  // After the evidence bar, so a result missing basic proof is told about that first.
+  expectRequirements(args.requirements, args.status);
+  expectDiscussionClaims(args.discussionClaims);
+  expectFileChanges(args.fileChanges, args.candidatePatch, args.requirements);
   if (args.candidatePatch === null) return;
   if (!args.candidatePatch || typeof args.candidatePatch !== "object" || Array.isArray(args.candidatePatch)) {
     throw new Error("Expected candidatePatch object or null");
@@ -678,6 +927,168 @@ function expectSquasherResult(args: Record<string, unknown>): void {
   expectMeaningfulText(patch.title, "candidatePatch.title", 8);
   expectMeaningfulText(patch.body, "candidatePatch.body", 12);
   expectPatchFiles(patch.files);
+}
+
+/**
+ * Checks the requirement verification. An implemented change must list the requirements it
+ * was built against, because "implemented" means nothing without saying what was asked
+ * for. No proven status may carry a requirement that failed: that change is not verified.
+ *
+ * Technical state and ownership are separate: `verdict` says what the code does, and
+ * `ownership` says whose work it is per the discussion. Work reserved for or claimed by
+ * someone else is never built in this run, whatever its technical state.
+ *
+ * Whether cited evidence is true is checked where the repository is at hand -- see
+ * repositoryEvidenceProblem, applied by the harness. Here only its presence is required.
+ */
+function expectRequirements(value: unknown, status: unknown): void {
+  const isImplementation = typeof status === "string" && implementationStatuses.has(status);
+  const isProven = typeof status === "string" && provenResultStatuses.has(status);
+  if (value === undefined || value === null) {
+    if (isImplementation) {
+      throw new Error(
+        `Expected requirements: list each acceptance criterion from the issue and its discussion with a verdict (${requirementVerdicts.join(", ")}) and the concrete evidence for it`
+      );
+    }
+    return;
+  }
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("Expected requirements to be a non-empty array");
+  }
+
+  const verdicts = value.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`Expected requirement object at index ${index}`);
+    }
+    const requirement = entry as Record<string, unknown>;
+    const name = `requirements[${index}]`;
+    expectMeaningfulText(requirement.requirement, `${name}.requirement`, 6);
+    if (typeof requirement.verdict !== "string" || !(requirementVerdicts as readonly string[]).includes(requirement.verdict)) {
+      throw new Error(`Expected ${name}.verdict to be one of ${requirementVerdicts.join(", ")}`);
+    }
+    if (requirement.verdict !== "out-of-scope") {
+      expectMeaningfulText(requirement.evidence, `${name}.evidence`, 6);
+    }
+    expectEvidenceShape(requirement, name);
+    if (assertsExistingBehaviour("requirement", requirement.verdict) && !hasRepositoryEvidence(requirement)) {
+      throw new Error(
+        `${name} is marked already-implemented without repository evidence. A comment saying it exists is a claim, not proof: cite codeEvidence (path and an excerpt that occurs in it) or an executedCommand you ran, or mark it missing.`
+      );
+    }
+
+    const ownership = requirement.ownership;
+    if (ownership !== undefined) {
+      if (!ownership || typeof ownership !== "object" || Array.isArray(ownership)) {
+        throw new Error(`Expected ${name}.ownership to be an object`);
+      }
+      const owned = ownership as Record<string, unknown>;
+      if (typeof owned.status !== "string" || !(ownershipStatuses as readonly string[]).includes(owned.status)) {
+        throw new Error(`Expected ${name}.ownership.status to be one of ${ownershipStatuses.join(", ")}`);
+      }
+      expectMeaningfulText(owned.by, `${name}.ownership.by`, 2);
+      if (requirement.verdict === "pass") {
+        throw new Error(
+          `${name} is ${owned.status} for ${String(owned.by)} per the discussion, so it must not be implemented in this run. Leave that work to its owner and exclude it from the patch.`
+        );
+      }
+    } else if (isProven && requirement.verdict === "missing") {
+      throw new Error(
+        `${name} is still missing, so status "${String(status)}" does not cover it: implement it, mark it out-of-scope with the reason, or record who owns it in ownership.`
+      );
+    }
+    return requirement.verdict;
+  });
+
+  if (isProven && verdicts.includes("fail")) {
+    throw new Error(
+      `A requirement failed verification, so status "${status}" is not available: repair the change and re-verify, or submit the status that honestly describes the result`
+    );
+  }
+  if (isImplementation && !verdicts.includes("pass")) {
+    throw new Error("An implemented change must have at least one requirement verified as pass");
+  }
+}
+
+/**
+ * Checks the discussion claims: what someone in the thread asserted, and what the
+ * repository showed. A confirmed claim needs the same evidence as an already-implemented
+ * requirement; a contradicted one keeps both sides -- the claim and what the code does.
+ */
+function expectDiscussionClaims(value: unknown): void {
+  if (value === undefined || value === null) return;
+  if (!Array.isArray(value)) throw new Error("Expected discussionClaims to be an array");
+
+  value.forEach((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`Expected discussion claim object at index ${index}`);
+    }
+    const claim = entry as Record<string, unknown>;
+    const name = `discussionClaims[${index}]`;
+    expectMeaningfulText(claim.claim, `${name}.claim`, 6);
+    if (typeof claim.verdict !== "string" || !(claimVerdicts as readonly string[]).includes(claim.verdict)) {
+      throw new Error(`Expected ${name}.verdict to be one of ${claimVerdicts.join(", ")}`);
+    }
+    expectMeaningfulText(claim.evidence, `${name}.evidence`, 6);
+    expectEvidenceShape(claim, name);
+    if (assertsExistingBehaviour("claim", claim.verdict) && !hasRepositoryEvidence(claim)) {
+      throw new Error(
+        `${name} is marked ${claim.verdict} without repository evidence. Cite codeEvidence or an executedCommand, or mark it unverified.`
+      );
+    }
+  });
+}
+
+/**
+ * Checks the per-file explanations: each names a file the patch actually changes, and any
+ * requirement it cites is one this result lists. That keeps the workspace's
+ * requirement-to-file mapping to what the agent declared, never inferred.
+ */
+function expectFileChanges(value: unknown, candidatePatch: unknown, requirements: unknown): void {
+  if (value === undefined || value === null) return;
+  if (!Array.isArray(value)) throw new Error("Expected fileChanges to be an array");
+  const patchPaths = new Set(
+    candidatePatch && typeof candidatePatch === "object" && Array.isArray((candidatePatch as Record<string, unknown>).files)
+      ? ((candidatePatch as Record<string, unknown>).files as Array<Record<string, unknown>>).map((file) => file?.path)
+      : []
+  );
+  const requirementTexts = new Set(
+    Array.isArray(requirements) ? requirements.map((entry) => (entry && typeof entry === "object" ? (entry as Record<string, unknown>).requirement : undefined)) : []
+  );
+
+  value.forEach((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`Expected fileChanges[${index}] to be an object`);
+    const change = entry as Record<string, unknown>;
+    const path = expectMeaningfulText(change.path, `fileChanges[${index}].path`, 1);
+    if (!patchPaths.has(path)) {
+      throw new Error(`fileChanges[${index}].path "${path}" is not a file in candidatePatch.files`);
+    }
+    expectMeaningfulText(change.summary, `fileChanges[${index}].summary`, 8);
+    if (change.requirements !== undefined) {
+      if (!Array.isArray(change.requirements) || change.requirements.some((text) => typeof text !== "string")) {
+        throw new Error(`Expected fileChanges[${index}].requirements to be an array of requirement texts`);
+      }
+      for (const text of change.requirements as string[]) {
+        if (!requirementTexts.has(text)) {
+          throw new Error(`fileChanges[${index}] cites requirement "${text}", which is not in requirements; cite the exact requirement text`);
+        }
+      }
+    }
+  });
+}
+
+function expectEvidenceShape(entry: Record<string, unknown>, name: string): void {
+  if (entry.codeEvidence !== undefined) {
+    if (!Array.isArray(entry.codeEvidence)) throw new Error(`Expected ${name}.codeEvidence to be an array`);
+    entry.codeEvidence.forEach((evidence, index) => {
+      if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+        throw new Error(`Expected ${name}.codeEvidence[${index}] to be an object with path and excerpt`);
+      }
+      const cited = evidence as Record<string, unknown>;
+      expectMeaningfulText(cited.path, `${name}.codeEvidence[${index}].path`, 1);
+      expectMeaningfulText(cited.excerpt, `${name}.codeEvidence[${index}].excerpt`, minimumExcerptLength);
+    });
+  }
+  if (entry.executedCommand !== undefined) expectString(entry.executedCommand, `${name}.executedCommand`);
 }
 
 function expectPatchFiles(value: unknown) {

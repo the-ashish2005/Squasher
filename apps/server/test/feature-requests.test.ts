@@ -48,7 +48,21 @@ function implementedResult(status: string) {
       title: "Add a Cancel button beside Save",
       body: "Adds the requested green Cancel button to index.html.",
       files: patchFiles
-    }
+    },
+    requirements: [
+      {
+        requirement: "A green Cancel button appears next to Save",
+        verdict: "pass",
+        evidence: "The acceptance test found #cancel beside #save with background #16a34a, 3/3 runs."
+      },
+      {
+        requirement: "The existing Save button is unchanged",
+        verdict: "already-implemented",
+        evidence: "index.html keeps #save; the regression check passed 3/3.",
+        // Quoted from the repository fixture below, so the harness can confirm it.
+        codeEvidence: [{ path: "index.html", excerpt: "<button id=\"save\">Save</button>" }]
+      }
+    ]
   };
 }
 
@@ -255,6 +269,12 @@ describe("feature and improvement requests", () => {
       expect(approval.resultStatus).toBe("pr-created");
       expect(approval.pullRequest.url).toBe("https://github.test/pull/11");
       expect(github.client.createPullRequest).toHaveBeenCalledTimes(1);
+
+      // The run page's outcome follows the record through the gate.
+      expect(latest.outcome.gate).toEqual({ eyebrow: "Mutation gate", title: "Awaiting human approval" });
+      const created = await fetch(`${baseUrl}/api/runs/latest`).then((r) => r.json());
+      expect(created.outcome.kind).toBe("contribution-created");
+      expect(created.outcome.change).toMatchObject({ created: true, pullRequest: { number: 11, url: "https://github.test/pull/11" } });
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
     }
@@ -303,6 +323,62 @@ describe("feature and improvement requests", () => {
       expect(github.labels.has("squasher:not-reproduced")).toBe(false);
       expect(github.labels.has("squasher:implemented")).toBe(false);
       expect(github.client.createPullRequest).not.toHaveBeenCalled();
+      expect(latest.outcome.gate).toEqual({ eyebrow: "Run outcome", title: "No change made" });
+      expect(latest.outcome.change.created).toBe(false);
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+
+  it("carries the agent's explanation fields to the run outcome", async () => {
+    const github = labelTrackingGitHub(defectIssue);
+    const notReproduced = {
+      kind: "squasher.result",
+      status: "not-reproduced",
+      summary: "The tokenizer does not throw on a trailing backslash on main. The reported line no longer exists.",
+      rootCauseSummary: "The escape handling the report quotes was replaced before this run, so the crash cannot occur on main.",
+      nextStep: "Ask the reporter which release they ran.",
+      findings: ["tokenizePattern() on main guards the index before reading the next character."],
+      proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "3/3 runs completed without the TypeError" },
+      candidatePatch: null
+    };
+    const { latest, server } = await runIssue(github, defectIssue, "explained-run-1", [
+      toolCallResponse([{ id: "c1", name: "run_command", arguments: { command: "node --experimental-strip-types repro.ts" } }]),
+      toolCallResponse([{ id: "c2", name: "submit_squasher_result", arguments: notReproduced }]),
+      textResponse(JSON.stringify(notReproduced))
+    ]);
+
+    try {
+      expect(latest.run.status).toBe("not-reproduced");
+      expect(latest.outcome.gate).toEqual({ eyebrow: "Run outcome", title: "No mutation required" });
+      expect(latest.outcome.rootCause).toEqual({ established: true, text: notReproduced.rootCauseSummary, source: "agent" });
+      expect(latest.outcome.nextStep).toEqual({ text: "Ask the reporter which release they ran.", source: "agent" });
+      expect(latest.outcome.findings).toEqual(notReproduced.findings);
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+
+  it("does not present the summary fallback as an established root cause", async () => {
+    const github = labelTrackingGitHub(defectIssue);
+    const withoutRootCause = {
+      kind: "squasher.result",
+      status: "not-reproduced",
+      summary: "The tokenizer does not throw on a trailing backslash on main. The reported line no longer exists.",
+      proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "3/3 runs completed without the TypeError" },
+      candidatePatch: null
+    };
+    const { latest, server } = await runIssue(github, defectIssue, "explained-run-2", [
+      toolCallResponse([{ id: "c1", name: "submit_squasher_result", arguments: withoutRootCause }]),
+      textResponse(JSON.stringify(withoutRootCause))
+    ]);
+
+    try {
+      // Extraction still fills rootCauseSummary from the summary for the GitHub comment...
+      expect(latest.trueForge.result.rootCauseSummary).toBeTruthy();
+      // ...but the page must not call that an established root cause.
+      expect(latest.outcome.rootCause).toEqual({ established: false, text: "Root cause not established" });
+      expect(latest.outcome.nextStep.source).toBe("server");
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
     }

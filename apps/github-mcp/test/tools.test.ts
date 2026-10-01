@@ -1,11 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
-import { approvalPayloadHash, createGitHubMcpTools, listGitHubTools, maxReadFileBytes } from "../src/index.js";
+import {
+  approvalPayloadHash,
+  createGitHubMcpTools,
+  formatIssueDiscussion,
+  listGitHubTools,
+  maxReadFileBytes,
+  readRepositoryInstructions,
+  selectIssueDiscussion
+} from "../src/index.js";
 
 describe("GitHub MCP tools", () => {
   it("exposes read and approved write tools", () => {
     expect(listGitHubTools()).toEqual([
       expect.objectContaining({ name: "read_issue", requiresApproval: false }),
       expect.objectContaining({ name: "read_file", requiresApproval: false }),
+      expect.objectContaining({ name: "read_repository_instructions", requiresApproval: false }),
       expect.objectContaining({ name: "submit_squasher_result", requiresApproval: false }),
       expect.objectContaining({ name: "add_verified_label", requiresApproval: true }),
       expect.objectContaining({ name: "comment_on_issue", requiresApproval: true }),
@@ -52,6 +61,35 @@ describe("GitHub MCP tools", () => {
     expect(result.content[0]?.text).toContain("\"accepted\":true");
     expect(client.createIssueComment).not.toHaveBeenCalled();
     expect(client.addLabels).not.toHaveBeenCalled();
+  });
+
+  it("accepts the optional explanation fields and rejects malformed ones", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+    const base = {
+      kind: "squasher.result",
+      status: "not-reproduced",
+      summary: "The reported error does not occur on main.",
+      proof: { before: "not run", after: "not run", regressions: "not run", attempts: "3/3 clean runs" },
+      candidatePatch: null
+    };
+
+    const accepted = await tools.callTool({
+      name: "submit_squasher_result",
+      arguments: {
+        ...base,
+        rootCauseSummary: "The reporter ran a release that predates the fix.",
+        nextStep: "Ask the reporter to upgrade.",
+        findings: ["analyze() calls the helper on main."]
+      }
+    });
+    expect(accepted.content[0]?.text).toContain("\"accepted\":true");
+
+    await expect(
+      tools.callTool({ name: "submit_squasher_result", arguments: { ...base, findings: "one long string" } })
+    ).rejects.toThrow("findings to be an array of strings");
+    await expect(
+      tools.callTool({ name: "submit_squasher_result", arguments: { ...base, nextStep: "" } })
+    ).rejects.toThrow("nextStep");
   });
 
   it("rejects placeholder proof before it can reach approval", async () => {
@@ -390,7 +428,14 @@ describe("result statuses for implemented changes", () => {
       title: "Add a Cancel button beside Save",
       body: "Adds the requested Cancel button to index.html.",
       files: [{ path: "index.html", content: "<button>Cancel</button>\n" }]
-    }
+    },
+    requirements: [
+      {
+        requirement: "A green Cancel button appears beside Save",
+        verdict: "pass",
+        evidence: "The acceptance test found #cancel with background #16a34a next to #save, 3/3 runs."
+      }
+    ]
   };
 
   it("accepts implemented-feature and implemented-improvement", async () => {
@@ -643,5 +688,201 @@ describe("read_file bounding and progressive inspection", () => {
     const { body } = await read(fileOf("é".repeat(40 * 1024)));
 
     expect(body.content).not.toContain("\uFFFD");
+  });
+});
+
+describe("issue discussion", () => {
+  function comment(login: string, association: string, body: string, index: number) {
+    return {
+      id: index,
+      body,
+      created_at: `2026-09-${String(10 + (index % 18)).padStart(2, "0")}T00:00:00Z`,
+      user: { login },
+      author_association: association
+    };
+  }
+
+  it("returns the comment thread with read_issue, marking maintainers", async () => {
+    // A live run once re-implemented sorting the owner had said in the thread already existed,
+    // because read_issue returned the body alone.
+    const client = {
+      getIssue: vi.fn().mockResolvedValue({
+        number: 164,
+        title: "UI/UX improvements",
+        body: "Add cards, badges, sorting and filtering.",
+        html_url: "https://github.test/o/r/issues/164",
+        state: "open",
+        labels: [{ name: "enhancement" }]
+      }),
+      listIssueComments: vi.fn().mockResolvedValue([
+        comment("owner-login", "OWNER", "Sorting by any column and the language filter already exist. I will split the rest.", 1),
+        comment("newcomer", "NONE", "/assign", 2)
+      ])
+    };
+    const tools = createGitHubMcpTools({ client: client as never });
+
+    const result = await tools.callTool({ name: "read_issue", arguments: { owner: "o", repo: "r", issueNumber: 164 } });
+    const issue = JSON.parse(result.content[0]!.text);
+
+    expect(client.listIssueComments).toHaveBeenCalledWith("o", "r", 164, { limit: 200 });
+    expect(issue.labels).toEqual(["enhancement"]);
+    expect(issue.commentCount).toBe(2);
+    expect(issue.comments[0]).toMatchObject({ author: "owner-login", association: "OWNER", maintainer: true });
+    expect(issue.comments[0].body).toContain("already exist");
+    expect(issue.comments[1]).toMatchObject({ author: "newcomer", maintainer: false });
+  });
+
+  it("reports unreadable comments instead of presenting the issue as undiscussed", async () => {
+    const client = {
+      getIssue: vi.fn().mockResolvedValue({ number: 1, title: "t", body: "b", html_url: "u", state: "open" }),
+      listIssueComments: vi.fn().mockRejectedValue(new Error("GitHub API 502 Bad Gateway"))
+    };
+    const tools = createGitHubMcpTools({ client: client as never });
+
+    const issue = JSON.parse((await tools.callTool({ name: "read_issue", arguments: { owner: "o", repo: "r", issueNumber: 1 } })).content[0]!.text);
+
+    expect(issue.commentsError).toContain("502");
+    expect(issue.comments).toEqual([]);
+  });
+
+  it("bounds a long thread but keeps its opening, its latest comments, and every maintainer comment", () => {
+    const raw = Array.from({ length: 120 }, (_, index) =>
+      comment(index === 60 ? "maintainer" : `user${index}`, index === 60 ? "MEMBER" : "NONE", `comment ${index}`, index)
+    );
+
+    const discussion = selectIssueDiscussion(raw);
+
+    expect(discussion.total).toBe(120);
+    expect(discussion.omitted).toBe(120 - discussion.comments.length);
+    expect(discussion.comments[0]?.body).toBe("comment 0");
+    expect(discussion.comments.at(-1)?.body).toBe("comment 119");
+    // From the dropped middle, but kept: a maintainer's word is what changes the requirement.
+    expect(discussion.comments.some((entry) => entry.author === "maintainer")).toBe(true);
+    expect(formatIssueDiscussion(discussion)).toContain("further comment(s) were omitted");
+  });
+
+  it("formats the thread with roles so the agent can weigh maintainer direction", () => {
+    const text = formatIssueDiscussion(selectIssueDiscussion([comment("owner-login", "OWNER", "Please split this.", 1)]));
+
+    expect(text).toContain("@owner-login (OWNER, maintainer)");
+    expect(text).toContain("Please split this.");
+    expect(formatIssueDiscussion(selectIssueDiscussion([]))).toBe("(no comments)");
+  });
+});
+
+describe("repository instructions", () => {
+  it("reads the repository's contributor and agent guidance and lists what is missing", async () => {
+    const files: Record<string, string> = {
+      "AGENTS.md": "Run `pnpm test` before submitting. Use tabs.",
+      "CONTRIBUTING.md": "Disclose AI assistance in the pull request body."
+    };
+    const client = {
+      getFile: vi.fn().mockImplementation(async (_owner: string, _repo: string, path: string) => {
+        const content = files[path];
+        if (content === undefined) throw Object.assign(new Error("GitHub API 404 Not Found"), { status: 404 });
+        return { path, sha: "sha", encoding: "base64", content: Buffer.from(content, "utf8").toString("base64") };
+      })
+    };
+    const tools = createGitHubMcpTools({ client: client as never });
+
+    const result = JSON.parse(
+      (await tools.callTool({ name: "read_repository_instructions", arguments: { owner: "o", repo: "r" } })).content[0]!.text
+    );
+
+    expect(result.found.map((file: { path: string }) => file.path)).toEqual(["AGENTS.md", "CONTRIBUTING.md"]);
+    expect(result.found[0].content).toContain("pnpm test");
+    expect(result.missing).toContain("CLAUDE.md");
+    expect(result.unreadable).toEqual([]);
+    expect(result.notice).toContain("Do not invent rules");
+  });
+
+  it("bounds a huge document and marks it truncated", async () => {
+    const client = {
+      getFile: vi.fn().mockImplementation(async (_owner: string, _repo: string, path: string) => {
+        if (path !== "CONTRIBUTING.md") throw Object.assign(new Error("404"), { status: 404 });
+        return { path, sha: "sha", encoding: "utf8", content: "x".repeat(100_000) };
+      })
+    };
+
+    const result = await readRepositoryInstructions(client as never, "o", "r");
+
+    expect(result.found[0]).toMatchObject({ path: "CONTRIBUTING.md", truncated: true, totalChars: 100_000 });
+    expect(result.found[0]!.content.length).toBeLessThan(100_000);
+  });
+});
+
+describe("requirement verification", () => {
+  const base = {
+    kind: "squasher.result",
+    status: "implemented-feature",
+    summary: "Added the requested sort dropdown alongside the existing sortable headers.",
+    proof: {
+      before: "The new dropdown test failed 3/3 before the change.",
+      after: "The same test passed 3/3 after it.",
+      regressions: "The existing 83 tests still pass; no pre-existing failures.",
+      attempts: "3/3 matching executions"
+    },
+    candidatePatch: {
+      title: "Add a sort dropdown",
+      body: "Adds a sort dropdown for small screens.",
+      files: [{ path: "index.html", content: "<select id=\"sort\"></select>\n" }]
+    }
+  };
+
+  it("requires an implemented change to list its requirements", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+
+    await expect(tools.callTool({ name: "submit_squasher_result", arguments: base })).rejects.toThrow("Expected requirements");
+  });
+
+  it("refuses a proven status when any requirement failed", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+
+    await expect(
+      tools.callTool({
+        name: "submit_squasher_result",
+        arguments: {
+          ...base,
+          requirements: [
+            { requirement: "A sort dropdown exists", verdict: "pass", evidence: "Test found #sort 3/3." },
+            { requirement: "Sorting persists across reloads", verdict: "fail", evidence: "Reloading reset the order in 3/3 runs." }
+          ]
+        }
+      })
+    ).rejects.toThrow("A requirement failed verification");
+  });
+
+  it("accepts requirements already met by existing code, with their evidence", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+
+    const result = await tools.callTool({
+      name: "submit_squasher_result",
+      arguments: {
+        ...base,
+        requirements: [
+          {
+            requirement: "Sort by created date",
+            verdict: "already-implemented",
+            evidence: "COLUMNS marks created_at sortable and handleSort toggles direction.",
+            codeEvidence: [{ path: "index.html", excerpt: '{ key: "created_at", label: "Created",  sortable: true }' }]
+          },
+          { requirement: "A sort control usable on small screens", verdict: "pass", evidence: "The dropdown test selected each option 3/3 at 390px." },
+          { requirement: "Rewrite the layout as cards", verdict: "out-of-scope" }
+        ]
+      }
+    });
+
+    expect(result.content[0]?.text).toContain('"accepted":true');
+  });
+
+  it("rejects a requirement verdict that is not one of the four", async () => {
+    const tools = createGitHubMcpTools({ client: {} as never });
+
+    await expect(
+      tools.callTool({
+        name: "submit_squasher_result",
+        arguments: { ...base, requirements: [{ requirement: "Something", verdict: "probably", evidence: "trust me" }] }
+      })
+    ).rejects.toThrow("verdict to be one of");
   });
 });

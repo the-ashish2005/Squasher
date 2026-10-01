@@ -48,7 +48,7 @@ describe("environment variable aliases", () => {
 
   it("falls back to the default when neither is set", () => {
     expect(brandedEnv("CONTRIBUTION_MODE", {})).toBeUndefined();
-    expect(configuredContributionMode({})).toBe("own");
+    expect(configuredContributionMode({})).toBe("fork");
     expect(upstreamAllowlist({})).toEqual([]);
   });
 });

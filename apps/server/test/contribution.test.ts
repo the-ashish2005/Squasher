@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   configuredContributionMode,
+  isContributionWritable,
   isUpstreamAllowlisted,
+  pullRequestIssueNumber,
   maxOpenPullRequests,
   resolveContributionTarget,
   scanContributionPolicy,
@@ -28,7 +30,7 @@ function clientFor(options: {
   disabled?: boolean;
   login?: string;
   files?: Record<string, string>;
-  openPullRequests?: Array<{ number: number; html_url: string; state: string; head: { ref: string; label: string } }>;
+  openPullRequests?: Array<{ number: number; html_url: string; state: string; body?: string | null; head: { ref: string; label: string } }>;
   forkFails?: boolean;
 } = {}) {
   const files = options.files ?? {};
@@ -62,11 +64,21 @@ function clientFor(options: {
 }
 
 describe("contribution mode configuration", () => {
-  it("defaults to own so existing deployments are unchanged", () => {
-    expect(configuredContributionMode({})).toBe("own");
-    expect(configuredContributionMode({ SQUASHER_CONTRIBUTION_MODE: "nonsense" })).toBe("own");
+  it("defaults to fork, and keeps every explicit mode", () => {
+    expect(configuredContributionMode({})).toBe("fork");
+    expect(configuredContributionMode({ SQUASHER_CONTRIBUTION_MODE: "nonsense" })).toBe("fork");
     expect(configuredContributionMode({ SQUASHER_CONTRIBUTION_MODE: " Fork " })).toBe("fork");
     expect(configuredContributionMode({ SQUASHER_CONTRIBUTION_MODE: "triage" })).toBe("triage");
+    expect(configuredContributionMode({ SQUASHER_CONTRIBUTION_MODE: "own" })).toBe("own");
+    expect(configuredContributionMode({ BYTER_CONTRIBUTION_MODE: "own" })).toBe("own");
+  });
+
+  it("reads a legacy record's triage mode as not writable", () => {
+    // Records from before `writable` existed encoded every refusal as mode triage.
+    expect(isContributionWritable({ mode: "triage" })).toBe(false);
+    expect(isContributionWritable({ mode: "fork" })).toBe(true);
+    expect(isContributionWritable({ mode: "fork", writable: false })).toBe(false);
+    expect(isContributionWritable(undefined)).toBe(false);
   });
 
   it("fails closed when no allowlist is configured", () => {
@@ -74,14 +86,14 @@ describe("contribution mode configuration", () => {
     expect(isUpstreamAllowlisted("upstream", "project", [])).toBe(false);
   });
 
-  it("defaults the open pull request limit to one, and only accepts a positive whole number", () => {
-    expect(maxOpenPullRequests({})).toBe(1);
+  it("has no repository-wide pull request cap unless one is set", () => {
+    expect(maxOpenPullRequests({})).toBeUndefined();
     expect(maxOpenPullRequests({ SQUASHER_MAX_OPEN_PULL_REQUESTS: "3" })).toBe(3);
     expect(maxOpenPullRequests({ BYTER_MAX_OPEN_PULL_REQUESTS: "3" })).toBe(3);
 
-    // A mistyped limit must not silently become "no limit".
+    // A mistyped cap must not silently become a cap of zero that blocks everything.
     for (const raw of ["0", "-2", "2.5", "many", ""]) {
-      expect(maxOpenPullRequests({ SQUASHER_MAX_OPEN_PULL_REQUESTS: raw }), raw).toBe(1);
+      expect(maxOpenPullRequests({ SQUASHER_MAX_OPEN_PULL_REQUESTS: raw }), raw).toBeUndefined();
     }
   });
 
@@ -189,13 +201,18 @@ describe("contribution target resolution", () => {
     expect(client.forkRepository).toHaveBeenCalledWith("upstream", "project");
   });
 
-  it("refuses a repository that is not allowlisted, and forks nothing", async () => {
+  it("refuses the write for a repository that is not allowlisted, forks nothing, and keeps the fork mode", async () => {
     const client = clientFor({ push: false });
 
-    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "fork", allowlist: [] });
+    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", issueNumber: 42, mode: "fork", allowlist: [] });
 
-    expect(target.mode).toBe("triage");
+    // Not rewritten to triage: triage now means only an explicit choice not to submit.
+    expect(target.mode).toBe("fork");
+    expect(target.writable).toBe(false);
+    expect(target.blockers?.[0]).toMatchObject({ kind: "configuration" });
     expect(target.reason).toContain("SQUASHER_UPSTREAM_ALLOWLIST");
+    expect(target.blockers?.[0]?.action).toContain("Add upstream/project to SQUASHER_UPSTREAM_ALLOWLIST");
+    expect(target.preflight).toMatchObject({ allowlisted: false, pushAccess: false, authenticated: true, account: "contributor", policyReviewed: true });
     expect(client.forkRepository).not.toHaveBeenCalled();
   });
 
@@ -207,10 +224,22 @@ describe("contribution target resolution", () => {
 
     const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "fork", allowlist });
 
-    expect(target.mode).toBe("triage");
+    expect(target.writable).toBe(false);
+    expect(target.blockers?.[0]?.kind).toBe("policy");
     expect(target.policyFindings).toHaveLength(1);
     // The order matters: nothing is created in the user's account before this check runs.
     expect(client.forkRepository).not.toHaveBeenCalled();
+  });
+
+  it("records every blocker, not just the first", async () => {
+    const client = clientFor({
+      push: false,
+      files: { "CONTRIBUTING.md": "AI-generated pull requests are not accepted." }
+    });
+
+    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "fork", allowlist: [] });
+
+    expect(target.blockers?.map((blocker) => blocker.kind)).toEqual(["configuration", "policy"]);
   });
 
   it("never writes to an archived repository", async () => {
@@ -218,74 +247,95 @@ describe("contribution target resolution", () => {
 
     const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "own", allowlist });
 
-    expect(target.mode).toBe("triage");
+    expect(target.writable).toBe(false);
+    expect(target.blockers?.[0]?.kind).toBe("capability");
     expect(target.archived).toBe(true);
   });
 
-  it("stays in triage when own mode has no push access", async () => {
+  it("refuses the write in own mode without push access, and says how to enable it", async () => {
     const client = clientFor({ push: false });
 
     const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "own", allowlist });
 
-    expect(target.mode).toBe("triage");
+    expect(target.mode).toBe("own");
+    expect(target.writable).toBe(false);
     expect(target.reason).toContain("set it to fork");
     expect(client.forkRepository).not.toHaveBeenCalled();
   });
 
-  it("honours triage mode without probing at all", async () => {
+  it("honours an explicit triage mode without probing at all", async () => {
     const client = clientFor({ push: true });
 
     const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "triage", allowlist });
 
     expect(target.mode).toBe("triage");
+    expect(target.writable).toBe(false);
+    expect(target.reason).toContain("kept rather than submitted");
     expect(client.getRepository).not.toHaveBeenCalled();
   });
 
-  it("refuses a second pull request while one is still open", async () => {
+  it("refuses a second pull request for the same issue", async () => {
     const client = clientFor({
       push: false,
       openPullRequests: [
-        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42", label: "contributor:squasher/fix-42" } }
+        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42-abc1234567", label: "contributor:squasher/fix-42-abc1234567" } }
       ]
     });
 
-    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "fork", allowlist });
+    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", issueNumber: 42, mode: "fork", allowlist });
 
-    expect(target.mode).toBe("triage");
+    expect(target.writable).toBe(false);
+    expect(target.blockers?.[0]?.kind).toBe("duplicate");
     expect(target.existingPullRequestUrl).toBe("https://github.test/pull/4");
-    expect(target.reason).toContain("SQUASHER_MAX_OPEN_PULL_REQUESTS");
+    expect(target.preflight?.duplicatePullRequest).toBe("https://github.test/pull/4");
     expect(client.forkRepository).not.toHaveBeenCalled();
   });
 
-  it("allows a second pull request when the limit is raised", async () => {
-    // The default of one is a courtesy to maintainers receiving unsolicited pull requests,
-    // not a correctness rule, so an operator who knows it does not apply can raise it.
+  it("does not block a different issue because another issue already has a pull request", async () => {
     const client = clientFor({
       push: false,
       openPullRequests: [
-        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42", label: "contributor:squasher/fix-42" } }
+        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42-abc1234567", label: "contributor:squasher/fix-42-abc1234567" } }
       ]
     });
 
-    const target = await resolveContributionTarget({
-      client: client as never,
-      owner: "upstream",
-      repo: "project",
-      mode: "fork",
-      allowlist,
-      maxOpenPullRequests: 2
-    });
+    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", issueNumber: 43, mode: "fork", allowlist });
 
+    expect(target.writable).toBe(true);
     expect(target.mode).toBe("fork");
+    expect(target.preflight?.openSquasherPullRequests).toBe(1);
+    expect(target.preflight?.duplicatePullRequest).toBeNull();
     expect(client.forkRepository).toHaveBeenCalled();
   });
 
-  it("still refuses once the raised limit is reached", async () => {
+  it("recognises a same-issue pull request by the issue it closes, and a pre-rename branch", async () => {
+    expect(pullRequestIssueNumber({ head: { ref: "squasher/fix-42-abc" } })).toBe(42);
+    expect(pullRequestIssueNumber({ head: { ref: "byter/fix-7-abc" } })).toBe(7);
+    expect(pullRequestIssueNumber({ head: { ref: "squasher/other" }, body: "Summary.\n\nFixes #19" })).toBe(19);
+    expect(pullRequestIssueNumber({ head: { ref: "squasher/other" }, body: "Mentions #19 only" })).toBeUndefined();
+  });
+
+  it("refuses a same-issue duplicate in own mode too", async () => {
+    const client = clientFor({
+      push: true,
+      openPullRequests: [
+        { number: 8, html_url: "https://github.test/pull/8", state: "open", head: { ref: "squasher/fix-5-abc", label: "upstream:squasher/fix-5-abc" } }
+      ]
+    });
+
+    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", issueNumber: 5, mode: "fork", allowlist });
+
+    expect(target.mode).toBe("own");
+    expect(target.writable).toBe(false);
+    expect(target.blockers?.[0]?.kind).toBe("duplicate");
+  });
+
+  it("applies an explicit repository-wide cap when one is set", async () => {
     const client = clientFor({
       push: false,
       openPullRequests: [
-        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42", label: "contributor:squasher/fix-42" } },
-        { number: 5, html_url: "https://github.test/pull/5", state: "open", head: { ref: "byter/fix-45", label: "contributor:byter/fix-45" } }
+        { number: 4, html_url: "https://github.test/pull/4", state: "open", head: { ref: "squasher/fix-42-a", label: "contributor:squasher/fix-42-a" } },
+        { number: 5, html_url: "https://github.test/pull/5", state: "open", head: { ref: "byter/fix-45-b", label: "contributor:byter/fix-45-b" } }
       ]
     });
 
@@ -293,13 +343,15 @@ describe("contribution target resolution", () => {
       client: client as never,
       owner: "upstream",
       repo: "project",
+      issueNumber: 50,
       mode: "fork",
       allowlist,
       maxOpenPullRequests: 2
     });
 
     // Counts both prefixes: a pre-rename pull request occupies a slot too.
-    expect(target.mode).toBe("triage");
+    expect(target.writable).toBe(false);
+    expect(target.blockers?.[0]?.kind).toBe("configuration");
     expect(target.reason).toContain("limit of 2");
     expect(client.forkRepository).not.toHaveBeenCalled();
   });
@@ -309,13 +361,14 @@ describe("contribution target resolution", () => {
       push: false,
       openPullRequests: [
         { number: 5, html_url: "https://github.test/pull/5", state: "open", head: { ref: "feature/x", label: "someone:feature/x" } },
-        { number: 6, html_url: "https://github.test/pull/6", state: "open", head: { ref: "squasher/fix-1", label: "otheruser:squasher/fix-1" } }
+        { number: 6, html_url: "https://github.test/pull/6", state: "open", head: { ref: "squasher/fix-1-a", label: "otheruser:squasher/fix-1-a" } }
       ]
     });
 
-    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "fork", allowlist });
+    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", issueNumber: 1, mode: "fork", allowlist });
 
     expect(target.mode).toBe("fork");
+    expect(target.writable).toBe(true);
   });
 
   it("does not read a pull request listing failure as an absence of duplicates", async () => {
@@ -323,46 +376,43 @@ describe("contribution target resolution", () => {
       listPullRequests: vi.fn().mockRejectedValue(new Error("GitHub API 502 Bad Gateway"))
     };
 
-    const scan = await scanOpenSquasherPullRequests(client as never, "upstream", "project", "contributor");
+    const scan = await scanOpenSquasherPullRequests(client as never, "upstream", "project", "contributor", 42);
 
     // Unknown, not zero: reporting zero here is the direction that duplicates.
     expect(scan.unreadable).toBe(true);
     expect(scan.urls).toEqual([]);
+    expect(scan.forIssue).toEqual([]);
   });
 
-  it("blocks on an unreadable listing however high the limit is", async () => {
+  it("blocks the write on an unreadable listing, since a duplicate cannot be ruled out", async () => {
     const client = clientFor({ push: false });
     client.listPullRequests = vi.fn().mockRejectedValue(new Error("GitHub API 502 Bad Gateway"));
 
-    const target = await resolveContributionTarget({
-      client: client as never,
-      owner: "upstream",
-      repo: "project",
-      mode: "fork",
-      allowlist,
-      maxOpenPullRequests: 10
-    });
+    const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", issueNumber: 42, mode: "fork", allowlist });
 
-    expect(target.mode).toBe("triage");
-    expect(target.reason).toContain("unknown");
+    expect(target.writable).toBe(false);
+    expect(target.reason).toContain("cannot be ruled out");
     expect(client.forkRepository).not.toHaveBeenCalled();
   });
 
-  it("refuses when forking is disabled on the upstream repository", async () => {
+  it("reports a failed fork as a capability problem", async () => {
     const client = clientFor({ push: false, forkFails: true });
 
     const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "fork", allowlist });
 
-    expect(target.mode).toBe("triage");
+    expect(target.writable).toBe(false);
+    expect(target.blockers?.[0]?.kind).toBe("capability");
     expect(target.reason).toContain("Fork could not be created");
+    expect(target.preflight?.forkCapable).toBe(false);
   });
 
-  it("falls back to triage when the upstream repository cannot be read", async () => {
+  it("refuses the write when the upstream repository cannot be read", async () => {
     const client = { getRepository: vi.fn().mockRejectedValue(notFound()) };
 
     const target = await resolveContributionTarget({ client: client as never, owner: "upstream", repo: "project", mode: "fork", allowlist });
 
-    expect(target.mode).toBe("triage");
+    expect(target.writable).toBe(false);
+    expect(target.blockers?.[0]?.kind).toBe("capability");
     expect(target.reason).toContain("could not be read");
   });
 
@@ -372,6 +422,7 @@ describe("contribution target resolution", () => {
     const target = await resolveContributionTarget({ client: {} as never, owner: "upstream", repo: "project", mode: "own", allowlist });
 
     expect(target.mode).toBe("own");
+    expect(target.writable).toBe(true);
     expect(target.upstreamPushAccess).toBe(true);
   });
 });

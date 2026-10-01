@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { approvalPayloadHash, type GitHubMcpWriteToolName } from "@squasher/github-mcp";
+import { approvalPayloadHash, repositoryEvidenceProblem, type GitHubMcpWriteToolName } from "@squasher/github-mcp";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { LlmRateLimitError, type LlmClient } from "./llm-client.js";
 import {
@@ -11,9 +11,18 @@ import {
 } from "./structured-output-guard.js";
 import { resultContractProblem } from "./issue-scope.js";
 import type { HarnessAgentMessage, SessionStore } from "./session-store.js";
-import type { ToolDispatcher } from "./tool-dispatcher.js";
+import { sandboxToolName, type ToolDispatcher } from "./tool-dispatcher.js";
 
-export const defaultIterationLimit = 64;
+/**
+ * Model round trips a turn may take before it is abandoned.
+ *
+ * The limit exists to stop a runaway loop, so it is deliberately finite. Raised from 64
+ * after a live run on a real repository exhausted it while making steady progress: 65 tool
+ * calls, none of them repeated, cut off while capturing its before/after proof. A run that
+ * repeats itself is caught long before this ceiling; a large repository that is genuinely
+ * being worked through needs more than 64 steps.
+ */
+export const defaultIterationLimit = 120;
 export const mainThreadId = "main";
 
 const guardedSchemas: Record<string, GuardSchema> = {
@@ -32,11 +41,19 @@ export interface WriteTargetDecision {
   /** Account that will hold the fix branch. Omit for a same-repository write. */
   headOwner?: string;
   reason?: string;
+  /**
+   * Whether the pull request must carry the automated-contribution disclosure even when it
+   * stays inside one repository, as when the repository's policy requires AI disclosure.
+   * A write that crosses a fork boundary is always disclosed.
+   */
+  disclose?: boolean;
 }
 
 export type WriteTargetResolver = (input: {
   owner: string;
   repo: string;
+  /** The reserved fix branch, which identifies the run when one repository has several. */
+  branchName?: string;
 }) => Promise<WriteTargetDecision> | WriteTargetDecision;
 
 export interface AgentLoopOptions {
@@ -48,6 +65,8 @@ export interface AgentLoopOptions {
   iterationLimit?: number;
   approvalRequiredTools?: string[];
   resolveWriteTarget?: WriteTargetResolver;
+  /** Reads a repository file's text at a ref; undefined when it does not exist there. */
+  readRepositoryFile?: (owner: string, repo: string, path: string, ref?: string) => Promise<string | undefined>;
 }
 
 /**
@@ -172,6 +191,12 @@ export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
           if (problem) {
             throw new GuardValidationError(toolCall.name, JSON.stringify(args).slice(0, 8 * 1024), problem);
           }
+          // Cited evidence must hold against the repository itself. Reported as a tool error
+          // rather than a guard failure: a discrepancy between a comment and the code is
+          // something to investigate and correct, not malformed output, and it must not end
+          // the turn after one retry.
+          const discrepancy = await evidenceDiscrepancy(options, args);
+          if (discrepancy) throw new Error(discrepancy);
         }
 
         const result = await dispatcher.callTool(toolCall.name, args);
@@ -223,7 +248,8 @@ export async function runAgentTurn(options: AgentLoopOptions): Promise<void> {
     store,
     sessionId,
     turnId,
-    `The agent loop reached its iteration limit of ${iterationLimit} without producing a final result`
+    `The agent loop reached its iteration limit of ${iterationLimit} without producing a final result. ` +
+      `Raise SQUASHER_ITERATION_LIMIT if the work was progressing rather than repeating itself.`
   );
 }
 
@@ -359,7 +385,8 @@ async function resolveWriteTargetFor(
 
   let decision: WriteTargetDecision;
   try {
-    decision = await options.resolveWriteTarget({ owner, repo });
+    const branchName = typeof args.branchName === "string" && args.branchName.length > 0 ? args.branchName : undefined;
+    decision = await options.resolveWriteTarget({ owner, repo, ...(branchName ? { branchName } : {}) });
   } catch (error) {
     return {
       allowed: false,
@@ -371,16 +398,22 @@ async function resolveWriteTargetFor(
     return { allowed: false, ...(decision.reason !== undefined ? { reason: decision.reason } : {}) };
   }
 
-  if (!decision.headOwner || decision.headOwner === owner) {
+  const crossRepository = Boolean(decision.headOwner && decision.headOwner !== owner);
+  if (!crossRepository && !decision.disclose) {
     return { allowed: true, arguments: args };
   }
 
-  // Crossing into someone else's repository, so disclosure is not left to the model.
-  // Added before the pause, which means the approver reads the exact body that will ship.
+  // Crossing into someone else's repository, or a repository whose policy requires it, so
+  // disclosure is not left to the model. Added before the pause, which means the approver
+  // reads the exact body that will ship.
   const body = typeof args.body === "string" ? args.body : "";
   return {
     allowed: true,
-    arguments: { ...args, headOwner: decision.headOwner, body: withContributionDisclosure(body) }
+    arguments: {
+      ...args,
+      ...(crossRepository ? { headOwner: decision.headOwner } : {}),
+      body: withContributionDisclosure(body)
+    }
   };
 }
 
@@ -477,6 +510,38 @@ function llmErrorMessage(error: unknown): string {
 }
 
 /** Empty text when the issue could not be read, which makes the scope check a no-op. */
+/**
+ * Checks what a result cites as repository evidence: excerpts against the files on the
+ * issue's base ref, commands against what this session actually ran. Skipped when the
+ * repository or a reader is unknown, since nothing could be checked.
+ */
+async function evidenceDiscrepancy(options: AgentLoopOptions, args: Record<string, unknown>): Promise<string | undefined> {
+  const repository = options.store.issue(options.sessionId)?.repository;
+  if (!repository || !options.readRepositoryFile) return undefined;
+  const read = options.readRepositoryFile;
+  return repositoryEvidenceProblem(
+    args,
+    (path) => read(repository.owner, repository.repo, path, repository.ref),
+    executedSandboxCommands(options.store, options.sessionId)
+  );
+}
+
+/** Every command this session sent to the sandbox. */
+function executedSandboxCommands(store: SessionStore, sessionId: string): string[] {
+  return store.listEvents(sessionId).flatMap(({ event }) => {
+    if (event.type !== "model.message" || !Array.isArray(event.toolCalls)) return [];
+    return (event.toolCalls as Array<{ function?: { name?: string; arguments?: string } }>).flatMap((call) => {
+      if (call.function?.name !== sandboxToolName || typeof call.function.arguments !== "string") return [];
+      try {
+        const parsed = JSON.parse(call.function.arguments) as { command?: unknown };
+        return typeof parsed.command === "string" ? [parsed.command] : [];
+      } catch {
+        return [];
+      }
+    });
+  });
+}
+
 function issueTextFor(store: SessionStore, sessionId: string): { title: string; body: string } {
   return store.issue(sessionId) ?? { title: "", body: "" };
 }

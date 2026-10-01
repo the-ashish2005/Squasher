@@ -345,25 +345,48 @@ describe("fork-based contribution", () => {
     }
   });
 
-  it("refuses the write and forks nothing when the repository is not allowlisted", async () => {
+  type OutcomeRecord = {
+    run: { id: string; status: string };
+    contribution: { mode: string; writable: boolean; reason: string; policyFindings?: Array<{ path: string; excerpt: string }> };
+    statuses: { implementation: { status: string }; contribution: { status: string; reason: string; action?: string } };
+    outcome: { kind: string; headline: string; gate: { title: string } };
+    trueForge: { status: string; error?: string; result: { status: string; candidatePatch: { hash: string; files: Array<{ path: string }> } } };
+  };
+
+  it("verifies and keeps the patch for a repository that is not allowlisted, and writes nothing", async () => {
+    // CASE B: the allowlist authorises the GitHub write only. It must not stop the work,
+    // and it must not turn the verified work into a failed run.
     process.env.SQUASHER_CONTRIBUTION_MODE = "fork";
     delete process.env.SQUASHER_UPSTREAM_ALLOWLIST;
     const github = foreignRepoGitHub();
 
-    const { latest, server } = await runIssue(github, "fork-run-3");
+    const { latest, baseUrl, server } = await runIssue(github, "fork-run-3");
     try {
-      const record = latest as unknown as {
-        run: { status: string };
-        contribution: { mode: string; reason: string };
-      };
+      const record = latest as unknown as OutcomeRecord;
 
-      expect(record.contribution.mode).toBe("triage");
+      expect(record.contribution.mode).toBe("fork");
+      expect(record.contribution.writable).toBe(false);
       expect(record.contribution.reason).toContain("SQUASHER_UPSTREAM_ALLOWLIST");
+
+      // Engineering: complete and verified, not failed.
+      expect(record.run.status).toBe("patch-ready");
+      expect(record.trueForge.error).toBeUndefined();
+      expect(record.statuses.implementation.status).toBe("verified");
+      expect(record.trueForge.result.candidatePatch.files[0]?.path).toBe("src/paths.ts");
+
+      // Contribution: blocked, with the exact reason and what to do about it.
+      expect(record.statuses.contribution.status).toBe("blocked");
+      expect(record.statuses.contribution.reason).toContain("SQUASHER_UPSTREAM_ALLOWLIST");
+      expect(record.statuses.contribution.action).toContain("Add upstream/project to SQUASHER_UPSTREAM_ALLOWLIST");
+      expect(record.outcome.headline).toBe("Implementation verified. Pull request was not created.");
+      expect(record.outcome.gate.title).toBe("Pull request not created");
+
+      // Nothing written, nothing forked, and no approval can force a write.
       expect(github.client.forkRepository).not.toHaveBeenCalled();
       expect(github.client.createBranch).not.toHaveBeenCalled();
-
-      // No approval checkpoint exists, so the patch can never be written from the dashboard.
-      expect(record.run.status).not.toBe("awaiting-approval");
+      const approval = await approve(baseUrl, record.run, record.trueForge.result.candidatePatch.hash);
+      expect(approval.status).toBe(409);
+      expect(github.client.createPullRequest).not.toHaveBeenCalled();
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
     }
@@ -378,13 +401,17 @@ describe("fork-based contribution", () => {
 
     const { latest, server } = await runIssue(github, "fork-run-4");
     try {
-      const record = latest as unknown as {
-        contribution: { mode: string; policyFindings?: Array<{ path: string; excerpt: string }> };
-      };
+      const record = latest as unknown as OutcomeRecord;
 
-      expect(record.contribution.mode).toBe("triage");
+      // CASE D: the project's refusal is respected -- nothing forked, nothing written --
+      // and the verified work is still reported as verified.
+      expect(record.contribution.writable).toBe(false);
       expect(record.contribution.policyFindings?.[0]?.path).toBe("CONTRIBUTING.md");
       expect(github.client.forkRepository).not.toHaveBeenCalled();
+      expect(record.run.status).toBe("patch-ready");
+      expect(record.statuses.implementation.status).toBe("verified");
+      expect(record.statuses.contribution.status).toBe("blocked");
+      expect(record.statuses.contribution.reason).toContain("refuse automated contributions");
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
     }
@@ -422,18 +449,46 @@ describe("fork-based contribution", () => {
     }
   });
 
-  it("stays in triage for a foreign repository when fork mode is not enabled", async () => {
+  it("contributes through a fork by default when no mode is configured", async () => {
     delete process.env.SQUASHER_CONTRIBUTION_MODE;
     process.env.SQUASHER_UPSTREAM_ALLOWLIST = upstream.fullName;
     const github = foreignRepoGitHub();
 
     const { latest, server } = await runIssue(github, "fork-run-5");
     try {
-      const record = latest as unknown as { contribution: { mode: string; reason: string } };
+      const record = latest as unknown as OutcomeRecord;
+
+      expect(record.contribution.mode).toBe("fork");
+      expect(record.contribution.writable).toBe(true);
+      expect(record.run.status).toBe("awaiting-approval");
+      expect(record.statuses.contribution.status).toBe("awaiting_approval");
+      // The fork exists in the user's account; nothing is written upstream before approval.
+      expect(github.client.forkRepository).toHaveBeenCalled();
+      expect(github.client.createPullRequest).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+
+  it("verifies the patch in an explicitly selected triage mode and submits nothing", async () => {
+    // CASE C: triage means "do not submit", not "do not work".
+    process.env.SQUASHER_CONTRIBUTION_MODE = "triage";
+    process.env.SQUASHER_UPSTREAM_ALLOWLIST = upstream.fullName;
+    const github = foreignRepoGitHub();
+
+    const { latest, server } = await runIssue(github, "fork-run-7");
+    try {
+      const record = latest as unknown as OutcomeRecord;
 
       expect(record.contribution.mode).toBe("triage");
-      expect(record.contribution.reason).toContain("set it to fork");
+      expect(record.run.status).toBe("patch-ready");
+      expect(record.statuses.implementation.status).toBe("verified");
+      expect(record.statuses.contribution.status).toBe("blocked");
+      expect(record.statuses.contribution.reason).toContain("triage");
+      expect(record.trueForge.result.candidatePatch.files).toHaveLength(1);
       expect(github.client.forkRepository).not.toHaveBeenCalled();
+      expect(github.client.createBranch).not.toHaveBeenCalled();
+      expect(github.client.createPullRequest).not.toHaveBeenCalled();
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
     }

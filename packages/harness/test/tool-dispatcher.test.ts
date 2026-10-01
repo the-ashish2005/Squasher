@@ -59,6 +59,7 @@ describe("tool dispatcher", () => {
     expect(names).toEqual([
       "read_issue",
       "read_file",
+      "read_repository_instructions",
       "submit_squasher_result",
       "create_fix_pull_request",
       sandboxToolName

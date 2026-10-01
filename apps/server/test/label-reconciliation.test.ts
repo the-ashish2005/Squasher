@@ -272,20 +272,11 @@ describe("Squasher label reconciliation", () => {
     expect(github.labels.has("squasher:awaiting-approval")).toBe(false);
   }, 30_000);
 
-  it("never labels a refused patch as verified", async () => {
-    // hasGenuineProof is satisfied by the proof text alone, so the run status has to gate
-    // the claim: this result is well formed but arrives with no approval checkpoint.
+  async function runWithoutCheckpoint(delivery: string, responses: LlmResponse[]) {
     const github = labelTrackingGitHub();
-    const llm = scriptedLlm([
-      toolCallResponse([
-        { id: "c1", name: "run_command", arguments: { command: "node --experimental-strip-types repro.ts" } }
-      ]),
-      toolCallResponse([{ id: "c2", name: "submit_squasher_result", arguments: provenResult }]),
-      // Ends without ever requesting the gated write, so no approval checkpoint exists.
-      textResponse(JSON.stringify(provenResult))
-    ]);
+    const llm = scriptedLlm(responses);
     const harness = new SquasherHarness({ client: github.client as never, llm, sandbox: fakeSandbox() });
-    const dataDir = await mkdtemp(join(tmpdir(), "squasher-label-d-"));
+    const dataDir = await mkdtemp(join(tmpdir(), `squasher-label-${delivery}-`));
     const server = createSquasherServer({
       staticDir,
       dataDir,
@@ -294,7 +285,7 @@ describe("Squasher label reconciliation", () => {
     });
     await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
     const { port } = server.address() as AddressInfo;
-    const body = payloadFor("label-run-4");
+    const body = payloadFor(delivery);
 
     try {
       await fetch(`http://127.0.0.1:${port}/api/github/webhook`, {
@@ -302,7 +293,7 @@ describe("Squasher label reconciliation", () => {
         headers: {
           "Content-Type": "application/json",
           "X-GitHub-Event": "issues",
-          "X-GitHub-Delivery": "label-run-4",
+          "X-GitHub-Delivery": delivery,
           "X-Hub-Signature-256": signWebhookPayload(body, "webhook-secret")
         },
         body
@@ -313,10 +304,43 @@ describe("Squasher label reconciliation", () => {
         if (["paused", "completed", "failed"].includes(latest?.trueForge?.status)) break;
         await new Promise((wait) => setTimeout(wait, 20));
       }
-      expect(latest.run.status).toBe("failed");
-      expect(github.labels.has("squasher:verified")).toBe(false);
+      return { latest, github };
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
     }
+  }
+
+  it("labels a verified patch verified even when no write was requested, but never awaiting approval", async () => {
+    // A verified patch with no approval checkpoint used to be failed outright. It is verified
+    // work whose contribution never started, so the verified claim holds and the approval
+    // claim must not appear.
+    const { latest, github } = await runWithoutCheckpoint("label-run-4", [
+      toolCallResponse([
+        { id: "c1", name: "run_command", arguments: { command: "node --experimental-strip-types repro.ts" } }
+      ]),
+      toolCallResponse([{ id: "c2", name: "submit_squasher_result", arguments: provenResult }]),
+      // Ends without ever requesting the gated write, so no approval checkpoint exists.
+      textResponse(JSON.stringify(provenResult))
+    ]);
+
+    expect(latest.run.status).toBe("patch-ready");
+    expect(latest.statuses.implementation.status).toBe("verified");
+    expect(latest.statuses.contribution.status).toBe("blocked");
+    expect(github.labels.has("squasher:verified")).toBe(true);
+    expect(github.labels.has("squasher:awaiting-approval")).toBe(false);
+  });
+
+  it("never labels proof that was not executed as verified", async () => {
+    // hasGenuineProof is satisfied by the proof text alone; the trace has to show a command
+    // that actually ran. With none, the patch is implemented but not verified.
+    const { latest, github } = await runWithoutCheckpoint("label-run-5", [
+      toolCallResponse([{ id: "c1", name: "submit_squasher_result", arguments: provenResult }]),
+      textResponse(JSON.stringify(provenResult))
+    ]);
+
+    expect(latest.run.status).toBe("failed");
+    expect(latest.statuses.implementation.status).toBe("implemented");
+    expect(latest.statuses.contribution.status).toBe("unavailable");
+    expect(github.labels.has("squasher:verified")).toBe(false);
   }, 30_000);
 });

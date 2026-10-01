@@ -43,6 +43,8 @@ export interface HarnessAgentMessage {
 export interface HarnessIssueText {
   title: string;
   body: string;
+  /** Where the issue's code lives, so cited evidence can be checked against it. */
+  repository?: { owner: string; repo: string; ref?: string };
 }
 
 export interface HarnessSessionSpec {

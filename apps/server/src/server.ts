@@ -8,6 +8,8 @@ import { SquasherTrueForgeRuntime } from "@squasher/agent";
 import {
   approvalPayloadHash,
   bugProofStatuses,
+  formatIssueDiscussion,
+  selectIssueDiscussion,
   squasherResultStatuses,
   createGitHubMcpHttpHandler,
   implementationStatuses,
@@ -23,11 +25,21 @@ import type {
   TrueForgeRuntimeEventListener,
   TrueForgeRuntimeEvent
 } from "@squasher/agent";
-import { SquasherHarness, defaultLlmModel, type WriteTargetDecision } from "@squasher/harness";
+import { LlmClient, SquasherHarness, defaultLlmModel, type WriteTargetDecision } from "@squasher/harness";
 import {
+  configuredContributionMode,
+  isContributionWritable,
   resolveContributionTarget,
   type ContributionTarget
 } from "./contribution.js";
+import {
+  contributionStatusLabels,
+  deriveRunStatuses,
+  implementationStatusLabels,
+  type ContributionIssue,
+  type PullRequestState,
+  type RunStatuses
+} from "./run-status.js";
 import { brandedEnv } from "./env.js";
 import { canTransition, createRun, scanIssueText, transitionRun } from "@squasher/core";
 import {
@@ -38,6 +50,9 @@ import {
 } from "@squasher/github";
 
 import { PostgresStore } from "./db.js";
+import { buildRunOutcome, type RunOutcomeInput } from "./run-outcome.js";
+import { summarizePolicy } from "./policy-summary.js";
+import { askAboutRun, readChangeRequests, recordChangeRequest, WorkspaceInputError, type AskModel } from "./workspace.js";
 
 type ApprovalActionId = "approve-pr" | "request-diff" | "reject-run";
 type GitHubCommentKind = "started" | "completed" | "failed" | "approval";
@@ -48,6 +63,39 @@ const maxPatchFiles = 40;
 const maxPatchFileBytes = 512 * 1024;
 const maxPatchTotalBytes = 2 * 1024 * 1024;
 const maxHarnessEvents = 120;
+const maxResultFindings = 8;
+
+interface RecordedEvidence {
+  codeEvidence?: Array<{ path: string; excerpt: string }>;
+  executedCommand?: string;
+}
+
+interface RecordedRequirement extends RecordedEvidence {
+  requirement: string;
+  verdict: string;
+  evidence?: string;
+  ownership?: { status: string; by: string; basis?: string };
+}
+
+interface RecordedClaim extends RecordedEvidence {
+  claim: string;
+  verdict: string;
+  evidence: string;
+}
+
+function recordedEvidence(entry: Record<string, unknown>): RecordedEvidence {
+  const codeEvidence = Array.isArray(entry.codeEvidence)
+    ? entry.codeEvidence
+        .filter((cited): cited is Record<string, unknown> => isRecord(cited) && typeof cited.path === "string" && typeof cited.excerpt === "string")
+        .slice(0, 6)
+        .map((cited) => ({ path: clampText(String(cited.path), 300), excerpt: clampText(String(cited.excerpt), 600) }))
+    : [];
+  return {
+    ...(codeEvidence.length ? { codeEvidence } : {}),
+    ...(typeof entry.executedCommand === "string" && entry.executedCommand.trim() ? { executedCommand: clampText(entry.executedCommand.trim(), 400) } : {})
+  };
+}
+const maxResultRequirements = 20;
 /**
  * Silence that marks an event stream as hung. Generous on purpose: the gap between events
  * is one model round trip plus one tool call, and bootstrapping a toolchain in the sandbox
@@ -71,6 +119,8 @@ export interface SquasherServerOptions {
    * because the approval path refuses a write the decision does not cover.
    */
   contributions?: ContributionRegistry;
+  /** Answers workspace questions. Defaults to the configured model when one is set. */
+  askModel?: AskModel;
 }
 
 type McpRequestHandler = (request: IncomingMessage, response: ServerResponse) => Promise<void>;
@@ -101,9 +151,34 @@ interface LiveProofResult {
   status: SquasherResultStatus;
   summary: string;
   rootCauseSummary?: string;
+  /**
+   * Whether the agent itself supplied rootCauseSummary. When it did not, that field holds the
+   * summary's opening sentences, which must not be presented as an established root cause.
+   */
+  rootCauseReported?: boolean;
   proposedFixSummary?: string;
+  /** The agent's recommendation for the maintainer, when it made one. */
+  nextStep?: string;
+  /** Short factual statements of what the agent checked and observed. */
+  findings?: string[];
+  /** Acceptance criteria and the verdict on each against the final code. */
+  requirements?: RecordedRequirement[];
+  /** Claims from the issue or its discussion, and what the repository showed. */
+  discussionClaims?: RecordedClaim[];
+  /** The agent's explanation of each changed file, and the requirements it serves. */
+  fileChanges?: Array<{ path: string; summary: string; requirements?: string[] }>;
+  /**
+   * Whether the evidence held when the run completed: proof text, 3/3 count, an executed
+   * command in the trace, and no failed requirement. Absent on records from before it was
+   * recorded, which are judged by their proof text alone.
+   */
+  proofVerified?: boolean;
   baseSha?: string;
-  patchDiff?: Array<{ path: string; before: string; after: string }>;
+  /**
+   * Each changed file against the base. `change` is "added" when the file does not exist on
+   * the base branch; records from before it existed hold only files that could be read.
+   */
+  patchDiff?: Array<{ path: string; before: string; after: string; change?: "added" | "modified" }>;
   proof?: {
     before?: string;
     after?: string;
@@ -152,6 +227,8 @@ interface PersistedWebhookRunRecord {
   baseBranch: string;
   issueTitle: string;
   issueBody: string;
+  /** The issue's comment thread as the agent saw it at intake, bounded; public GitHub data. */
+  issueDiscussion?: string;
   dashboardUrl?: string;
   githubStatusComment?: { id?: number; url: string };
   githubComments?: Array<{ id?: number; url: string; kind: GitHubCommentKind; createdAt: string }>;
@@ -159,6 +236,13 @@ interface PersistedWebhookRunRecord {
   approvalLabel?: { name: "squasher:awaiting-approval"; appliedAt?: string; error?: string };
   lifecycleLabels?: Array<{ name: string; appliedAt?: string; error?: string }>;
   contribution?: ContributionTarget;
+  /** A contribution problem after the preflight, such as a write that failed or was lost. */
+  contributionIssue?: ContributionIssue;
+  pullRequestState?: PullRequestState;
+  /** Stamped on every write from deriveRunStatuses; see run-status.ts. */
+  implementationStatus?: RunStatuses["implementation"]["status"];
+  contributionStatus?: RunStatuses["contribution"]["status"];
+  contributionReason?: string;
   run: ReturnType<typeof createRun>;
   scan: ReturnType<typeof scanIssueText>;
   trueForge: {
@@ -191,6 +275,7 @@ export function createSquasherServer(options: SquasherServerOptions = {}): Serve
   const trueForgeRuntime = options.trueForgeRuntime ?? trueForgeRuntimeFromEnv(githubClient, contributions);
   const mcpHandler = options.mcpHandler ?? githubMcpHandlerFromEnv(githubClient);
   const activeIssueTriggers = new Set<string>();
+  const askModel = options.askModel ?? askModelFromEnv();
 
   return createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
@@ -202,12 +287,26 @@ export function createSquasherServer(options: SquasherServerOptions = {}): Serve
       }
 
       if (url.pathname === "/api/runs/latest") {
-        await handleLatestRun(request, response, dataDir ? resolve(dataDir) : undefined, trueForgeRuntime, postgresStore);
+        await handleLatestRun(request, response, dataDir ? resolve(dataDir) : undefined, trueForgeRuntime, postgresStore, githubClient);
+        return;
+      }
+
+      const workspaceRoute = /^\/api\/runs\/(.+)\/(ask|change-requests)$/.exec(url.pathname);
+      if (workspaceRoute) {
+        await handleWorkspaceRequest(
+          request,
+          response,
+          dataDir ? resolve(dataDir) : undefined,
+          decodeRunId(`/api/runs/${workspaceRoute[1]}`),
+          workspaceRoute[2] as "ask" | "change-requests",
+          askModel,
+          postgresStore
+        );
         return;
       }
 
       if (url.pathname.startsWith("/api/runs/") && url.pathname !== "/api/runs/latest") {
-        await handleRun(request, response, dataDir ? resolve(dataDir) : undefined, decodeRunId(url.pathname), trueForgeRuntime, postgresStore);
+        await handleRun(request, response, dataDir ? resolve(dataDir) : undefined, decodeRunId(url.pathname), trueForgeRuntime, postgresStore, githubClient);
         return;
       }
 
@@ -405,15 +504,29 @@ async function processIssueWebhook(
     );
     // Resolved before the agent starts, because the agent can reach the gated write at any
     // point after that and the harness reads this decision when it pauses.
+    // It decides only how the finished work is submitted, never whether it is done.
+    const branchName = branchNameForIssue(webhook.issue.number, deliveryId);
     const contribution = await resolveContributionForRun(
       contributions,
       githubClient,
       webhook.repository.owner.login,
       webhook.repository.name,
+      webhook.issue.number,
+      branchName,
       scan.safeToExecute
     );
+    const issueDiscussion = scan.safeToExecute
+      ? await readIssueDiscussion(githubClient, webhook.repository.owner.login, webhook.repository.name, webhook.issue.number)
+      : undefined;
 
-    const orchestration = await startTrueForgeSessionForIssue(run, webhook, deliveryId, scan.safeToExecute, trueForgeRuntime);
+    const orchestration = await startTrueForgeSessionForIssue(
+      run,
+      webhook,
+      deliveryId,
+      scan.safeToExecute,
+      trueForgeRuntime,
+      issueDiscussion
+    );
     run = orchestration.run;
 
     const record: PersistedWebhookRunRecord = {
@@ -423,6 +536,7 @@ async function processIssueWebhook(
       baseBranch: webhook.repository.default_branch,
       issueTitle: webhook.issue.title,
       issueBody: webhook.issue.body ?? "",
+      ...(issueDiscussion !== undefined ? { issueDiscussion } : {}),
       dashboardUrl: dashboardUrlFor(run.id),
       contribution,
       run,
@@ -430,7 +544,7 @@ async function processIssueWebhook(
       trueForge: orchestration.trueForge
     };
     const labeledRecord = await syncLifecycleLabels(record, githubClient);
-    const commentRecord = await appendGitHubComment(labeledRecord, githubClient, "started");
+    const commentRecord = withRunStatuses(await appendGitHubComment(labeledRecord, githubClient, "started"));
 
     if (postgresStore) {
       await postgresStore.saveWebhookRun(commentRecord).catch((err) => {
@@ -581,7 +695,8 @@ async function handleLatestRun(
   response: ServerResponse,
   dataDir: string | undefined,
   trueForgeRuntime: SquasherSessionStarter | undefined,
-  postgresStore?: PostgresStore
+  postgresStore?: PostgresStore,
+  githubClient?: GitHubRestClientLike
 ): Promise<void> {
   if (request.method !== "GET") {
     sendJson(response, 405, { error: "Method not allowed" });
@@ -606,7 +721,94 @@ async function handleLatestRun(
   }
 
   const refreshed = await refreshLegacyHarnessTrace(dataDir, latest, trueForgeRuntime);
-  sendJson(response, 200, publicRunPayload(hydratePersistedPullRequest(ensureDashboardUrl(refreshed))));
+  const tracked = await refreshPullRequestState(dataDir, hydratePersistedPullRequest(ensureDashboardUrl(refreshed)), githubClient, postgresStore);
+  sendJson(response, 200, await withChangeRequests(dataDir, publicRunPayload(tracked)));
+}
+
+/** Adds the run's recorded change requests to a public payload. */
+async function withChangeRequests(dataDir: string | undefined, payload: unknown): Promise<unknown> {
+  if (!isRecord(payload) || !isRecord(payload.run) || typeof payload.run.id !== "string") return payload;
+  const changeRequests = await readChangeRequests(dataDir, payload.run.id);
+  return {
+    ...payload,
+    changeRequests: changeRequests.map((entry) => ({ ...entry, text: safePublicMarkdown(entry.text) }))
+  };
+}
+
+/**
+ * The Contribution Workspace endpoints. Both need the maintainer token: a question spends
+ * model time, and a change request is recorded against the run. Both read the run only
+ * through its public payload.
+ */
+async function handleWorkspaceRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  dataDir: string | undefined,
+  runId: string,
+  action: "ask" | "change-requests",
+  askModel: AskModel | undefined,
+  postgresStore?: PostgresStore
+): Promise<void> {
+  if (request.method !== "POST") {
+    sendJson(response, 405, { error: "Method not allowed" });
+    return;
+  }
+  const approvalToken = process.env.APPROVAL_TOKEN;
+  if (!approvalToken) {
+    sendJson(response, 503, { error: "APPROVAL_TOKEN is not configured" });
+    return;
+  }
+  if (bearerToken(request) !== approvalToken) {
+    sendJson(response, 401, { error: "Maintainer authentication required" });
+    return;
+  }
+
+  const record = await findPersistedRunById(dataDir, runId, postgresStore);
+  if (!record) {
+    sendJson(response, 404, { error: "Persisted run not found" });
+    return;
+  }
+  const payload = await readJson(request);
+
+  try {
+    if (action === "change-requests") {
+      if (!dataDir) {
+        sendJson(response, 503, { error: "Change requests need local storage (DATA_DIR); they are not stored in PostgreSQL yet" });
+        return;
+      }
+      const recorded = await recordChangeRequest(dataDir, {
+        runId,
+        text: payload.text,
+        ...(record.trueForge.result?.candidatePatch?.hash ? { patchHash: record.trueForge.result.candidatePatch.hash } : {})
+      });
+      sendJson(response, 201, { ...recorded, text: safePublicMarkdown(recorded.text) });
+      return;
+    }
+
+    if (!askModel) {
+      sendJson(response, 503, { error: "Ask Squasher is not configured: no model is available (set DEEPSEEK_API_KEY)" });
+      return;
+    }
+    const publicRun = publicRunPayload(hydratePersistedPullRequest(ensureDashboardUrl(record)));
+    const answer = await askAboutRun(askModel, isRecord(publicRun) ? publicRun : {}, payload.question);
+    sendJson(response, 200, { ...answer, answer: safePublicMarkdown(answer.answer) });
+  } catch (error) {
+    if (error instanceof WorkspaceInputError) {
+      sendJson(response, 400, { error: error.message });
+      return;
+    }
+    sendJson(response, 502, { error: error instanceof Error ? error.message : "The model did not answer" });
+  }
+}
+
+function askModelFromEnv(): AskModel | undefined {
+  if (!process.env.DEEPSEEK_API_KEY) return undefined;
+  try {
+    const client = LlmClient.fromEnv();
+    return { complete: (messages) => client.complete(messages, []) };
+  } catch {
+    return undefined;
+  }
 }
 
 async function handleRun(
@@ -615,7 +817,8 @@ async function handleRun(
   dataDir: string | undefined,
   runId: string,
   trueForgeRuntime: SquasherSessionStarter | undefined,
-  postgresStore?: PostgresStore
+  postgresStore?: PostgresStore,
+  githubClient?: GitHubRestClientLike
 ): Promise<void> {
   if (request.method !== "GET") {
     sendJson(response, 405, { error: "Method not allowed" });
@@ -629,7 +832,60 @@ async function handleRun(
   }
 
   const refreshed = await refreshLegacyHarnessTrace(dataDir, record, trueForgeRuntime);
-  sendJson(response, 200, publicRunPayload(hydratePersistedPullRequest(ensureDashboardUrl(refreshed))));
+  const tracked = await refreshPullRequestState(dataDir, hydratePersistedPullRequest(ensureDashboardUrl(refreshed)), githubClient, postgresStore);
+  sendJson(response, 200, await withChangeRequests(dataDir, publicRunPayload(tracked)));
+}
+
+/** How long a pull request's observed state is trusted before it is read again. */
+const pullRequestStateTtlMs = process.env.NODE_ENV === "test" ? 0 : 5 * 60_000;
+
+/**
+ * Follows a submitted pull request after it is opened. Creating it is not merging it, so
+ * the contribution status reads GitHub's state rather than assuming: open, reviewed with
+ * changes requested or approved, merged, or closed. Read at most every few minutes, only
+ * while the pull request can still change, and a read failure leaves the last known state.
+ */
+async function refreshPullRequestState(
+  dataDir: string | undefined,
+  value: unknown,
+  githubClient: GitHubRestClientLike | undefined,
+  postgresStore?: PostgresStore
+): Promise<unknown> {
+  if (!githubClient?.getPullRequest || !isRecord(value) || !hasRecordShape(value)) return value;
+  const record = value as PersistedWebhookRunRecord;
+  const pullRequest = record.trueForge.result?.pullRequest;
+  if (!pullRequest) return value;
+
+  const previous = record.pullRequestState;
+  if (previous && (previous.state !== "open" || Date.now() - Date.parse(previous.checkedAt) < pullRequestStateTtlMs)) {
+    return value;
+  }
+
+  const { owner, repo } = record.run.issue;
+  let state: PullRequestState;
+  try {
+    const detail = await githubClient.getPullRequest(owner, repo, pullRequest.number);
+    const merged = detail.merged === true || Boolean(detail.merged_at);
+    state = {
+      state: merged ? "merged" : detail.state === "closed" ? "closed" : "open",
+      checkedAt: new Date().toISOString()
+    };
+    if (state.state === "open" && githubClient.listPullRequestReviews) {
+      const decisive = (await githubClient.listPullRequestReviews(owner, repo, pullRequest.number)).filter(
+        (review) => review.state === "APPROVED" || review.state === "CHANGES_REQUESTED"
+      );
+      const latest = decisive.at(-1);
+      if (latest) state.reviewDecision = latest.state === "APPROVED" ? "approved" : "changes_requested";
+    }
+  } catch {
+    return value;
+  }
+
+  // Saved even when nothing changed: the check time is what keeps the dashboard's
+  // five-second poll from reading GitHub on every request once the window has passed.
+  const updated: PersistedWebhookRunRecord = { ...record, pullRequestState: state };
+  await appendUpdatedLiveRecord(dataDir, updated, postgresStore);
+  return updated;
 }
 
 function publicRunPayload(value: unknown): unknown {
@@ -656,6 +912,62 @@ function publicRunPayload(value: unknown): unknown {
         ...(typeof trueForge.result.summary === "string" ? { summary: safePublicMarkdown(trueForge.result.summary) } : {}),
         ...(typeof trueForge.result.rootCauseSummary === "string" ? { rootCauseSummary: safePublicMarkdown(trueForge.result.rootCauseSummary) } : {}),
         ...(typeof trueForge.result.proposedFixSummary === "string" ? { proposedFixSummary: safePublicMarkdown(trueForge.result.proposedFixSummary) } : {}),
+        ...(typeof trueForge.result.nextStep === "string" ? { nextStep: safePublicMarkdown(trueForge.result.nextStep) } : {}),
+        ...(Array.isArray(trueForge.result.findings)
+          ? { findings: trueForge.result.findings.filter((finding): finding is string => typeof finding === "string").map(safePublicMarkdown) }
+          : {}),
+        ...(Array.isArray(trueForge.result.requirements)
+          ? {
+              requirements: trueForge.result.requirements.flatMap((entry) =>
+                isRecord(entry) && typeof entry.requirement === "string" && typeof entry.verdict === "string"
+                  ? [
+                      {
+                        requirement: safePublicMarkdown(entry.requirement),
+                        verdict: entry.verdict,
+                        ...(typeof entry.evidence === "string" ? { evidence: safePublicMarkdown(entry.evidence) } : {}),
+                        ...publicEvidence(entry),
+                        ...(isRecord(entry.ownership) && typeof entry.ownership.status === "string" && typeof entry.ownership.by === "string"
+                          ? { ownership: { status: entry.ownership.status, by: safePublicMarkdown(entry.ownership.by) } }
+                          : {})
+                      }
+                    ]
+                  : []
+              )
+            }
+          : {}),
+        ...(Array.isArray(trueForge.result.fileChanges)
+          ? {
+              fileChanges: trueForge.result.fileChanges.flatMap((entry) =>
+                isRecord(entry) && typeof entry.path === "string" && typeof entry.summary === "string"
+                  ? [
+                      {
+                        path: safePublicMarkdown(entry.path),
+                        summary: safePublicMarkdown(entry.summary),
+                        ...(Array.isArray(entry.requirements)
+                          ? { requirements: entry.requirements.filter((text): text is string => typeof text === "string").map(safePublicMarkdown) }
+                          : {})
+                      }
+                    ]
+                  : []
+              )
+            }
+          : {}),
+        ...(Array.isArray(trueForge.result.discussionClaims)
+          ? {
+              discussionClaims: trueForge.result.discussionClaims.flatMap((entry) =>
+                isRecord(entry) && typeof entry.claim === "string" && typeof entry.verdict === "string" && typeof entry.evidence === "string"
+                  ? [
+                      {
+                        claim: safePublicMarkdown(entry.claim),
+                        verdict: entry.verdict,
+                        evidence: safePublicMarkdown(entry.evidence),
+                        ...publicEvidence(entry)
+                      }
+                    ]
+                  : []
+              )
+            }
+          : {}),
         ...(isRecord(trueForge.result.proof)
           ? {
               proof: Object.fromEntries(
@@ -708,16 +1020,222 @@ function publicRunPayload(value: unknown): unknown {
       : label)
     : value.lifecycleLabels;
 
+  // Derived from the private record, which still holds the approval checkpoint; the result
+  // carries no private data, and every text in it is ours or already public.
+  const statuses = hasRecordShape(value) ? runStatusesFor(value) : undefined;
+  const publicStatuses = statuses
+    ? {
+        implementation: {
+          ...statuses.implementation,
+          reason: safePublicMarkdown(statuses.implementation.reason),
+          label: implementationStatusLabels[statuses.implementation.status]
+        },
+        contribution: {
+          ...statuses.contribution,
+          reason: safePublicMarkdown(statuses.contribution.reason),
+          ...(statuses.contribution.action ? { action: safePublicMarkdown(statuses.contribution.action) } : {}),
+          label: contributionStatusLabels[statuses.contribution.status]
+        }
+      }
+    : undefined;
+
   return {
     ...value,
     ...(typeof value.issueTitle === "string" ? { issueTitle: safePublicMarkdown(value.issueTitle) } : {}),
     ...(typeof value.issueBody === "string" ? { issueBody: safePublicMarkdown(value.issueBody) } : {}),
+    ...(typeof value.issueDiscussion === "string" ? { issueDiscussion: safePublicMarkdown(value.issueDiscussion) } : {}),
+    policy: summarizePolicy(isRecord(value.contribution) ? (value.contribution as unknown as ContributionTarget) : undefined),
     run: publicRun,
     trueForge: { ...trueForge, result, events },
+    ...(publicStatuses
+      ? {
+          statuses: publicStatuses,
+          implementationStatus: publicStatuses.implementation.status,
+          contributionStatus: publicStatuses.contribution.status,
+          contributionReason: publicStatuses.contribution.reason
+        }
+      : {}),
+    outcome: buildRunOutcome({
+      ...runOutcomeInput(value, publicRun, result, events, Boolean(value.trueForge.pendingApproval)),
+      ...(publicStatuses ? { statuses: publicStatuses } : {})
+    }),
     verifiedLabel: normalizeLabel(value.verifiedLabel, "squasher:verified"),
     approvalLabel: normalizeLabel(value.approvalLabel, "squasher:awaiting-approval"),
     lifecycleLabels
   };
+}
+
+/**
+ * Collects what the run outcome is derived from. Text is taken from the already-sanitized
+ * public copies; only the pending-approval flag and the root-cause provenance come from the
+ * private record, and neither carries text of its own.
+ */
+function runOutcomeInput(
+  value: Record<string, unknown>,
+  publicRun: unknown,
+  publicResult: unknown,
+  publicEvents: unknown,
+  pendingApproval: boolean
+): RunOutcomeInput {
+  const run = isRecord(publicRun) ? publicRun : {};
+  const issue = isRecord(run.issue) ? run.issue : {};
+  const harness = isRecord(value.trueForge) ? value.trueForge : {};
+  const scan = isRecord(value.scan) ? value.scan : {};
+  const contribution = isRecord(value.contribution) ? value.contribution : undefined;
+  const privateResult = isRecord(harness.result) ? harness.result : undefined;
+  const result = isRecord(publicResult) ? publicResult : undefined;
+  const proof = result && isRecord(result.proof) ? result.proof : undefined;
+  const patch = result && isRecord(result.candidatePatch) ? result.candidatePatch : undefined;
+  const text = (field: unknown) => (typeof field === "string" && field.trim() ? field : undefined);
+
+  return {
+    runStatus: typeof run.status === "string" ? run.status : "received",
+    runEvents: Array.isArray(run.events)
+      ? run.events.flatMap((event) =>
+          isRecord(event) && typeof event.status === "string" && typeof event.message === "string"
+            ? [{ status: event.status, message: event.message }]
+            : []
+        )
+      : [],
+    harness: {
+      status: typeof harness.status === "string" ? harness.status : "unknown",
+      ...(text(harness.error) ? { error: safePublicMarkdown(harness.error as string) } : {}),
+      ...(text(harness.reason) ? { reason: safePublicMarkdown(harness.reason as string) } : {})
+    },
+    pendingApproval,
+    scan: {
+      safeToExecute: scan.safeToExecute !== false,
+      findingCount: Array.isArray(scan.findings) ? scan.findings.length : 0
+    },
+    repository: {
+      owner: typeof issue.owner === "string" ? issue.owner : "",
+      repo: typeof issue.repo === "string" ? issue.repo : "",
+      issueNumber: typeof issue.issueNumber === "number" ? issue.issueNumber : 0
+    },
+    ...(contribution && typeof contribution.mode === "string"
+      ? {
+          contribution: {
+            mode: contribution.mode,
+            ...(typeof contribution.writable === "boolean" ? { writable: contribution.writable } : {}),
+            ...(typeof contribution.headOwner === "string" ? { headOwner: contribution.headOwner } : {}),
+            ...(text(contribution.reason) ? { reason: safePublicMarkdown(contribution.reason as string) } : {}),
+            ...(Array.isArray(contribution.policyFindings)
+              ? {
+                  policyFindings: contribution.policyFindings.flatMap((finding) =>
+                    isRecord(finding) && typeof finding.path === "string" && typeof finding.excerpt === "string"
+                      ? [{ path: finding.path, excerpt: safePublicMarkdown(finding.excerpt) }]
+                      : []
+                  )
+                }
+              : {})
+          }
+        }
+      : {}),
+    ...(result && typeof result.status === "string"
+      ? {
+          result: {
+            status: result.status,
+            summary: typeof result.summary === "string" ? result.summary : "",
+            ...(privateResult && rootCauseWasReported(privateResult) && text(result.rootCauseSummary)
+              ? { rootCause: result.rootCauseSummary as string }
+              : {}),
+            ...(text(result.nextStep) ? { nextStep: result.nextStep as string } : {}),
+            ...(Array.isArray(result.requirements)
+              ? {
+                  requirements: result.requirements.flatMap((entry) =>
+                    isRecord(entry) && typeof entry.requirement === "string" && typeof entry.verdict === "string"
+                      ? [
+                          {
+                            requirement: entry.requirement,
+                            verdict: entry.verdict,
+                            ...(typeof entry.evidence === "string" ? { evidence: entry.evidence } : {}),
+                            ...(isRecord(entry.ownership) && typeof entry.ownership.status === "string" && typeof entry.ownership.by === "string"
+                              ? { ownership: { status: entry.ownership.status, by: entry.ownership.by } }
+                              : {})
+                          }
+                        ]
+                      : []
+                  )
+                }
+              : {}),
+            ...(Array.isArray(result.discussionClaims)
+              ? {
+                  discussionClaims: result.discussionClaims.flatMap((entry) =>
+                    isRecord(entry) && typeof entry.claim === "string" && typeof entry.verdict === "string" && typeof entry.evidence === "string"
+                      ? [{ claim: entry.claim, verdict: entry.verdict, evidence: entry.evidence }]
+                      : []
+                  )
+                }
+              : {}),
+            ...(Array.isArray(result.findings) ? { findings: result.findings.filter((finding): finding is string => typeof finding === "string") } : {}),
+            ...(proof
+              ? {
+                  proof: Object.fromEntries(
+                    (["before", "after", "regressions", "attempts"] as const).flatMap((key) => (typeof proof[key] === "string" ? [[key, proof[key]]] : []))
+                  )
+                }
+              : {}),
+            ...(patch
+              ? {
+                  candidatePatch: {
+                    ...(typeof patch.title === "string" ? { title: patch.title } : {}),
+                    ...(typeof patch.branchName === "string" ? { branchName: patch.branchName } : {}),
+                    files: Array.isArray(patch.files)
+                      ? patch.files.flatMap((file) => (typeof file === "string" ? [file] : isRecord(file) && typeof file.path === "string" ? [file.path] : []))
+                      : []
+                  }
+                }
+              : {}),
+            ...(isRecord(result.pullRequest) && typeof result.pullRequest.number === "number" && typeof result.pullRequest.url === "string"
+              ? { pullRequest: { number: result.pullRequest.number, url: result.pullRequest.url } }
+              : {})
+          }
+        }
+      : {}),
+    trace: Array.isArray(publicEvents) ? publicEvents.filter(isRecord) : [],
+    traceCapacity: maxHarnessEvents
+  };
+}
+
+/**
+ * Whether rootCauseSummary is the agent's own statement. Records extracted before the flag
+ * existed are judged by content: extraction filled a missing value with sentences lifted
+ * from the summary, so a value that reproduces that fallback, or appears verbatim in the
+ * summary, is treated as not reported. That can undercount a root cause the agent stated
+ * in its summary, which is the safe direction: the page then says none was established.
+ */
+function rootCauseWasReported(result: Record<string, unknown>): boolean {
+  if (typeof result.rootCauseReported === "boolean") return result.rootCauseReported;
+  if (typeof result.rootCauseSummary !== "string" || typeof result.summary !== "string") return false;
+  const collapse = (text: string) => text.replace(/\s+/g, " ").trim();
+  const rootCause = collapse(result.rootCauseSummary);
+  if (!rootCause) return false;
+  if (rootCause === collapse(clampText(summarizeCommentText(result.summary), 520))) return false;
+  return !collapse(result.summary).includes(rootCause);
+}
+
+function publicEvidence(entry: Record<string, unknown>) {
+  const codeEvidence = Array.isArray(entry.codeEvidence)
+    ? entry.codeEvidence.flatMap((cited) =>
+        isRecord(cited) && typeof cited.path === "string" && typeof cited.excerpt === "string"
+          ? [{ path: safePublicMarkdown(cited.path), excerpt: safePublicMarkdown(cited.excerpt) }]
+          : []
+      )
+    : [];
+  return {
+    ...(codeEvidence.length ? { codeEvidence } : {}),
+    ...(typeof entry.executedCommand === "string" ? { executedCommand: safePublicMarkdown(entry.executedCommand) } : {})
+  };
+}
+
+function hasRecordShape(value: Record<string, unknown>): value is Record<string, unknown> & PersistedWebhookRunRecord {
+  return (
+    isRecord(value.run) &&
+    Array.isArray(value.run.events) &&
+    isRecord(value.scan) &&
+    isRecord(value.trueForge) &&
+    typeof value.trueForge.status === "string"
+  );
 }
 
 function safePublicMarkdown(value: string): string {
@@ -851,12 +1369,32 @@ function isPullRequest(value: unknown): value is { number: number; url: string }
   return isRecord(value) && typeof value.number === "number" && Number.isInteger(value.number) && value.number > 0 && typeof value.url === "string";
 }
 
+/**
+ * Reads and bounds the issue's comment thread for the agent's opening message. A client
+ * without comment support, or a read failure, yields a stated gap rather than silence, so
+ * the agent knows the discussion was not seen and can read it itself.
+ */
+async function readIssueDiscussion(
+  githubClient: GitHubRestClientLike | undefined,
+  owner: string,
+  repo: string,
+  issueNumber: number
+): Promise<string | undefined> {
+  if (!githubClient?.listIssueComments) return undefined;
+  try {
+    return formatIssueDiscussion(selectIssueDiscussion(await githubClient.listIssueComments(owner, repo, issueNumber, { limit: 200 })));
+  } catch (error) {
+    return `(The comments could not be read before the run started: ${error instanceof Error ? error.message : String(error)}. Call read_issue to read them.)`;
+  }
+}
+
 async function startTrueForgeSessionForIssue(
   run: ReturnType<typeof createRun>,
   webhook: ReturnType<typeof parseIssueWebhook>,
   deliveryId: string,
   safeToExecute: boolean,
-  trueForgeRuntime: SquasherSessionStarter | undefined
+  trueForgeRuntime: SquasherSessionStarter | undefined,
+  issueDiscussion?: string
 ) {
   if (!safeToExecute) {
     return {
@@ -884,6 +1422,7 @@ async function startTrueForgeSessionForIssue(
       issueUrl: webhook.issue.html_url,
       issueTitle: webhook.issue.title,
       issueBody: webhook.issue.body ?? "",
+      ...(issueDiscussion !== undefined ? { issueDiscussion } : {}),
       baseBranch: webhook.repository.default_branch,
       branchName: branchNameForIssue(webhook.issue.number, deliveryId)
     });
@@ -1168,16 +1707,22 @@ async function executeApproval(
     // failed write are in exactly this state. Settle the run instead of leaving it
     // advertising an approval button that fails on every click with nothing to show why.
     if (/no harness tool call is awaiting approval/i.test(message)) {
+      // The approval step is lost, the verified patch is not: the run returns to
+      // patch-ready and the contribution records why it can no longer be written.
+      const reason =
+        "The approved write cannot be resumed: the harness no longer holds the paused tool call. The verified patch is kept.";
       const strandedRecord: PersistedWebhookRunRecord = {
         ...liveRecord,
-        run: canTransition(liveRecord.run.status, "failed")
-          ? transitionRun(
-              liveRecord.run,
-              "failed",
-              "The approved write cannot be resumed: the harness no longer holds the paused tool call. Re-run the issue to produce a fresh patch."
-            )
+        run: canTransition(liveRecord.run.status, "patch-ready")
+          ? transitionRun(liveRecord.run, "patch-ready", reason)
           : liveRecord.run,
-        trueForge: { ...liveRecord.trueForge, pendingApproval: undefined }
+        trueForge: { ...liveRecord.trueForge, pendingApproval: undefined },
+        contributionIssue: {
+          status: "blocked",
+          reason,
+          action: "Re-run the issue to produce an approvable write, or apply the verified patch by hand",
+          at: new Date().toISOString()
+        }
       };
       const labelled = await syncLifecycleLabels(strandedRecord, githubClient);
       await appendUpdatedLiveRecord(dataDir, labelled, postgresStore);
@@ -1211,6 +1756,9 @@ async function executeApproval(
       // write failed only because a large fork was still finishing GitHub's own import
       // (see the isSettled comment above) can then be retried once that settles, without
       // starting the whole triage over.
+      //
+      // The failure is a contribution problem, never an engineering one: the verified
+      // patch stands, and so does the checkpoint that lets the write be retried.
       await appendUpdatedLiveRecord(
         dataDir,
         {
@@ -1218,6 +1766,12 @@ async function executeApproval(
           trueForge: {
             ...approvalRecord.trueForge,
             pendingApproval: { ...pendingApproval, approvalTurnId: undefined }
+          },
+          contributionIssue: {
+            status: "blocked",
+            reason: `The GitHub write failed: ${failedReceipt.message}`,
+            action: "The approval checkpoint is still held, so the write can be approved again once the cause is fixed",
+            at: new Date().toISOString()
           }
         },
         postgresStore
@@ -1235,8 +1789,9 @@ async function executeApproval(
       evidence: { pullRequestUrl: pullRequest.url, pullRequestNumber: pullRequest.number }
     });
   }
+  const { contributionIssue: _resolvedIssue, ...approvedRecord } = approvalRecord;
   const updatedRecord: PersistedWebhookRunRecord = {
-    ...approvalRecord,
+    ...approvedRecord,
     run,
     trueForge: {
       ...approvalRecord.trueForge,
@@ -1333,7 +1888,52 @@ async function appendApprovalReceipt(dataDir: string | undefined, receipt: Appro
   }
 }
 
-async function appendUpdatedLiveRecord(dataDir: string | undefined, record: PersistedWebhookRunRecord, postgresStore?: PostgresStore): Promise<void> {
+/** The facts a run's two statuses are derived from; see run-status.ts. */
+function runStatusFacts(record: PersistedWebhookRunRecord) {
+  const result = record.trueForge.result;
+  return {
+    runStatus: record.run.status,
+    runEvents: record.run.events.map((event) => ({ status: event.status, message: event.message })),
+    harness: {
+      status: record.trueForge.status,
+      ...(record.trueForge.error ? { error: record.trueForge.error } : {}),
+      ...(record.trueForge.reason ? { reason: record.trueForge.reason } : {})
+    },
+    scanSafe: record.scan.safeToExecute,
+    pendingApproval: Boolean(record.trueForge.pendingApproval),
+    ...(result
+      ? {
+          result: {
+            status: result.status,
+            hasPatch: Boolean(result.candidatePatch),
+            proofVerified: result.proofVerified ?? hasGenuineProof(result),
+            ...(result.pullRequest ? { pullRequest: result.pullRequest } : {})
+          }
+        }
+      : {}),
+    ...(record.contribution ? { contribution: record.contribution } : {}),
+    ...(record.contributionIssue ? { contributionIssue: record.contributionIssue } : {}),
+    ...(record.pullRequestState ? { pullRequestState: record.pullRequestState } : {})
+  };
+}
+
+function runStatusesFor(record: PersistedWebhookRunRecord): RunStatuses {
+  return deriveRunStatuses(runStatusFacts(record));
+}
+
+/** Stamps the derived statuses so every persisted record carries them. */
+function withRunStatuses(record: PersistedWebhookRunRecord): PersistedWebhookRunRecord {
+  const statuses = runStatusesFor(record);
+  return {
+    ...record,
+    implementationStatus: statuses.implementation.status,
+    contributionStatus: statuses.contribution.status,
+    contributionReason: statuses.contribution.reason
+  };
+}
+
+async function appendUpdatedLiveRecord(dataDir: string | undefined, unstamped: PersistedWebhookRunRecord, postgresStore?: PostgresStore): Promise<void> {
+  const record = withRunStatuses(unstamped);
   if (postgresStore) {
     await postgresStore.saveWebhookRun(record).catch((err) => {
       console.error("Postgres saveWebhookRun error:", err);
@@ -1454,32 +2054,44 @@ async function resolveContributionForRun(
   githubClient: GitHubRestClientLike | undefined,
   owner: string,
   repo: string,
+  issueNumber: number,
+  branchName: string,
   safeToExecute: boolean
 ): Promise<ContributionTarget> {
-  const blocked = (reason: string): ContributionTarget => ({
-    mode: "triage",
+  const blocked = (kind: "capability" | "policy", reason: string, action: string): ContributionTarget => ({
+    mode: configuredContributionMode(),
+    writable: false,
     headOwner: owner,
     upstreamPushAccess: false,
     archived: false,
-    reason
+    reason,
+    blockers: [{ kind, reason, action }]
   });
 
   let target: ContributionTarget;
   if (!githubClient) {
-    target = blocked("No GitHub client is configured, so no write is possible");
+    target = blocked("capability", "No GitHub client is configured, so no write is possible", "Set GITHUB_TOKEN and re-run the issue");
   } else if (!safeToExecute) {
-    target = blocked("Issue was rejected by the security scan, so no GitHub write is attempted");
+    target = blocked(
+      "policy",
+      "Issue was rejected by the security scan, so no GitHub write is attempted",
+      "Review the security findings; if they are false positives, edit the issue and re-run"
+    );
   } else {
     try {
-      target = await resolveContributionTarget({ client: githubClient, owner, repo });
+      target = await resolveContributionTarget({ client: githubClient, owner, repo, issueNumber });
     } catch (error) {
       target = blocked(
-        `Contribution policy could not be resolved: ${error instanceof Error ? error.message : String(error)}`
+        "capability",
+        `Contribution policy could not be resolved: ${error instanceof Error ? error.message : String(error)}`,
+        "Re-run the issue once GitHub is reachable"
       );
     }
   }
 
-  contributions.set(owner, repo, target);
+  // Keyed by branch as well as repository: two issues in one repository can run at once and
+  // each must get its own decision, since duplicates are judged per issue.
+  contributions.set(owner, repo, target, branchName);
   return target;
 }
 
@@ -1499,7 +2111,7 @@ function contributionApprovalBlocker(record: PersistedWebhookRunRecord): string 
     return undefined;
   }
 
-  if (contribution.mode === "triage") {
+  if (!isContributionWritable(contribution)) {
     return `This run may not write to GitHub: ${contribution.reason}`;
   }
 
@@ -1554,7 +2166,8 @@ async function upstreamDriftBlocker(
 function canWriteToUpstream(record: PersistedWebhookRunRecord): boolean {
   // An absent decision means this record predates contribution modes; preserve the old
   // attempt-and-swallow behaviour rather than silently going quiet on existing deployments.
-  return record.contribution === undefined || record.contribution.upstreamPushAccess;
+  // Explicit triage means no automatic GitHub writes at all, status labels and comments included.
+  return record.contribution === undefined || (record.contribution.upstreamPushAccess && record.contribution.mode !== "triage");
 }
 
 async function syncLifecycleLabels(
@@ -1741,6 +2354,30 @@ function hasGenuineProof(result: LiveProofResult | undefined): boolean {
       hasThreeMatchingAttempts(proof?.attempts) &&
       (!result?.candidatePatch || hasValidPatchFiles)
   );
+}
+
+/**
+ * Why a result's requirement verification does not support its status, or undefined. An
+ * implemented change must say what was asked for and show it passing; no proven status may
+ * carry a failed requirement. The tool enforces the same rule when the result is submitted;
+ * this re-checks what was actually parsed.
+ */
+function requirementsProblem(result: LiveProofResult): string | undefined {
+  if (!provenResultStatuses.has(result.status)) return undefined;
+  const requirements = result.requirements ?? [];
+  if (requirements.some((requirement) => requirement.verdict === "fail")) {
+    return "a requirement failed verification";
+  }
+  if (requirements.some((requirement) => requirement.verdict === "missing" && !requirement.ownership)) {
+    return "a requirement is still missing and nobody else owns it";
+  }
+  if (requirements.some((requirement) => requirement.ownership && requirement.verdict === "pass")) {
+    return "the change implements work the discussion reserved for someone else";
+  }
+  if (implementationStatuses.has(result.status) && !requirements.some((requirement) => requirement.verdict === "pass")) {
+    return "the implemented change lists no requirement verified as pass";
+  }
+  return undefined;
 }
 
 function isMeaningfulProofText(value: unknown, minimumLength: number): value is string {
@@ -2594,8 +3231,58 @@ function trueForgeTurnError(events: TrueForgeRuntimeEvent[]): string | undefined
   return undefined;
 }
 
+/**
+ * Result submissions the harness refused: the structured-output guard sent a correction, or
+ * the tool itself returned an error. A refused submission is not the run's result. Counting
+ * it once stopped a live run from ever being asked to resubmit: its model call dropped right
+ * after the guard asked for a corrected "3/3", the server took the refused submission as
+ * final, judged it, and failed a run whose only fault was a connection error.
+ */
+function rejectedResultSubmissions(events: TrueForgeRuntimeEvent[]): Set<string> {
+  const rejected = new Set<string>();
+  let latestSubmissions: string[] = [];
+  for (const event of events) {
+    const raw = unwrapRuntimeEvent(event.raw);
+    if (!isRecord(raw)) continue;
+    if (event.type === "model.message") {
+      const toolCalls = Array.isArray(raw.toolCalls) ? raw.toolCalls : Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+      latestSubmissions = toolCalls.flatMap((toolCall) =>
+        isRecord(toolCall) &&
+        typeof toolCall.id === "string" &&
+        isRecord(toolCall.function) &&
+        typeof toolCall.function.name === "string" &&
+        toolCall.function.name.endsWith("submit_squasher_result")
+          ? [toolCall.id]
+          : []
+      );
+      continue;
+    }
+    if (
+      event.type === "squasher.structured_output.guard" &&
+      typeof raw.toolName === "string" &&
+      raw.toolName.endsWith("submit_squasher_result") &&
+      (raw.outcome === "retrying" || raw.outcome === "failed")
+    ) {
+      for (const id of latestSubmissions) rejected.add(id);
+      continue;
+    }
+    if (event.type === "tool.response" && typeof raw.toolCallId === "string" && typeof raw.content === "string") {
+      if (/^\s*\{\s*"error"/.test(raw.content) || /^Rejected before execution/.test(raw.content)) rejected.add(raw.toolCallId);
+    }
+  }
+  return rejected;
+}
+
+/**
+ * Turn failures worth one more turn in the same session: a token limit, or a transient
+ * connection failure that outlasted the model client's own retries. The session still holds
+ * the work, so a continuation resumes it rather than discarding it.
+ */
 function isRecoverableTrueForgeTurnError(message: string): boolean {
-  return /max[_ -]?tokens?\s+breached|token\s+(?:budget|limit)/i.test(message);
+  return (
+    /max[_ -]?tokens?\s+breached|token\s+(?:budget|limit)/i.test(message) ||
+    /Model request failed:.*(?:connection error|timed?\s*out|terminated|ECONNRESET|socket hang up|fetch failed)/i.test(message)
+  );
 }
 
 function extractTrueForgePendingApproval(
@@ -2956,20 +3643,29 @@ async function monitorTrueForgeTurn(
     const requiresExecutableProof = Boolean(
       result && (provenResultStatuses.has(result.status) || result.candidatePatch)
     );
-    const validResult = Boolean(
+    // Whether the engineering held up. Deliberately says nothing about GitHub: a verified
+    // patch with no approval checkpoint -- because policy refused the write, or the agent
+    // never requested it -- is still a verified patch. Folding the checkpoint into this
+    // check is what used to report every blocked contribution as a failed run.
+    const requirementProblem = result ? requirementsProblem(result) : undefined;
+    const proofValid = Boolean(
       result &&
       (!requiresExecutableProof || (hasGenuineProof(result) && hasExecutableProof(eventMetadata))) &&
-      (!result.candidatePatch || pendingApproval)
+      !requirementProblem
     );
+    if (result && requiresExecutableProof) {
+      result = { ...result, proofVerified: proofValid };
+    }
+    const validResult = proofValid;
     let run = record.run;
     if (settled && validResult && result) {
-      run = applyLiveProofResult(run, result);
+      run = applyLiveProofResult(run, result, { checkpoint: Boolean(pendingApproval) });
     } else if (settled && canTransition(run.status, "failed")) {
       run = transitionRun(
         run,
         "failed",
         result?.candidatePatch
-          ? "TrueForge returned a patch without a matching native approval checkpoint"
+          ? `The candidate patch did not pass verification: ${requirementProblem ?? "its executed evidence did not hold"}`
           : turnError
             ? `TrueForge turn failed: ${turnError}`
             : "TrueForge completed without a valid squasher.result contract"
@@ -2987,7 +3683,7 @@ async function monitorTrueForgeTurn(
             ? validResult
               ? { error: undefined }
               : { error: result?.candidatePatch
-                  ? "TrueForge patch did not match a native approval checkpoint"
+                  ? `The candidate patch did not pass verification: ${requirementProblem ?? "its executed evidence did not hold"}`
                   : turnError
                     ? `TrueForge turn failed: ${turnError}`
                     : "TrueForge completed without a valid squasher.result contract" }
@@ -3111,7 +3807,7 @@ function projectTrueForgeEvent(event: TrueForgeRuntimeEvent, fallbackIndex = 0):
       id: eventId,
       category: "sandbox",
       status: "passed",
-      summary: "Daytona sandbox created",
+      summary: "Sandbox created",
       ...(sandboxId ? { sandboxId } : {})
     }];
   }
@@ -3156,7 +3852,7 @@ function categoryForTool(name: string): HarnessEventCategory {
 }
 
 function summaryForTool(name: string, args: Record<string, unknown>): string {
-  if (name === "exec" || name === "shell" || name === "run_command") return "Running a command in the Daytona sandbox";
+  if (name === "exec" || name === "shell" || name === "run_command") return "Running a command in the sandbox";
   if (name === "read_file") return `Reading ${typeof args.path === "string" ? redactHarnessText(args.path) : "a repository file"} through GitHub MCP`;
   if (name === "read_issue") return `Reading ${typeof args.issueNumber === "number" ? `issue #${args.issueNumber}` : "the GitHub issue"} through GitHub MCP`;
   if (name === "submit_squasher_result") return "Submitting the Squasher proof contract";
@@ -3309,6 +4005,68 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
       typeof parsed.rootCauseSummary === "string" ? parsed.rootCauseSummary : summarizeCommentText(summary),
       520
     ),
+    rootCauseReported: typeof parsed.rootCauseSummary === "string" && parsed.rootCauseSummary.trim().length > 0,
+    ...(typeof parsed.nextStep === "string" && parsed.nextStep.trim() ? { nextStep: clampText(parsed.nextStep.trim(), 520) } : {}),
+    ...(Array.isArray(parsed.requirements)
+      ? {
+          requirements: parsed.requirements
+            .filter((entry): entry is Record<string, unknown> => isRecord(entry) && typeof entry.requirement === "string" && typeof entry.verdict === "string")
+            .slice(0, maxResultRequirements)
+            .map((entry) => ({
+              requirement: clampText(String(entry.requirement).trim(), 400),
+              verdict: String(entry.verdict),
+              ...(typeof entry.evidence === "string" ? { evidence: clampText(entry.evidence.trim(), 600) } : {}),
+              ...recordedEvidence(entry),
+              ...(isRecord(entry.ownership) && typeof entry.ownership.status === "string" && typeof entry.ownership.by === "string"
+                ? {
+                    ownership: {
+                      status: entry.ownership.status,
+                      by: clampText(entry.ownership.by, 120),
+                      ...(typeof entry.ownership.basis === "string" ? { basis: clampText(entry.ownership.basis, 400) } : {})
+                    }
+                  }
+                : {})
+            }))
+        }
+      : {}),
+    ...(Array.isArray(parsed.fileChanges)
+      ? {
+          fileChanges: parsed.fileChanges
+            .filter((entry): entry is Record<string, unknown> => isRecord(entry) && typeof entry.path === "string" && typeof entry.summary === "string")
+            .slice(0, maxPatchFiles)
+            .map((entry) => ({
+              path: String(entry.path),
+              summary: clampText(String(entry.summary).trim(), 800),
+              ...(Array.isArray(entry.requirements)
+                ? { requirements: entry.requirements.filter((text): text is string => typeof text === "string").slice(0, 12).map((text) => clampText(text, 400)) }
+                : {})
+            }))
+        }
+      : {}),
+    ...(Array.isArray(parsed.discussionClaims)
+      ? {
+          discussionClaims: parsed.discussionClaims
+            .filter(
+              (entry): entry is Record<string, unknown> =>
+                isRecord(entry) && typeof entry.claim === "string" && typeof entry.verdict === "string" && typeof entry.evidence === "string"
+            )
+            .slice(0, maxResultRequirements)
+            .map((entry) => ({
+              claim: clampText(String(entry.claim).trim(), 400),
+              verdict: String(entry.verdict),
+              evidence: clampText(String(entry.evidence).trim(), 600),
+              ...recordedEvidence(entry)
+            }))
+        }
+      : {}),
+    ...(Array.isArray(parsed.findings)
+      ? {
+          findings: parsed.findings
+            .filter((finding): finding is string => typeof finding === "string" && finding.trim().length > 0)
+            .slice(0, maxResultFindings)
+            .map((finding) => clampText(finding.trim(), 360))
+        }
+      : {}),
     proposedFixSummary: clampText(
       typeof parsed.proposedFixSummary === "string"
         ? parsed.proposedFixSummary
@@ -3323,6 +4081,7 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
 }
 
 function extractSubmittedSquasherResult(events: TrueForgeRuntimeEvent[]): Record<string, unknown> | undefined {
+  const rejected = rejectedResultSubmissions(events);
   for (const event of [...events].reverse()) {
     if (event.type !== "model.message") continue;
     const raw = unwrapRuntimeEvent(event.raw);
@@ -3331,6 +4090,7 @@ function extractSubmittedSquasherResult(events: TrueForgeRuntimeEvent[]): Record
     for (const toolCall of [...toolCalls].reverse()) {
       if (!isRecord(toolCall) || !isRecord(toolCall.function)) continue;
       if (typeof toolCall.function.name !== "string" || !toolCall.function.name.endsWith("submit_squasher_result")) continue;
+      if (typeof toolCall.id === "string" && rejected.has(toolCall.id)) continue;
       const submitted = parseToolArguments(toolCall.function.arguments);
       if (isSquasherResultContract(submitted)) return submitted;
     }
@@ -3347,7 +4107,7 @@ async function hydratePatchEvidence(
     return result;
   }
 
-  const diffs: Array<{ path: string; before: string; after: string }> = [];
+  const diffs: Array<{ path: string; before: string; after: string; change: "added" | "modified" }> = [];
   for (const file of result.candidatePatch.files) {
     try {
       const source = await githubClient.getFile(
@@ -3359,9 +4119,17 @@ async function hydratePatchEvidence(
       const before = source.encoding.toLowerCase() === "base64"
         ? Buffer.from(source.content.replace(/\s+/g, ""), "base64").toString("utf8")
         : source.content;
-      diffs.push({ path: file.path, before, after: file.content });
+      diffs.push({ path: file.path, before, after: file.content, change: "modified" });
     } catch (error) {
-      console.warn(`Could not load base content for ${file.path}`, error);
+      // Absent on the base branch means the patch adds it: an honest, complete diff. Any
+      // other failure leaves the file out, so the page says its base is unknown instead.
+      if (isRecord(error) && error.status === 404) {
+        diffs.push({ path: file.path, before: "", after: file.content, change: "added" });
+      } else if (error instanceof Error && / 404 /.test(error.message)) {
+        diffs.push({ path: file.path, before: "", after: file.content, change: "added" });
+      } else {
+        console.warn(`Could not load base content for ${file.path}`, error);
+      }
     }
   }
 
@@ -3477,7 +4245,11 @@ function branchNameForIssue(issueNumber: number, deliveryId: string): string {
   return `squasher/fix-${issueNumber}-${createHash("sha256").update(deliveryId).digest("hex").slice(0, 10)}`;
 }
 
-function applyLiveProofResult(run: ReturnType<typeof createRun>, result: LiveProofResult) {
+function applyLiveProofResult(
+  run: ReturnType<typeof createRun>,
+  result: LiveProofResult,
+  options: { checkpoint?: boolean } = {}
+) {
   if (result.candidatePatch) {
     // One path to a pull request, shared by both kinds of work: the state machine's names
     // are written for a defect, so an implemented change is narrated for what it actually
@@ -3493,7 +4265,11 @@ function applyLiveProofResult(run: ReturnType<typeof createRun>, result: LivePro
         }
       : {};
 
-    for (const status of ["reproducing", "verified", "minimizing", "fixing", "validating", "patch-ready", "awaiting-approval"] as const) {
+    // Awaiting approval only when a write is actually paused; otherwise the verified patch
+    // rests at patch-ready and the contribution status says why it went no further.
+    const stages = ["reproducing", "verified", "minimizing", "fixing", "validating", "patch-ready", "awaiting-approval"] as const;
+    for (const status of stages) {
+      if (status === "awaiting-approval" && options.checkpoint === false) break;
       if (canTransition(run.status, status)) {
         run = transitionRun(run, status, narration[status] ?? `TrueForge proof: ${status}`, {
           evidence: { summary: result.summary, ...(result.proof ? { proof: result.proof } : {}) }
@@ -3804,7 +4580,7 @@ function trueForgeRuntimeFromEnv(
       modelProvider: process.env.MODEL_PROVIDER ?? "deepseek"
     },
     SquasherHarness.fromEnv(githubClient, {
-      resolveWriteTarget: ({ owner, repo }) => contributions.decide(owner, repo)
+      resolveWriteTarget: ({ owner, repo, branchName }) => contributions.decide(owner, repo, branchName)
     })
   );
 }
@@ -3818,20 +4594,25 @@ function trueForgeRuntimeFromEnv(
 export class ContributionRegistry {
   private readonly entries = new Map<string, ContributionTarget>();
 
-  private static key(owner: string, repo: string): string {
-    return `${owner}/${repo}`.toLowerCase();
+  private static key(owner: string, repo: string, branchName?: string): string {
+    return `${owner}/${repo}`.toLowerCase() + (branchName ? `#${branchName}` : "");
   }
 
-  set(owner: string, repo: string, target: ContributionTarget): void {
+  set(owner: string, repo: string, target: ContributionTarget, branchName?: string): void {
     this.entries.set(ContributionRegistry.key(owner, repo), target);
+    if (branchName) this.entries.set(ContributionRegistry.key(owner, repo, branchName), target);
   }
 
-  get(owner: string, repo: string): ContributionTarget | undefined {
-    return this.entries.get(ContributionRegistry.key(owner, repo));
+  /** The decision for this run's reserved branch, falling back to the repository's latest. */
+  get(owner: string, repo: string, branchName?: string): ContributionTarget | undefined {
+    return (
+      (branchName ? this.entries.get(ContributionRegistry.key(owner, repo, branchName)) : undefined) ??
+      this.entries.get(ContributionRegistry.key(owner, repo))
+    );
   }
 
-  decide(owner: string, repo: string): WriteTargetDecision {
-    const target = this.get(owner, repo);
+  decide(owner: string, repo: string, branchName?: string): WriteTargetDecision {
+    const target = this.get(owner, repo, branchName);
     if (!target) {
       // No decision was recorded for this repository, so nothing has established that a
       // write is permitted. Fail closed rather than defaulting to the upstream repository.
@@ -3841,11 +4622,12 @@ export class ContributionRegistry {
       };
     }
 
-    if (target.mode === "triage") {
+    if (!isContributionWritable(target)) {
       return { allowed: false, reason: target.reason };
     }
 
-    return { allowed: true, headOwner: target.headOwner };
+    const disclose = (target.policySignals ?? []).some((signal) => signal.kind === "ai-disclosure-required");
+    return { allowed: true, headOwner: target.headOwner, ...(disclose ? { disclose: true } : {}) };
   }
 }
 

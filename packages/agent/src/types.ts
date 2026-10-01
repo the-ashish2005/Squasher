@@ -29,6 +29,13 @@ export interface StartSquasherSessionInput {
   issueUrl: string;
   issueTitle: string;
   issueBody: string;
+  /**
+   * The issue's comment thread, already bounded and rendered as text by the server. Handed
+   * to the agent in its first message so the maintainers' current direction is in front of
+   * it before any code is read, and so it survives the tool-output budget, which only ever
+   * elides tool results.
+   */
+  issueDiscussion?: string;
   repository: string;
   baseBranch: string;
   branchName: string;

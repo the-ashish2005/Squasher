@@ -136,7 +136,7 @@ describe("squasher harness runtime", () => {
 
     const messages = complete.mock.calls[0]?.[0] as Array<{ role: string; content: string }>;
     expect(messages[0]?.role).toBe("system");
-    expect(messages[0]?.content).toContain("You are Squasher, CI for bug reports.");
+    expect(messages[0]?.content).toContain("You are Squasher, CI for GitHub issues");
     expect(messages[1]?.content).toContain("Analyze issue 7.");
     expect(store.messages(sessionId)).not.toHaveLength(0);
   });
@@ -645,5 +645,190 @@ describe("squasher harness runtime", () => {
     expect(Array.isArray(listed.data)).toBe(true);
     expect(listed.data[0]?.sequenceNumber).toBe(1);
     expect(listed.data[0]?.event.type).toBe("turn.created");
+  });
+});
+
+describe("issue discussion in the opening message", () => {
+  it("keeps the discussion out of the reported issue text the scope check reads", async () => {
+    const { llm, complete } = scriptedLlm([textResponse("done")]);
+    const store = new SessionStore({});
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox: fakeSandbox(), store });
+
+    const spec = buildSquasherAgentSpec({ modelName: "deepseek-flash" });
+    const created = (await harness.sessions.create({ agent: { spec } })) as { data: { id: string } };
+    const message = buildInitialUserMessage({
+      issueUrl: "https://github.test/o/r/issues/164",
+      issueTitle: "UI/UX improvements for issue discovery",
+      issueBody: "Replace the table with cards and add sorting.",
+      // A maintainer comment that mentions an error must not make the report read as a defect.
+      issueDiscussion: "--- @owner (OWNER, maintainer) at 2026-09-20T00:00:00Z\nSorting already exists; the old build threw a TypeError once, unrelated.",
+      repository: "o/r",
+      baseBranch: "main",
+      branchName: "squasher/fix-164-abc"
+    });
+    const turn = (await harness.sessions.createTurn(created.data.id, {
+      input: [{ type: "user.message", content: message }]
+    })) as { data: { id: string } };
+    await drain(harness, created.data.id, turn.data.id);
+
+    expect(store.issue(created.data.id)).toEqual({
+      title: "UI/UX improvements for issue discovery",
+      body: "Replace the table with cards and add sorting.",
+      // Kept so cited evidence can be checked against the issue's own repository.
+      repository: { owner: "o", repo: "r", ref: "main" }
+    });
+    // The agent sees the discussion in full, marked as the maintainer's.
+    const sent = complete.mock.calls[0]?.[0] as Array<{ role: string; content: string }>;
+    expect(sent[1]?.content).toContain("Issue discussion:");
+    expect(sent[1]?.content).toContain("@owner (OWNER, maintainer)");
+    expect(sent[1]?.content).toContain("Sorting already exists");
+  });
+});
+
+describe("implementation repair loop", () => {
+  it("keeps working after a failing test run, repairs, re-runs, and then submits", async () => {
+    // CASE E. A non-zero exit is evidence for the agent to act on, never the end of the turn.
+    const runCommand = vi
+      .fn()
+      .mockResolvedValueOnce({ stdout: "", stderr: "FAIL tokenizer.test.ts: expected 'a\\\\' got undefined", exitCode: 1 })
+      .mockResolvedValueOnce({ stdout: "patched src/tokenizer.ts", stderr: "", exitCode: 0 })
+      .mockResolvedValue({ stdout: "3/3 passed", stderr: "", exitCode: 0 });
+    const sandbox: SandboxClientLike = { ...fakeSandbox(), runCommand };
+    const { llm, complete } = scriptedLlm([
+      toolCallResponse([{ id: "t1", name: "run_command", arguments: { command: "npx vitest run tokenizer.test.ts" } }]),
+      toolCallResponse([{ id: "t2", name: "run_command", arguments: { command: "node apply-guard.mjs" } }]),
+      toolCallResponse([{ id: "t3", name: "run_command", arguments: { command: "npx vitest run tokenizer.test.ts" } }]),
+      toolCallResponse([{ id: "t4", name: "submit_squasher_result", arguments: { ...proofContract, candidatePatch: null, status: "verified" } }]),
+      textResponse(JSON.stringify({ ...proofContract, candidatePatch: null, status: "verified" }))
+    ]);
+    const store = new SessionStore({});
+    const harness = new SquasherHarness({ client: fakeGitHub(), llm, sandbox, store });
+
+    const { sessionId, turnId } = await startSession(harness);
+    const events = await drain(harness, sessionId, turnId);
+
+    expect(runCommand).toHaveBeenCalledTimes(3);
+    // The failing output reached the model, which is what lets it diagnose and repair.
+    const afterFailure = complete.mock.calls[1]?.[0] as Array<{ role: string; content: string }>;
+    expect(afterFailure.at(-1)?.content).toContain("FAIL tokenizer.test.ts");
+    expect(events.at(-1)).toMatchObject({ type: "turn.done", state: { status: "completed" } });
+  });
+});
+
+describe("discussion claims checked against the repository", () => {
+  // The real page at the time of drkrillo/good-first-issues#164: Repo is not sortable.
+  const indexHtml = [
+    "const COLUMNS = [",
+    '  { key: "repo",       label: "Repo" },',
+    '  { key: "comments",   label: "Comments", sortable: true, numeric: true, align: "center" },',
+    '  { key: "created_at", label: "Created",  sortable: true },',
+    '  { key: "updated_at", label: "Updated",  sortable: true },',
+    "];"
+  ].join("\n");
+
+  function resultWith(requirements: unknown[], discussionClaims: unknown[] = []) {
+    return {
+      kind: "squasher.result",
+      status: "not-actionable",
+      summary: "The owner has split and reserved the remaining work on this issue.",
+      requirements,
+      discussionClaims,
+      proof: { before: "n/a", after: "n/a", regressions: "n/a", attempts: "0/0" },
+      candidatePatch: null
+    };
+  }
+
+  // What the agent wrote on the live run: the owner's claim, taken as fact.
+  const repeatedClaim = resultWith([
+    {
+      requirement: "Sort by repository name",
+      verdict: "already-implemented",
+      evidence: "The owner states sorting works on any column, including Repo.",
+      codeEvidence: [{ path: "index.html", excerpt: '{ key: "repo",       label: "Repo", sortable: true }' }]
+    }
+  ]);
+
+  const checked = resultWith(
+    [
+      {
+        requirement: "Sort by created date",
+        verdict: "already-implemented",
+        evidence: "COLUMNS marks created_at sortable.",
+        codeEvidence: [{ path: "index.html", excerpt: '{ key: "created_at", label: "Created",  sortable: true }' }]
+      },
+      {
+        requirement: "Sort by repository name",
+        verdict: "missing",
+        evidence: 'COLUMNS declares { key: "repo", label: "Repo" } with no sortable flag.',
+        ownership: { status: "reserved", by: "@drkrillo", basis: "The rest I am going to split into separate issues myself" }
+      }
+    ],
+    [
+      {
+        claim: "@drkrillo (OWNER): sorting by any column, including Created, Updated and Repo",
+        verdict: "partly-confirmed",
+        evidence: "Comments, Created and Updated are sortable; Repo is not.",
+        codeEvidence: [{ path: "index.html", excerpt: '{ key: "created_at", label: "Created",  sortable: true }' }]
+      }
+    ]
+  );
+
+  async function run(responses: LlmResponse[]) {
+    const { llm, complete } = scriptedLlm(responses);
+    const store = new SessionStore({});
+    const getFile = vi.fn().mockImplementation(async (_owner: string, _repo: string, path: string) => {
+      if (path !== "index.html") throw Object.assign(new Error("GitHub API 404 Not Found"), { status: 404 });
+      return { path, sha: "sha", encoding: "utf8", content: indexHtml };
+    });
+    const harness = new SquasherHarness({ client: fakeGitHub({ getFile } as never), llm, sandbox: fakeSandbox(), store });
+    const spec = buildSquasherAgentSpec({ modelName: "deepseek-flash" });
+    const created = (await harness.sessions.create({ agent: { spec } })) as { data: { id: string } };
+    const message = buildInitialUserMessage({
+      issueUrl: "https://github.test/drkrillo/good-first-issues/issues/164",
+      issueTitle: "UI/UX Improvements for Better Issue Discovery",
+      issueBody: "Add sorting options such as recently updated, recently created, and repository name.",
+      issueDiscussion: "--- @drkrillo (OWNER, maintainer) at 2026-09-20T14:12:23Z\nTwo of the points are already in there though: sorting by any column, including Created, Updated and Repo.",
+      repository: "drkrillo/good-first-issues",
+      baseBranch: "main",
+      branchName: "squasher/fix-164-abc"
+    });
+    const turn = (await harness.sessions.createTurn(created.data.id, {
+      input: [{ type: "user.message", content: message }]
+    })) as { data: { id: string } };
+    const events = await drain(harness, created.data.id, turn.data.id);
+    return { events, complete, getFile };
+  }
+
+  it("sends a comment repeated as fact back to the agent, and accepts the checked result", async () => {
+    const { events, complete, getFile } = await run([
+      toolCallResponse([{ id: "r1", name: "submit_squasher_result", arguments: repeatedClaim }]),
+      toolCallResponse([{ id: "r2", name: "submit_squasher_result", arguments: checked }]),
+      textResponse(JSON.stringify(checked))
+    ]);
+
+    // The claim was checked against the issue's own repository at its base branch.
+    expect(getFile).toHaveBeenCalledWith("drkrillo", "good-first-issues", "index.html", "main");
+
+    // Refused, with the discrepancy spelled out for the agent to act on.
+    const refusal = events.find((event) => event.type === "tool.response" && event.toolCallId === "r1");
+    expect(String(refusal?.content)).toContain("does not occur in index.html");
+    expect(String(refusal?.content)).toContain("is a claim, not repository evidence");
+    const afterRefusal = complete.mock.calls[1]?.[0] as Array<{ role: string; content: string }>;
+    expect(afterRefusal.at(-1)?.content).toContain("mark the requirement missing");
+
+    // The corrected result keeps both facts and is accepted; the turn does not fail.
+    const accepted = events.find((event) => event.type === "tool.response" && event.toolCallId === "r2");
+    expect(String(accepted?.content)).toContain('"accepted":true');
+    expect(events.at(-1)).toMatchObject({ type: "turn.done", state: { status: "completed" } });
+  });
+
+  it("accepts a first submission whose claims the repository confirms", async () => {
+    const { events } = await run([
+      toolCallResponse([{ id: "r1", name: "submit_squasher_result", arguments: checked }]),
+      textResponse(JSON.stringify(checked))
+    ]);
+
+    const accepted = events.find((event) => event.type === "tool.response" && event.toolCallId === "r1");
+    expect(String(accepted?.content)).toContain('"accepted":true');
   });
 });

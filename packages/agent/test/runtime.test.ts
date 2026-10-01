@@ -26,7 +26,7 @@ describe("Squasher TrueForge runtime", () => {
       {
         name: "squasher-github",
         preload: true,
-        enableTools: ["read_issue", "read_file", "submit_squasher_result", "create_fix_pull_request"],
+        enableTools: ["read_issue", "read_file", "read_repository_instructions", "submit_squasher_result", "create_fix_pull_request"],
         requireApprovalForTools: ["create_fix_pull_request"]
       }
     ]);
