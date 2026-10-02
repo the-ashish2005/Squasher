@@ -100,14 +100,53 @@ export interface PolicySummaryView {
   signals: Array<{ kind: string; path: string; excerpt: string }>;
 }
 
-/** Mirrors ChangeRequest in apps/server/src/workspace.ts. */
+/** A change request and where it stands, as the server reports it. */
 export interface ChangeRequestView {
   id: string;
   runId: string;
   text: string;
   createdAt: string;
   patchHash?: string;
-  status: "recorded";
+  /** recorded: noted only. in-progress: Squasher is applying it. implemented: see `revision`. failed: see `error`. */
+  status: "recorded" | "in-progress" | "implemented" | "failed";
+  revision?: number;
+  error?: string;
+}
+
+/** Mirrors the public revision in apps/server/src/server.ts (withWorkspaceState). */
+export interface RevisionView {
+  number: number;
+  source: "requested-change" | "verification";
+  basedOn: number;
+  createdAt: string;
+  hash: string;
+  title: string;
+  summary: string;
+  changeRequestText?: string;
+  files: Array<{ path: string; content: string }>;
+  requirements?: WorkspaceRequirement[];
+  fileChanges?: Array<{ path: string; summary: string; requirements?: string[] }>;
+  testCommands?: Array<{ command: string; purpose?: string }>;
+  proof?: { before?: string; after?: string; regressions?: string; attempts?: string };
+}
+
+/** Mirrors WorkspaceJob in apps/server/src/revisions.ts, without its private session fields. */
+export interface WorkspaceJobView {
+  id: string;
+  kind: "apply-change" | "verify" | "test-run";
+  status: "running" | "succeeded" | "failed";
+  stage: string;
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
+  changeRequestId?: string;
+  producedRevision?: number;
+  testRun?: {
+    passed: boolean;
+    source: "recorded-commands";
+    commands: Array<{ command: string; purpose?: string; exitCode: number | null; durationMs: number; stdout: string; stderr: string }>;
+  };
+  error?: string;
 }
 
 /** One of the two statuses the server reports: engineering, and contribution. */
@@ -174,8 +213,16 @@ export interface DashboardRun extends ReproRun {
   issueDiscussion?: string;
   /** What the repository's documents say about contributions like this one. */
   policy?: PolicySummaryView;
-  /** Changes a human asked for in the workspace. Recorded only: Squasher does not apply them yet. */
+  /** Changes a human asked for in the workspace, and where each stands. */
   changeRequests?: ChangeRequestView[];
+  /** Revisions of the patch made from requested changes or re-verification; the original is not listed. */
+  revisions?: RevisionView[];
+  /** Work Squasher is doing or did in the workspace: applying changes, verifying, running tests. */
+  workspaceJobs?: WorkspaceJobView[];
+  /** The revision most recently submitted to GitHub; absent when it was the original patch. */
+  submittedRevision?: number;
+  /** Commands that re-verify the original patch from a fresh clone, when the run recorded them. */
+  testCommands?: Array<{ command: string; purpose?: string }>;
   /** Engineering and contribution, reported separately by the server. */
   statuses?: { implementation: RunStatusView; contribution: RunStatusView };
   /** Where an approved write would land, so the approver sees the destination before deciding. */
@@ -217,6 +264,9 @@ interface WebhookRunRecord {
   issueDiscussion?: string;
   policy?: PolicySummaryView;
   changeRequests?: ChangeRequestView[];
+  revisions?: RevisionView[];
+  workspaceJobs?: WorkspaceJobView[];
+  submittedRevision?: number;
   contribution?: {
     mode?: "own" | "fork" | "triage";
     /** Absent on records from before it existed, where mode "triage" meant not writable. */
@@ -251,6 +301,7 @@ interface WebhookRunRecord {
       requirements?: WorkspaceRequirement[];
       discussionClaims?: Array<{ claim: string; verdict: string; evidence: string }>;
       fileChanges?: Array<{ path: string; summary: string; requirements?: string[] }>;
+      testCommands?: Array<{ command: string; purpose?: string }>;
       proof?: { before?: string; after?: string; regressions?: string; attempts?: string };
       candidatePatch?: {
         title: string;
@@ -378,6 +429,10 @@ export function toDashboardRunFromWebhook(record: WebhookRunRecord): DashboardRu
     ...(record.issueDiscussion ? { issueDiscussion: record.issueDiscussion } : {}),
     ...(record.policy ? { policy: record.policy } : {}),
     ...(record.changeRequests ? { changeRequests: record.changeRequests } : {}),
+    ...(record.revisions ? { revisions: record.revisions } : {}),
+    ...(record.workspaceJobs ? { workspaceJobs: record.workspaceJobs } : {}),
+    ...(record.submittedRevision !== undefined ? { submittedRevision: record.submittedRevision } : {}),
+    ...(liveResult?.testCommands ? { testCommands: liveResult.testCommands } : {}),
     ...(pullRequest ? { pullRequest } : {}),
     ...(contribution ? { contribution } : {}),
     ...(record.outcome ? { outcome: record.outcome } : {}),

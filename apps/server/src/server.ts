@@ -8,6 +8,7 @@ import { SquasherTrueForgeRuntime } from "@squasher/agent";
 import {
   approvalPayloadHash,
   bugProofStatuses,
+  createGitHubMcpTools,
   formatIssueDiscussion,
   selectIssueDiscussion,
   squasherResultStatuses,
@@ -25,7 +26,15 @@ import type {
   TrueForgeRuntimeEventListener,
   TrueForgeRuntimeEvent
 } from "@squasher/agent";
-import { LlmClient, SquasherHarness, defaultLlmModel, type WriteTargetDecision } from "@squasher/harness";
+import {
+  E2bSandboxClient,
+  LlmClient,
+  SquasherHarness,
+  defaultLlmModel,
+  withContributionDisclosure,
+  type SandboxClientLike,
+  type WriteTargetDecision
+} from "@squasher/harness";
 import {
   configuredContributionMode,
   isContributionWritable,
@@ -52,7 +61,22 @@ import {
 import { PostgresStore } from "./db.js";
 import { buildRunOutcome, type RunOutcomeInput } from "./run-outcome.js";
 import { summarizePolicy } from "./policy-summary.js";
-import { askAboutRun, readChangeRequests, recordChangeRequest, WorkspaceInputError, type AskModel } from "./workspace.js";
+import { askAboutRun, readChangeRequests, recordChangeRequest, WorkspaceInputError, type AskModel, type ChangeRequest } from "./workspace.js";
+import {
+  isActive,
+  maxRevisablePatchChars,
+  newJob,
+  pushRevisionToBranch,
+  readJobs,
+  readRevisions,
+  runRecordedTests,
+  saveJob,
+  saveRevision,
+  type PatchRevision,
+  type RevisionFile,
+  type TestCommand,
+  type WorkspaceJob
+} from "./revisions.js";
 
 type ApprovalActionId = "approve-pr" | "request-diff" | "reject-run";
 type GitHubCommentKind = "started" | "completed" | "failed" | "approval";
@@ -121,6 +145,8 @@ export interface SquasherServerOptions {
   contributions?: ContributionRegistry;
   /** Answers workspace questions. Defaults to the configured model when one is set. */
   askModel?: AskModel;
+  /** Runs a revision's recorded test commands. Defaults to E2B when E2B_API_KEY is set. */
+  sandbox?: SandboxClientLike;
 }
 
 type McpRequestHandler = (request: IncomingMessage, response: ServerResponse) => Promise<void>;
@@ -167,6 +193,8 @@ interface LiveProofResult {
   discussionClaims?: RecordedClaim[];
   /** The agent's explanation of each changed file, and the requirements it serves. */
   fileChanges?: Array<{ path: string; summary: string; requirements?: string[] }>;
+  /** Commands that re-verify the patch from a fresh clone, for the workspace's Run tests. */
+  testCommands?: TestCommand[];
   /**
    * Whether the evidence held when the run completed: proof text, 3/3 count, an executed
    * command in the trace, and no failed requirement. Absent on records from before it was
@@ -239,6 +267,8 @@ interface PersistedWebhookRunRecord {
   /** A contribution problem after the preflight, such as a write that failed or was lost. */
   contributionIssue?: ContributionIssue;
   pullRequestState?: PullRequestState;
+  /** The patch revision most recently submitted to GitHub; absent when it was the original. */
+  submittedRevision?: number;
   /** Stamped on every write from deriveRunStatuses; see run-status.ts. */
   implementationStatus?: RunStatuses["implementation"]["status"];
   contributionStatus?: RunStatuses["contribution"]["status"];
@@ -276,6 +306,7 @@ export function createSquasherServer(options: SquasherServerOptions = {}): Serve
   const mcpHandler = options.mcpHandler ?? githubMcpHandlerFromEnv(githubClient);
   const activeIssueTriggers = new Set<string>();
   const askModel = options.askModel ?? askModelFromEnv();
+  const sandbox = options.sandbox ?? (process.env.E2B_API_KEY ? E2bSandboxClient.fromEnv() : undefined);
 
   return createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
@@ -291,17 +322,19 @@ export function createSquasherServer(options: SquasherServerOptions = {}): Serve
         return;
       }
 
-      const workspaceRoute = /^\/api\/runs\/(.+)\/(ask|change-requests)$/.exec(url.pathname);
+      const workspaceRoute = /^\/api\/runs\/(.+)\/(ask|change-requests|test-runs|revisions\/(\d+)\/approve)$/.exec(url.pathname);
       if (workspaceRoute) {
-        await handleWorkspaceRequest(
-          request,
-          response,
-          dataDir ? resolve(dataDir) : undefined,
-          decodeRunId(`/api/runs/${workspaceRoute[1]}`),
-          workspaceRoute[2] as "ask" | "change-requests",
+        await handleWorkspaceRequest(request, response, {
+          dataDir: dataDir ? resolve(dataDir) : undefined,
+          runId: decodeRunId(`/api/runs/${workspaceRoute[1]}`),
+          action: workspaceRoute[3] ? "approve-revision" : (workspaceRoute[2] as "ask" | "change-requests" | "test-runs"),
+          revisionNumber: workspaceRoute[3] ? Number(workspaceRoute[3]) : undefined,
           askModel,
+          trueForgeRuntime,
+          githubClient,
+          sandbox,
           postgresStore
-        );
+        });
         return;
       }
 
@@ -722,33 +755,28 @@ async function handleLatestRun(
 
   const refreshed = await refreshLegacyHarnessTrace(dataDir, latest, trueForgeRuntime);
   const tracked = await refreshPullRequestState(dataDir, hydratePersistedPullRequest(ensureDashboardUrl(refreshed)), githubClient, postgresStore);
-  sendJson(response, 200, await withChangeRequests(dataDir, publicRunPayload(tracked)));
+  sendJson(response, 200, await withWorkspaceState(dataDir, publicRunPayload(tracked)));
 }
 
-/** Adds the run's recorded change requests to a public payload. */
-async function withChangeRequests(dataDir: string | undefined, payload: unknown): Promise<unknown> {
-  if (!isRecord(payload) || !isRecord(payload.run) || typeof payload.run.id !== "string") return payload;
-  const changeRequests = await readChangeRequests(dataDir, payload.run.id);
-  return {
-    ...payload,
-    changeRequests: changeRequests.map((entry) => ({ ...entry, text: safePublicMarkdown(entry.text) }))
-  };
+interface WorkspaceContext {
+  dataDir: string | undefined;
+  runId: string;
+  action: "ask" | "change-requests" | "test-runs" | "approve-revision";
+  revisionNumber?: number;
+  askModel: AskModel | undefined;
+  trueForgeRuntime: SquasherSessionStarter | undefined;
+  githubClient: GitHubRestClientLike | undefined;
+  sandbox: SandboxClientLike | undefined;
+  postgresStore?: PostgresStore;
 }
 
 /**
- * The Contribution Workspace endpoints. Both need the maintainer token: a question spends
- * model time, and a change request is recorded against the run. Both read the run only
- * through its public payload.
+ * The Contribution Workspace endpoints. All need the maintainer token: a question spends
+ * model time, a change request starts an agent session, a test run starts a sandbox, and
+ * approving a revision writes to GitHub. All read the run through its public payload or
+ * the persisted record, never the browser's copy.
  */
-async function handleWorkspaceRequest(
-  request: IncomingMessage,
-  response: ServerResponse,
-  dataDir: string | undefined,
-  runId: string,
-  action: "ask" | "change-requests",
-  askModel: AskModel | undefined,
-  postgresStore?: PostgresStore
-): Promise<void> {
+async function handleWorkspaceRequest(request: IncomingMessage, response: ServerResponse, context: WorkspaceContext): Promise<void> {
   if (request.method !== "POST") {
     sendJson(response, 405, { error: "Method not allowed" });
     return;
@@ -763,7 +791,7 @@ async function handleWorkspaceRequest(
     return;
   }
 
-  const record = await findPersistedRunById(dataDir, runId, postgresStore);
+  const record = await findPersistedRunById(context.dataDir, context.runId, context.postgresStore);
   if (!record) {
     sendJson(response, 404, { error: "Persisted run not found" });
     return;
@@ -771,34 +799,476 @@ async function handleWorkspaceRequest(
   const payload = await readJson(request);
 
   try {
-    if (action === "change-requests") {
-      if (!dataDir) {
-        sendJson(response, 503, { error: "Change requests need local storage (DATA_DIR); they are not stored in PostgreSQL yet" });
+    if (context.action === "ask") {
+      if (!context.askModel) {
+        sendJson(response, 503, { error: "Ask Squasher is not configured: no model is available (set DEEPSEEK_API_KEY)" });
         return;
       }
-      const recorded = await recordChangeRequest(dataDir, {
-        runId,
-        text: payload.text,
-        ...(record.trueForge.result?.candidatePatch?.hash ? { patchHash: record.trueForge.result.candidatePatch.hash } : {})
-      });
-      sendJson(response, 201, { ...recorded, text: safePublicMarkdown(recorded.text) });
+      const publicRun = await withWorkspaceState(context.dataDir, publicRunPayload(hydratePersistedPullRequest(ensureDashboardUrl(record))));
+      const answer = await askAboutRun(context.askModel, isRecord(publicRun) ? publicRun : {}, payload.question);
+      sendJson(response, 200, { ...answer, answer: safePublicMarkdown(answer.answer) });
       return;
     }
 
-    if (!askModel) {
-      sendJson(response, 503, { error: "Ask Squasher is not configured: no model is available (set DEEPSEEK_API_KEY)" });
+    if (!context.dataDir) {
+      sendJson(response, 503, { error: "The contribution workspace needs local storage (DATA_DIR); PostgreSQL is not supported for it yet" });
       return;
     }
-    const publicRun = publicRunPayload(hydratePersistedPullRequest(ensureDashboardUrl(record)));
-    const answer = await askAboutRun(askModel, isRecord(publicRun) ? publicRun : {}, payload.question);
-    sendJson(response, 200, { ...answer, answer: safePublicMarkdown(answer.answer) });
+    const dataDir = context.dataDir;
+
+    if (context.action === "change-requests") {
+      const recorded = await recordChangeRequest(dataDir, {
+        runId: context.runId,
+        text: payload.text,
+        ...(record.trueForge.result?.candidatePatch?.hash ? { patchHash: record.trueForge.result.candidatePatch.hash } : {})
+      });
+      // Applying is the default; a request can also just be noted.
+      let job: WorkspaceJob | undefined;
+      let jobError: string | undefined;
+      if (payload.apply !== false) {
+        try {
+          job = await startRevisionJob(context, record, "apply-change", recorded);
+        } catch (error) {
+          jobError = error instanceof Error ? error.message : String(error);
+        }
+      }
+      sendJson(response, 201, {
+        changeRequest: { ...recorded, text: safePublicMarkdown(recorded.text) },
+        ...(job ? { job: publicJob(job) } : {}),
+        ...(jobError ? { jobError } : {})
+      });
+      return;
+    }
+
+    if (context.action === "test-runs") {
+      const job = await startTestRun(context, record);
+      sendJson(response, 202, { job: publicJob(job) });
+      return;
+    }
+
+    const outcome = await approveRevision(context, record, context.revisionNumber ?? -1, payload.hash);
+    sendJson(response, 200, outcome);
   } catch (error) {
     if (error instanceof WorkspaceInputError) {
       sendJson(response, 400, { error: error.message });
       return;
     }
-    sendJson(response, 502, { error: error instanceof Error ? error.message : "The model did not answer" });
+    if (error instanceof WorkspaceConflict) {
+      sendJson(response, 409, { error: error.message });
+      return;
+    }
+    if (error instanceof HttpError) {
+      sendJson(response, error.statusCode, { error: error.message });
+      return;
+    }
+    sendJson(response, 502, { error: error instanceof Error ? error.message : "The workspace action failed" });
   }
+}
+
+class WorkspaceConflict extends Error {}
+
+/** The patch as it stands now: the latest revision, or the original Squasher patch. */
+function currentPatch(record: PersistedWebhookRunRecord, revisions: PatchRevision[]) {
+  const latest = revisions.at(-1);
+  if (latest) {
+    return {
+      number: latest.number,
+      files: latest.files,
+      title: latest.title,
+      body: latest.body,
+      requirements: latest.requirements ?? record.trueForge.result?.requirements ?? [],
+      testCommands: latest.testCommands,
+      hash: latest.hash
+    };
+  }
+  const patch = record.trueForge.result?.candidatePatch;
+  return {
+    number: 0,
+    files: patch?.files ?? [],
+    title: patch?.title ?? "",
+    body: patch?.body ?? "",
+    requirements: record.trueForge.result?.requirements ?? [],
+    testCommands: record.trueForge.result?.testCommands,
+    hash: patch?.hash ?? ""
+  };
+}
+
+async function assertNoActiveJob(dataDir: string, runId: string): Promise<void> {
+  const active = (await readJobs(dataDir, runId)).find((job) => isActive(job));
+  if (active) {
+    throw new WorkspaceConflict(`Squasher is still working on this run (${active.stage}); wait for it to finish`);
+  }
+}
+
+/**
+ * Starts an agent session that revises the current patch ("apply-change") or re-verifies it
+ * unchanged ("verify"). The session has no GitHub write tool. Its result becomes a new
+ * revision only if the evidence holds; otherwise the job fails and the patch is unchanged.
+ */
+async function startRevisionJob(
+  context: WorkspaceContext,
+  record: PersistedWebhookRunRecord,
+  mode: "apply-change" | "verify",
+  changeRequest?: ChangeRequest
+): Promise<WorkspaceJob> {
+  const dataDir = context.dataDir!;
+  const runtime = context.trueForgeRuntime;
+  if (!runtime?.subscribeToTurn) {
+    throw new WorkspaceConflict("Squasher's agent is not configured on this server (DEEPSEEK_API_KEY, E2B_API_KEY, GITHUB_TOKEN), so the change cannot be applied");
+  }
+  if (runStatusesFor(record).implementation.status !== "verified" || !record.trueForge.result?.candidatePatch) {
+    throw new WorkspaceConflict("Only a verified patch can be revised");
+  }
+  await assertNoActiveJob(dataDir, record.run.id);
+
+  const revisions = await readRevisions(dataDir, record.run.id);
+  const current = currentPatch(record, revisions);
+  const size = current.files.reduce((sum, file) => sum + file.content.length, 0);
+  if (size > maxRevisablePatchChars) {
+    throw new WorkspaceConflict(`This patch is too large to revise in the workspace (${size} characters; the limit is ${maxRevisablePatchChars})`);
+  }
+
+  let job = await saveJob(
+    dataDir,
+    newJob({
+      runId: record.run.id,
+      kind: mode,
+      revision: current.number,
+      stage: mode === "apply-change" ? "Starting the change" : "Preparing verification",
+      ...(changeRequest ? { changeRequestId: changeRequest.id } : {})
+    })
+  );
+
+  try {
+    const started = await runtime.startSession({
+      repository: record.repository,
+      issueUrl: record.run.issue.url,
+      issueTitle: record.issueTitle,
+      issueBody: record.issueBody,
+      ...(record.issueDiscussion !== undefined ? { issueDiscussion: record.issueDiscussion } : {}),
+      baseBranch: record.baseBranch,
+      branchName: branchNameForIssue(record.run.issue.issueNumber, record.deliveryId),
+      revision: {
+        mode,
+        files: current.files,
+        ...(changeRequest ? { changeRequest: changeRequest.text } : {}),
+        requirements: current.requirements.map((entry) => ({ requirement: entry.requirement, verdict: entry.verdict })),
+        previousChanges: revisions.flatMap((revision) => (revision.changeRequestText ? [revision.changeRequestText] : []))
+      }
+    });
+    job = await saveJob(dataDir, {
+      ...job,
+      sessionId: started.session.id,
+      turnId: started.turn.id,
+      stage: mode === "apply-change" ? "Applying the change and re-running tests" : "Re-running the checks"
+    });
+  } catch (error) {
+    await saveJob(dataDir, { ...job, status: "failed", stage: "Could not start", error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+
+  void completeRevisionJob(context, record, job, current, changeRequest).catch(async (error) => {
+    await saveJob(dataDir, { ...job, status: "failed", stage: "Failed", error: error instanceof Error ? error.message : String(error) });
+  });
+  return job;
+}
+
+async function completeRevisionJob(
+  context: WorkspaceContext,
+  record: PersistedWebhookRunRecord,
+  job: WorkspaceJob,
+  current: ReturnType<typeof currentPatch>,
+  changeRequest: ChangeRequest | undefined
+): Promise<void> {
+  const dataDir = context.dataDir!;
+  const runtime = context.trueForgeRuntime!;
+  const fail = (error: string) => saveJob(dataDir, { ...job, status: "failed", stage: "Failed", error });
+
+  let events = await reconcileSessionEvents({ trueForgeRuntime: runtime, sessionId: job.sessionId!, turnId: job.turnId!, isSettled: isTrueForgeTurnSettled });
+  let result = extractLiveProofResult(events, record);
+  // A transient model failure or token cutoff gets the same continuation as a normal run.
+  for (let attempt = 1; !result && attempt <= 2 && runtime.requestProofContract; attempt += 1) {
+    const turnError = trueForgeTurnError(events);
+    if (turnError && !isRecoverableTrueForgeTurnError(turnError)) break;
+    const recovery = await runtime.requestProofContract(job.sessionId!);
+    const more = await reconcileSessionEvents({ trueForgeRuntime: runtime, sessionId: job.sessionId!, turnId: recovery.id, isSettled: isTrueForgeTurnSettled, ignoreEvents: events });
+    events = [...events, ...more];
+    result = extractLiveProofResult(events, record);
+  }
+
+  if (!result) {
+    const turnError = trueForgeTurnError(events);
+    await fail(turnError ? `The agent stopped before submitting a result: ${turnError}` : "The agent did not submit a valid result");
+    return;
+  }
+  if (!result.candidatePatch || !provenResultStatuses.has(result.status)) {
+    await fail(`Squasher did not produce a revised patch (${result.status}): ${summarizeCommentText(result.summary)}`);
+    return;
+  }
+  const trace = events.flatMap((event, index) => projectTrueForgeEvent(event, index));
+  const problem = requirementsProblem(result);
+  if (!hasGenuineProof(result) || !hasExecutableProof(trace) || problem) {
+    await fail(`The revised patch did not pass verification: ${problem ?? "its executed evidence did not hold"}`);
+    return;
+  }
+  const files: RevisionFile[] = result.candidatePatch.files.map((file) => ({ path: file.path, content: file.content }));
+  if (job.kind === "verify" && patchHashOf(files) !== patchHashOf(current.files)) {
+    await fail("Re-verification changed the patch, which it must not; the patch is unchanged");
+    return;
+  }
+
+  const revisions = await readRevisions(dataDir, record.run.id);
+  const revision = await saveRevision(dataDir, {
+    runId: record.run.id,
+    number: (revisions.at(-1)?.number ?? 0) + 1,
+    source: job.kind === "verify" ? "verification" : "requested-change",
+    basedOn: current.number,
+    ...(changeRequest ? { changeRequestId: changeRequest.id, changeRequestText: changeRequest.text } : {}),
+    title: result.candidatePatch.title,
+    body: result.candidatePatch.body,
+    summary: result.summary,
+    files,
+    ...(result.requirements ? { requirements: result.requirements } : {}),
+    ...(result.fileChanges ? { fileChanges: result.fileChanges } : {}),
+    ...(result.testCommands ? { testCommands: result.testCommands } : {}),
+    ...(result.proof ? { proof: result.proof } : {})
+  });
+  await saveJob(dataDir, {
+    ...job,
+    status: "succeeded",
+    stage: job.kind === "verify" ? "Verification complete" : `Revision ${revision.number} ready for review`,
+    producedRevision: revision.number
+  });
+}
+
+function patchHashOf(files: RevisionFile[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify([...files].sort((a, b) => a.path.localeCompare(b.path)).map((file) => [file.path, file.content])))
+    .digest("hex");
+}
+
+/**
+ * Re-runs the current patch's recorded test commands in a fresh sandbox. A patch with no
+ * recorded commands -- every run from before they were recorded -- is re-verified by an
+ * agent session instead, which records them for next time.
+ */
+async function startTestRun(context: WorkspaceContext, record: PersistedWebhookRunRecord): Promise<WorkspaceJob> {
+  const dataDir = context.dataDir!;
+  if (!record.trueForge.result?.candidatePatch) throw new WorkspaceConflict("This run has no patch to test");
+  const revisions = await readRevisions(dataDir, record.run.id);
+  const current = currentPatch(record, revisions);
+  if (!current.testCommands?.length) {
+    return startRevisionJob(context, record, "verify");
+  }
+  if (!context.sandbox) {
+    throw new WorkspaceConflict("No sandbox is configured on this server (E2B_API_KEY), so tests cannot be re-run");
+  }
+  await assertNoActiveJob(dataDir, record.run.id);
+
+  let job = await saveJob(dataDir, newJob({ runId: record.run.id, kind: "test-run", revision: current.number, stage: "Preparing environment" }));
+  const sandbox = context.sandbox;
+  void (async () => {
+    try {
+      const outcome = await runRecordedTests(sandbox, {
+        owner: record.run.issue.owner,
+        repo: record.run.issue.repo,
+        baseBranch: record.baseBranch,
+        files: current.files,
+        commands: current.testCommands!,
+        onStage: async (stage) => {
+          job = await saveJob(dataDir, { ...job, stage });
+        }
+      });
+      await saveJob(dataDir, {
+        ...job,
+        status: "succeeded",
+        stage: outcome.passed ? "Tests passed" : "Tests failed",
+        testRun: { ...outcome, source: "recorded-commands" }
+      });
+    } catch (error) {
+      await saveJob(dataDir, { ...job, status: "failed", stage: "Test run failed", error: error instanceof Error ? error.message : String(error) });
+    }
+  })();
+  return job;
+}
+
+/**
+ * Submits an approved revision. Same gates as the original approval -- a writable
+ * contribution, a policy that allows it, an unchanged upstream -- plus: it must be the
+ * latest revision, the exact one the reviewer saw (by hash), with no work in progress and
+ * no failed test run against it. With no pull request yet, one is opened through the same
+ * pull request tool as the original write; with one open, its branch is updated.
+ */
+async function approveRevision(
+  context: WorkspaceContext,
+  record: PersistedWebhookRunRecord,
+  number: number,
+  hash: unknown
+): Promise<Record<string, unknown>> {
+  const dataDir = context.dataDir!;
+  const github = context.githubClient;
+  if (!github) throw new WorkspaceConflict("No GitHub client is configured, so nothing can be submitted");
+
+  const revisions = await readRevisions(dataDir, record.run.id);
+  const revision = revisions.find((entry) => entry.number === number);
+  if (!revision) throw new HttpError(404, `Revision ${number} does not exist`);
+  if (revision !== revisions.at(-1)) throw new WorkspaceConflict(`Revision ${revisions.at(-1)!.number} is newer; review and approve that one`);
+  if (typeof hash !== "string" || hash !== revision.hash) {
+    throw new WorkspaceConflict("This approval was for a different version of the patch; reload and review the current one");
+  }
+  const jobs = await readJobs(dataDir, record.run.id);
+  if (jobs.some((job) => isActive(job))) throw new WorkspaceConflict("Squasher is still working on this run; wait for it to finish");
+  const lastTest = [...jobs].reverse().find((job) => job.kind === "test-run" && job.revision === revision.number && job.testRun);
+  if (lastTest && !lastTest.testRun!.passed) {
+    throw new WorkspaceConflict(`The latest test run of revision ${revision.number} failed; fix it or re-run the tests before approving`);
+  }
+
+  const policy = summarizePolicy(record.contribution);
+  if (!policy.automaticContributionAllowed) throw new WorkspaceConflict(`Repository policy: ${policy.label}. Squasher will not submit this.`);
+  if (!isContributionWritable(record.contribution)) {
+    throw new WorkspaceConflict(`This run may not write to GitHub: ${record.contribution?.reason ?? "no contribution decision was recorded"}`);
+  }
+  const drift = await upstreamDriftBlocker(record, github);
+  if (drift) throw new WorkspaceConflict(drift);
+
+  const contribution = record.contribution!;
+  const { owner, repo } = record.run.issue;
+  const original = record.trueForge.result!.candidatePatch!;
+  const existing = record.trueForge.result?.pullRequest;
+
+  if (existing) {
+    const previous = record.submittedRevision ? revisions.find((entry) => entry.number === record.submittedRevision)?.files : original.files;
+    const bases = new Map((record.trueForge.result?.patchDiff ?? []).map((diff) => [diff.path, diff]));
+    const currentPaths = (previous ?? original.files).map((file) => file.path);
+    const unknown = currentPaths.filter((path) => !revision.files.some((file) => file.path === path) && !bases.has(path));
+    if (unknown.length) {
+      throw new WorkspaceConflict(`The revision drops ${unknown.join(", ")}, whose original content is unknown, so the pull request cannot be safely updated`);
+    }
+    const pushed = await pushRevisionToBranch(github, {
+      headOwner: contribution.headOwner,
+      repo,
+      branch: original.branchName,
+      revision,
+      currentPaths,
+      baseContent: (path) => {
+        const base = bases.get(path);
+        return base && base.change !== "added" ? base.before : undefined;
+      }
+    });
+    await appendUpdatedLiveRecord(dataDir, { ...record, submittedRevision: revision.number }, context.postgresStore);
+    return { pullRequest: existing, updated: true, commitSha: pushed.commitSha, revision: revision.number };
+  }
+
+  const crossRepository = contribution.headOwner !== owner;
+  const disclose = crossRepository || (contribution.policySignals ?? []).some((signal) => signal.kind === "ai-disclosure-required");
+  const args: Record<string, unknown> = {
+    owner,
+    repo,
+    baseBranch: original.baseBranch,
+    branchName: original.branchName,
+    title: revision.title,
+    body: disclose ? withContributionDisclosure(revision.body) : revision.body,
+    files: revision.files,
+    ...(crossRepository ? { headOwner: contribution.headOwner } : {})
+  };
+  const tools = createGitHubMcpTools({ client: github });
+  const written = await tools.callTool({
+    name: "create_fix_pull_request",
+    arguments: args,
+    approval: { approved: true, expectedPayloadHash: approvalPayloadHash("create_fix_pull_request", args) }
+  });
+  const parsed = JSON.parse(written.content.map((part) => part.text).join("")) as { number: number; url: string };
+  const pullRequest = { number: parsed.number, url: parsed.url };
+
+  let run = record.run;
+  for (const [status, message] of [
+    ["awaiting-approval", `Revision ${revision.number} approved in the contribution workspace`],
+    ["approved", "Maintainer approved the revised patch"],
+    ["pr-created", "Draft GitHub pull request created from the approved revision"]
+  ] as const) {
+    if (canTransition(run.status, status)) run = transitionRun(run, status, message);
+  }
+  await appendUpdatedLiveRecord(
+    dataDir,
+    {
+      ...record,
+      run,
+      submittedRevision: revision.number,
+      trueForge: {
+        ...record.trueForge,
+        status: "completed",
+        pendingApproval: undefined,
+        result: { ...record.trueForge.result!, pullRequest }
+      }
+    },
+    context.postgresStore
+  );
+  return { pullRequest, updated: false, revision: revision.number };
+}
+
+/** A job as the page may see it: no session or turn identifiers. */
+function publicJob(job: WorkspaceJob) {
+  const { sessionId: _sessionId, turnId: _turnId, ...rest } = job;
+  const stale = job.status === "running" && !isActive(job);
+  return {
+    ...rest,
+    ...(stale ? { status: "failed" as const, stage: "Stopped", error: "This job stopped making progress, probably because the server restarted" } : {}),
+    ...(rest.error ? { error: safePublicMarkdown(rest.error) } : {}),
+    ...(rest.testRun
+      ? {
+          testRun: {
+            ...rest.testRun,
+            commands: rest.testRun.commands.map((command) => ({
+              ...command,
+              command: safePublicMarkdown(command.command),
+              stdout: safePublicMarkdown(command.stdout),
+              stderr: safePublicMarkdown(command.stderr)
+            }))
+          }
+        }
+      : {})
+  };
+}
+
+/**
+ * Adds the workspace's state to a public payload: change requests with where each stands,
+ * patch revisions, and jobs.
+ */
+async function withWorkspaceState(dataDir: string | undefined, payload: unknown): Promise<unknown> {
+  if (!isRecord(payload) || !isRecord(payload.run) || typeof payload.run.id !== "string") return payload;
+  const runId = payload.run.id;
+  const [changeRequests, revisions, jobs] = await Promise.all([readChangeRequests(dataDir, runId), readRevisions(dataDir, runId), readJobs(dataDir, runId)]);
+  const publicJobs = jobs.map(publicJob);
+  return {
+    ...payload,
+    changeRequests: changeRequests.map((entry) => {
+      const job = [...publicJobs].reverse().find((candidate) => candidate.changeRequestId === entry.id);
+      const status = !job ? "recorded" : job.status === "running" ? "in-progress" : job.status === "succeeded" ? "implemented" : "failed";
+      return {
+        ...entry,
+        text: safePublicMarkdown(entry.text),
+        status,
+        ...(job?.producedRevision ? { revision: job.producedRevision } : {}),
+        ...(status === "failed" && job?.error ? { error: job.error } : {})
+      };
+    }),
+    revisions: revisions.map((revision) => ({
+      number: revision.number,
+      source: revision.source,
+      basedOn: revision.basedOn,
+      createdAt: revision.createdAt,
+      hash: revision.hash,
+      title: safePublicMarkdown(revision.title),
+      summary: safePublicMarkdown(revision.summary),
+      ...(revision.changeRequestText ? { changeRequestText: safePublicMarkdown(revision.changeRequestText) } : {}),
+      files: revision.files,
+      ...(revision.requirements ? { requirements: revision.requirements } : {}),
+      ...(revision.fileChanges ? { fileChanges: revision.fileChanges } : {}),
+      ...(revision.testCommands ? { testCommands: revision.testCommands } : {}),
+      ...(revision.proof ? { proof: revision.proof } : {})
+    })),
+    workspaceJobs: publicJobs
+  };
 }
 
 function askModelFromEnv(): AskModel | undefined {
@@ -833,7 +1303,7 @@ async function handleRun(
 
   const refreshed = await refreshLegacyHarnessTrace(dataDir, record, trueForgeRuntime);
   const tracked = await refreshPullRequestState(dataDir, hydratePersistedPullRequest(ensureDashboardUrl(refreshed)), githubClient, postgresStore);
-  sendJson(response, 200, await withChangeRequests(dataDir, publicRunPayload(tracked)));
+  sendJson(response, 200, await withWorkspaceState(dataDir, publicRunPayload(tracked)));
 }
 
 /** How long a pull request's observed state is trusted before it is read again. */
@@ -4026,6 +4496,17 @@ function extractLiveProofResult(events: TrueForgeRuntimeEvent[], record: Persist
                     }
                   }
                 : {})
+            }))
+        }
+      : {}),
+    ...(Array.isArray(parsed.testCommands)
+      ? {
+          testCommands: parsed.testCommands
+            .filter((entry): entry is Record<string, unknown> => isRecord(entry) && typeof entry.command === "string")
+            .slice(0, 8)
+            .map((entry) => ({
+              command: clampText(String(entry.command).trim(), 1_000),
+              ...(typeof entry.purpose === "string" ? { purpose: clampText(entry.purpose.trim(), 300) } : {})
             }))
         }
       : {}),

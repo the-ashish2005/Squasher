@@ -270,6 +270,21 @@ export function inputSchemaFor(name: GitHubMcpToolName) {
               }
             }
           },
+          testCommands: {
+            type: "array",
+            maxItems: 8,
+            description:
+              "Commands that re-verify this change from a FRESH clone of the repository with the patch applied, run from the repository root: include any setup (installing dependencies), and only commands that pass against the patch. Do not rely on files that exist only in your sandbox, such as a reproducer you did not add to the patch. The maintainer can re-run them later.",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["command", "purpose"],
+              properties: {
+                command: { type: "string" },
+                purpose: { type: "string", description: "What this command checks." }
+              }
+            }
+          },
           discussionClaims: {
             type: "array",
             description:

@@ -39,7 +39,7 @@ export class SquasherTrueForgeRuntime {
     const session = normalizeSession(
       await this.client.sessions.create({
         agent: {
-          spec: buildSquasherAgentSpec(this.config)
+          spec: buildSquasherAgentSpec(this.config, { revision: Boolean(input.revision) })
         }
       })
     );

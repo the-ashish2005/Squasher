@@ -301,19 +301,37 @@ export class GitHubRestClient {
     input: {
       baseTree: string;
       files: Array<{ path: string; content: string }>;
+      /** Paths to remove from the tree; GitHub deletes an entry given a null sha. */
+      deletions?: string[];
     }
   ): Promise<GitHubTree> {
     return this.request<GitHubTree>(`${repoBasePath(owner, repo)}/git/trees`, {
       method: "POST",
       body: JSON.stringify({
         base_tree: validateSha(input.baseTree),
-        tree: input.files.map((file) => ({
-          path: validateRepositoryPath(file.path),
-          mode: "100644",
-          type: "blob",
-          content: file.content
-        }))
+        tree: [
+          ...input.files.map((file) => ({
+            path: validateRepositoryPath(file.path),
+            mode: "100644",
+            type: "blob",
+            content: file.content
+          })),
+          ...(input.deletions ?? []).map((path) => ({
+            path: validateRepositoryPath(path),
+            mode: "100644",
+            type: "blob",
+            sha: null
+          }))
+        ]
       })
+    });
+  }
+
+  /** Moves an existing branch to a new commit, refusing anything but a fast-forward. */
+  async updateBranch(owner: string, repo: string, branch: string, sha: string): Promise<void> {
+    await this.request(`${repoBasePath(owner, repo)}/git/refs/heads/${validateBranchName(branch)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ sha: validateSha(sha), force: false })
     });
   }
 

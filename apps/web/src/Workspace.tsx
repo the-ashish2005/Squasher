@@ -9,7 +9,9 @@ import {
   FileCode2,
   FileDiff,
   GitPullRequestArrow,
+  History,
   ListChecks,
+  LoaderCircle,
   MessageSquareText,
   PencilLine,
   RefreshCw,
@@ -20,8 +22,8 @@ import {
   X
 } from "lucide-react";
 import { useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import type { AskAnswer } from "./approval-client";
-import type { ApprovalActionId, ChangeRequestView, DashboardRun } from "./data";
+import type { AskAnswer, ChangeRequestSubmission } from "./approval-client";
+import type { ApprovalActionId, ChangeRequestView, DashboardRun, WorkspaceJobView } from "./data";
 import { unifiedPatch, type FileDiff as FileDiffModel } from "./diff";
 import { MarkdownContent } from "./MarkdownContent";
 import { PanelTitle, SourceTag } from "./Outcome";
@@ -30,10 +32,9 @@ import { buildWorkspace, type WorkspaceFile, type WorkspaceModel } from "./works
 /**
  * The Contribution Workspace: where a human reviews a verified patch before any contribution.
  *
- * Review, understand, approve -- or request changes first. Everything shown comes from the
- * run. What is not wired up yet (re-running tests, applying requested changes) is shown as
- * not connected, never simulated. Approving uses the existing approval checkpoint and means
- * a human reviewed the work; it never makes the work human-authored.
+ * Review, understand, approve -- or request a change, which Squasher applies in a fresh
+ * session and re-verifies as a new revision, then review again. Everything shown comes from
+ * the run. Approving means a human reviewed the work; it never makes the work human-authored.
  */
 
 type TabId = "understand" | "files" | "diff" | "tests" | "evidence" | "ask" | "final";
@@ -50,8 +51,12 @@ const tabs: Array<{ id: TabId; label: string; icon: typeof FileDiff }> = [
 
 export interface WorkspaceActions {
   approve: (actionId: ApprovalActionId) => Promise<void>;
+  approveRevision: (runId: string, revision: number, hash: string) => Promise<unknown>;
   ask: (runId: string, question: string) => Promise<AskAnswer>;
-  requestChange: (runId: string, text: string) => Promise<ChangeRequestView>;
+  requestChange: (runId: string, text: string) => Promise<ChangeRequestSubmission>;
+  runTests: (runId: string) => Promise<WorkspaceJobView>;
+  /** Re-reads the run so new revisions and job progress appear. */
+  refresh?: () => Promise<void>;
 }
 
 export function ContributionWorkspace({
@@ -69,15 +74,23 @@ export function ContributionWorkspace({
   approvalMessage?: string;
   initialTab?: TabId;
 }) {
-  const [recorded, setRecorded] = useState<ChangeRequestView[]>([]);
-  // Requests recorded on this page count at once, before the next refresh brings them back
-  // from the server, so the review state never contradicts what was just recorded.
-  const known = run.changeRequests ?? [];
-  const changeRequests = [...known, ...recorded.filter((entry) => !known.some((existing) => existing.id === entry.id))];
-  const model = buildWorkspace({ ...run, changeRequests });
+  // Requests and jobs started on this page count at once, before the next refresh brings
+  // them back from the server, so the page never contradicts what was just done.
+  const [localRequests, setLocalRequests] = useState<ChangeRequestView[]>([]);
+  const [localJobs, setLocalJobs] = useState<WorkspaceJobView[]>([]);
+  const knownRequests = run.changeRequests ?? [];
+  const knownJobs = run.workspaceJobs ?? [];
+  const model = buildWorkspace({
+    ...run,
+    changeRequests: [...knownRequests, ...localRequests.filter((entry) => !knownRequests.some((known) => known.id === entry.id))],
+    workspaceJobs: [...knownJobs, ...localJobs.filter((entry) => !knownJobs.some((known) => known.id === entry.id))]
+  });
   const [tab, setTab] = useState<TabId>(initialTab);
   const [selectedPath, setSelectedPath] = useState<string | undefined>(model.files[0]?.path);
   const [dialog, setDialog] = useState<"request" | "approve" | undefined>();
+  const [actionError, setActionError] = useState<string | undefined>();
+  const [actionMessage, setActionMessage] = useState<string | undefined>();
+  const [busy, setBusy] = useState(false);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const idPrefix = useId();
 
@@ -95,6 +108,47 @@ export function ContributionWorkspace({
     tabRefs.current[next]?.focus();
   }
 
+  async function runTests() {
+    setBusy(true);
+    setActionError(undefined);
+    setActionMessage(undefined);
+    try {
+      const job = await actions.runTests(run.id);
+      setLocalJobs((current) => [...current, job]);
+      setActionMessage(job.kind === "verify" ? "Squasher is re-verifying the patch and recording its test commands." : "Tests are running in a fresh sandbox.");
+      setTab("tests");
+      await actions.refresh?.();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Tests could not be started");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approve() {
+    setDialog(undefined);
+    if (model.approval.kind === "original") {
+      await actions.approve("approve-pr");
+      return;
+    }
+    setBusy(true);
+    setActionError(undefined);
+    setActionMessage(undefined);
+    try {
+      const outcome = (await actions.approveRevision(run.id, model.current.number, model.current.hash ?? "")) as { pullRequest?: { number: number }; updated?: boolean };
+      setActionMessage(
+        outcome.updated
+          ? `Pull request #${outcome.pullRequest?.number} updated with revision ${model.current.number}.`
+          : `Pull request #${outcome.pullRequest?.number} opened with revision ${model.current.number}.`
+      );
+      await actions.refresh?.();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "The revision could not be submitted");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const backHref = run.harness.dashboardUrl ?? `/runs/${encodeURIComponent(run.id)}`;
 
   if (!model.available) {
@@ -109,23 +163,29 @@ export function ContributionWorkspace({
     );
   }
 
-  const withRequests = model;
   return (
     <section className="workspace" aria-labelledby={`${idPrefix}-title`}>
       <div className="workspace-heading">
         <a className="back-link" href={backHref}><ArrowLeft size={14} />Back to run overview</a>
-        <p className="eyebrow">Contribution workspace</p>
-        <h2 id={`${idPrefix}-title`}>{run.candidatePatch?.title ?? run.issueTitle}</h2>
+        <p className="eyebrow">Contribution workspace · {model.current.number === 0 ? "Original Squasher patch" : `Revision ${model.current.number}`}</p>
+        <h2 id={`${idPrefix}-title`}>{model.current.title ?? run.issueTitle}</h2>
         <p className="workspace-authorship">
           <Bot size={15} aria-hidden="true" />
           <span>
-            This patch was generated by Squasher, an automated agent. Approving records that a human reviewed it
-            and wants to continue; it does not make the work human-authored.
+            This patch was generated by Squasher, an automated agent{model.current.number > 0 ? ", including the requested changes" : ""}. Approving records that a
+            human reviewed it and wants to continue; it does not make the work human-authored.
           </span>
         </p>
       </div>
 
-      <WorkspaceSummary model={withRequests} />
+      {model.activeJob ? (
+        <div className="workspace-progress" role="status" aria-live="polite">
+          <LoaderCircle size={16} className="spin" aria-hidden="true" />
+          <span><strong>{jobTitle(model.activeJob)}</strong> {model.activeJob.stage}. This page updates on its own.</span>
+        </div>
+      ) : undefined}
+
+      <WorkspaceSummary model={model} />
 
       <div className="workspace-tabs" role="tablist" aria-label="Contribution workspace sections">
         {tabs.map(({ id, label, icon: Icon }, index) => (
@@ -148,61 +208,67 @@ export function ContributionWorkspace({
       </div>
 
       <div className="panel workspace-panel" role="tabpanel" id={`${idPrefix}-panel-${tab}`} aria-labelledby={`${idPrefix}-tab-${tab}`}>
-        {tab === "understand" ? <UnderstandView model={withRequests} openFile={openFile} /> : undefined}
-        {tab === "files" ? <FilesView model={withRequests} selectedPath={selectedPath} onSelect={setSelectedPath} openFile={openFile} /> : undefined}
-        {tab === "diff" ? <DiffView model={withRequests} selectedPath={selectedPath} onSelect={setSelectedPath} /> : undefined}
-        {tab === "tests" ? <TestsView run={run} model={withRequests} /> : undefined}
-        {tab === "evidence" ? <EvidenceView run={run} model={withRequests} /> : undefined}
+        {tab === "understand" ? <UnderstandView model={model} openFile={openFile} /> : undefined}
+        {tab === "files" ? <FilesView model={model} selectedPath={selectedPath} onSelect={setSelectedPath} openFile={openFile} /> : undefined}
+        {tab === "diff" ? <DiffView model={model} selectedPath={selectedPath} onSelect={setSelectedPath} /> : undefined}
+        {tab === "tests" ? <TestsView run={run} model={model} /> : undefined}
+        {tab === "evidence" ? <EvidenceView run={run} model={model} /> : undefined}
         {tab === "ask" ? <AskView run={run} ask={actions.ask} /> : undefined}
-        {tab === "final" ? <FinalReview run={run} model={withRequests} goTo={setTab} /> : undefined}
+        {tab === "final" ? <FinalReview run={run} model={model} goTo={setTab} /> : undefined}
       </div>
 
       <div className="workspace-actions" role="group" aria-label="Review actions">
-        <button type="button" className="button" onClick={() => setDialog("request")}><PencilLine size={16} aria-hidden="true" />Request changes</button>
-        <button type="button" className="button" disabled aria-describedby={`${idPrefix}-tests-note`}><RefreshCw size={16} aria-hidden="true" />Run tests</button>
+        <button type="button" className="button" disabled={Boolean(model.activeJob)} aria-describedby={`${idPrefix}-request-note`} onClick={() => setDialog("request")}>
+          <PencilLine size={16} aria-hidden="true" />Request changes
+        </button>
+        <button type="button" className="button" disabled={!model.runTests.possible || busy} aria-describedby={`${idPrefix}-tests-note`} onClick={() => void runTests()}>
+          <RefreshCw size={16} aria-hidden="true" />Run tests
+        </button>
         <button type="button" className="button" onClick={() => setTab("final")}><FileDiff size={16} aria-hidden="true" />Review final diff</button>
         <button
           type="button"
           className="button button-success"
-          disabled={!model.approval.possible || pendingAction !== undefined}
+          disabled={!model.approval.possible || pendingAction !== undefined || busy}
           aria-describedby={`${idPrefix}-approve-note`}
           onClick={() => setDialog("approve")}
         >
-          <GitPullRequestArrow size={16} aria-hidden="true" />{pendingAction === "approve-pr" ? "Approving" : "Approve contribution"}
+          <GitPullRequestArrow size={16} aria-hidden="true" />{pendingAction === "approve-pr" || busy ? "Working" : model.approval.label}
         </button>
-        <p className="workspace-action-note" id={`${idPrefix}-tests-note`}>
-          Run tests is not connected yet: the workspace cannot re-run tests. Results shown are from the run.
+        <p className="workspace-action-note" id={`${idPrefix}-request-note`}>
+          {model.activeJob ? "Wait for Squasher to finish before requesting another change." : "Squasher applies a requested change in a fresh session, re-runs the tests, and shows it as a new revision."}
         </p>
+        <p className="workspace-action-note" id={`${idPrefix}-tests-note`}>{model.runTests.reason}</p>
         <p className="workspace-action-note" id={`${idPrefix}-approve-note`}>{model.approval.reason}</p>
-        {approvalError ? <p className="workspace-action-note error" role="alert">{approvalError}</p> : undefined}
-        {approvalMessage ? <p className="workspace-action-note" role="status">{approvalMessage}</p> : undefined}
+        {approvalError || actionError ? <p className="workspace-action-note error" role="alert">{approvalError ?? actionError}</p> : undefined}
+        {approvalMessage || actionMessage ? <p className="workspace-action-note" role="status">{actionMessage ?? approvalMessage}</p> : undefined}
       </div>
 
       {dialog === "request" ? (
         <RequestChangesDialog
           onClose={() => setDialog(undefined)}
           onSubmit={async (text) => {
-            const created = await actions.requestChange(run.id, text);
-            setRecorded((current) => [...current, created]);
+            const submitted = await actions.requestChange(run.id, text);
+            setLocalRequests((current) => [...current, { ...submitted.changeRequest, status: submitted.job ? "in-progress" : submitted.changeRequest.status }]);
+            if (submitted.job) setLocalJobs((current) => [...current, submitted.job!]);
+            await actions.refresh?.();
+            return submitted;
           }}
         />
       ) : undefined}
-      {dialog === "approve" ? (
-        <ApproveDialog
-          model={withRequests}
-          onClose={() => setDialog(undefined)}
-          onConfirm={async () => {
-            setDialog(undefined);
-            await actions.approve("approve-pr");
-          }}
-        />
-      ) : undefined}
+      {dialog === "approve" ? <ApproveDialog run={run} model={model} onClose={() => setDialog(undefined)} onConfirm={approve} /> : undefined}
     </section>
   );
 }
 
+function jobTitle(job: WorkspaceJobView): string {
+  if (job.kind === "apply-change") return "Applying the requested change:";
+  if (job.kind === "verify") return "Re-verifying the patch:";
+  return "Running tests:";
+}
+
 function WorkspaceSummary({ model }: { model: WorkspaceModel }) {
   const tests = model.tests;
+  const lastRun = model.latestTestRun?.testRun;
   return (
     <dl className="workspace-summary" aria-label="Review status">
       <div className="summary-card status-success">
@@ -213,20 +279,25 @@ function WorkspaceSummary({ model }: { model: WorkspaceModel }) {
         <dt>Requirements</dt>
         <dd>{model.requirements.counted ? `${model.requirements.satisfied} / ${model.requirements.counted} satisfied` : "Not recorded"}</dd>
       </div>
-      <div className="summary-card">
+      <div className={`summary-card ${lastRun ? (lastRun.passed ? "status-success" : "status-danger") : ""}`}>
         <dt>Tests</dt>
-        <dd>
-          {tests.passed !== undefined
-            ? `${tests.passed} passed${tests.failed !== undefined ? `, ${tests.failed} failed` : ""}`
-            : "No structured count"}
-        </dd>
-        {tests.passed !== undefined ? <small>As reported by the agent</small> : undefined}
+        {lastRun ? (
+          <>
+            <dd>{lastRun.passed ? "Passed" : "Failed"} · {lastRun.commands.filter((command) => command.exitCode === 0).length} / {lastRun.commands.length} commands</dd>
+            <small>Re-run in the workspace</small>
+          </>
+        ) : (
+          <>
+            <dd>{tests.passed !== undefined ? `${tests.passed} passed${tests.failed !== undefined ? `, ${tests.failed} failed` : ""}` : "No structured count"}</dd>
+            {tests.passed !== undefined ? <small>As reported by the agent</small> : undefined}
+          </>
+        )}
       </div>
       <div className={`summary-card ${model.policy && !model.policy.automaticContributionAllowed ? "status-warning" : ""}`}>
         <dt>Repository policy</dt>
         <dd>{model.policy?.label ?? "Not available"}</dd>
       </div>
-      <div className={`summary-card ${model.review.state === "blocked-by-policy" || model.review.state === "changes-requested" ? "status-warning" : model.review.state === "submitted" ? "status-success" : "status-active"}`}>
+      <div className={`summary-card ${["blocked-by-policy", "changes-requested"].includes(model.review.state) ? "status-warning" : model.review.state === "submitted" ? "status-success" : "status-active"}`}>
         <dt>Review</dt>
         <dd>{model.review.label}</dd>
       </div>
@@ -275,6 +346,9 @@ function UnderstandView({ model, openFile }: { model: WorkspaceModel; openFile: 
           </li>
         ))}
       </ul>
+      {model.droppedFiles.length ? (
+        <p className="unavailable">Removed from the patch by a requested change: {model.droppedFiles.join(", ")}.</p>
+      ) : undefined}
 
       <h3 className="workspace-subheading">Requirement → file mapping</h3>
       {model.mapping?.length ? (
@@ -347,34 +421,53 @@ const renderedDiffLines = 1_500;
 
 function DiffView({ model, selectedPath, onSelect }: { model: WorkspaceModel; selectedPath?: string; onSelect: (path: string) => void }) {
   const file = model.files.find((entry) => entry.path === selectedPath) ?? model.files[0];
+  const [against, setAgainst] = useState<"base" | "original">("base");
+  const compareOriginal = model.current.number > 0 && against === "original";
   return (
     <>
       <PanelTitle eyebrow="Diff" title="Exact change" icon={<FileDiff size={17} />} />
-      <RevisionNote model={model} />
+      <VersionNote model={model} />
+      {model.current.number > 0 ? (
+        <div className="segmented" role="group" aria-label="Compare the current version against">
+          <button type="button" aria-pressed={against === "base"} onClick={() => setAgainst("base")}>Against the base branch</button>
+          <button type="button" aria-pressed={against === "original"} onClick={() => setAgainst("original")}>Against the original Squasher patch</button>
+        </div>
+      ) : undefined}
       <div className="workspace-split">
         <FileNav model={model} selectedPath={file?.path} onSelect={onSelect} label="Files in the diff" />
-        {file ? <FileDiffView file={file} /> : undefined}
+        {file ? <FileDiffView file={file} againstOriginal={compareOriginal} /> : undefined}
       </div>
     </>
   );
 }
 
-function RevisionNote({ model }: { model: WorkspaceModel }) {
-  const { revisions } = model;
+function VersionNote({ model }: { model: WorkspaceModel }) {
+  const applied = model.versions.filter((version) => version.source === "requested-change").length;
   return (
     <div className="revision-note" role="note">
-      <span><strong>Original Squasher patch</strong> {revisions.original.files} file{revisions.original.files === 1 ? "" : "s"}</span>
-      <span><strong>Human or requested changes applied</strong> {revisions.applied.length === 0 ? "none" : revisions.applied.length}</span>
-      <span><strong>Current proposed patch</strong> {revisions.proposed.sameAsOriginal ? "same as the original" : `${revisions.proposed.files} files`}</span>
-      {revisions.pendingRequests ? (
-        <span className="unavailable">{revisions.pendingRequests} requested change{revisions.pendingRequests === 1 ? "" : "s"} recorded, not yet implemented.</span>
-      ) : undefined}
+      <span><strong>Original Squasher patch</strong> {model.versions[0]!.files} file{model.versions[0]!.files === 1 ? "" : "s"}</span>
+      <span><strong>Requested changes applied</strong> {applied || "none"}</span>
+      <span><strong>Current proposed patch</strong> {model.current.number === 0 ? "same as the original" : `revision ${model.current.number}, ${model.files.length} file${model.files.length === 1 ? "" : "s"}`}</span>
     </div>
   );
 }
 
-function FileDiffView({ file }: { file: WorkspaceFile }) {
+function FileDiffView({ file, againstOriginal }: { file: WorkspaceFile; againstOriginal: boolean }) {
   const [showAll, setShowAll] = useState(false);
+  if (againstOriginal) {
+    if (file.newInRevision) {
+      return <div className="file-detail"><div className="change-card-head"><code>{file.path}</code></div><p className="unavailable">This file is new in the revision: it was not in the original Squasher patch.</p><pre className="workspace-code" tabIndex={0}>{file.after}</pre></div>;
+    }
+    if (!file.sinceOriginal || file.sinceOriginal.hunks.length === 0) {
+      return <div className="file-detail"><div className="change-card-head"><code>{file.path}</code></div><p className="unavailable">Unchanged since the original Squasher patch.</p></div>;
+    }
+    return (
+      <div className="file-detail">
+        <div className="change-card-head"><code>{file.path}</code><span className="change-badge change-modified">Changed by request · +{file.sinceOriginal.additions} −{file.sinceOriginal.deletions}</span></div>
+        <DiffTable diff={file.sinceOriginal} path={file.path} limit={showAll ? Infinity : renderedDiffLines} />
+      </div>
+    );
+  }
   if (!file.diff) {
     return (
       <div className="file-detail">
@@ -436,15 +529,34 @@ function DiffTable({ diff, path, limit }: { diff: FileDiffModel; path: string; l
 }
 
 function TestsView({ run, model }: { run: DashboardRun; model: WorkspaceModel }) {
+  const testJobs = [...model.jobs].reverse().filter((job) => job.kind === "test-run" || job.kind === "verify");
   const commands = run.harness.trace.filter((event) => event.category === "sandbox" && event.command && /\b(?:test|pytest|vitest|jest|spec|repro|check|lint|build)\b/i.test(event.command));
-  const proof = run.proof;
+  const proof = model.proof;
   return (
     <>
       <PanelTitle eyebrow="Tests" title="Tests and verification" icon={<TestTube2 size={17} />} />
-      <div className="evidence-note" role="note">
-        <AlertTriangle size={16} aria-hidden="true" />
-        <span>Re-running tests from the workspace is not connected yet. Everything below was recorded during the run.</span>
-      </div>
+
+      <h3 className="workspace-subheading">Test runs from the workspace</h3>
+      {testJobs.length ? (
+        <ol className="test-runs">
+          {testJobs.map((job) => <TestRunCard key={job.id} job={job} />)}
+        </ol>
+      ) : (
+        <p className="unavailable">No tests have been re-run from the workspace yet.</p>
+      )}
+
+      <h3 className="workspace-subheading">Recorded test commands for this version</h3>
+      {model.testCommands?.length ? (
+        <ul className="command-list">
+          {model.testCommands.map((command) => (
+            <li key={command.command}><code>{command.command}</code>{command.purpose ? <span className="workspace-small">{command.purpose}</span> : undefined}</li>
+          ))}
+        </ul>
+      ) : (
+        <p className="unavailable">None recorded. Run tests will re-verify the patch with Squasher and record them.</p>
+      )}
+
+      <h3 className="workspace-subheading">Verification recorded when this version was made</h3>
       <dl className="proof-list">
         <div><dt>Attempts</dt><dd>{proof?.attempts ? <MarkdownContent value={proof.attempts} /> : <span className="unavailable">Not recorded.</span>}</dd></div>
         <div><dt>Before the change</dt><dd>{proof?.before ? <MarkdownContent value={proof.before} /> : <span className="unavailable">Not recorded.</span>}</dd></div>
@@ -452,20 +564,50 @@ function TestsView({ run, model }: { run: DashboardRun; model: WorkspaceModel })
         <div><dt>Regression checks</dt><dd>{proof?.regressions ? <MarkdownContent value={proof.regressions} /> : <span className="unavailable">Not recorded.</span>}</dd></div>
       </dl>
       <SourceTag source="agent" />
-      {model.tests.passed !== undefined ? (
-        <p className="workspace-small">Counts in the summary are read from the regression text above; they are the agent's report, not a separate measurement.</p>
+      {model.current.number === 0 ? (
+        <>
+          <h3 className="workspace-subheading">Test commands in the original run's trace</h3>
+          {commands.length ? (
+            <ul className="command-list">{commands.map((event) => <li key={event.id}><code>{event.command}</code><SourceTag source="trace" /></li>)}</ul>
+          ) : (
+            <p className="unavailable">No test commands are in the retained trace.</p>
+          )}
+        </>
       ) : undefined}
-      <h3 className="workspace-subheading">Test commands in the trace</h3>
-      {commands.length ? (
+    </>
+  );
+}
+
+function TestRunCard({ job }: { job: WorkspaceJobView }) {
+  const run = job.testRun;
+  const state = job.status === "running" ? "running" : job.status === "failed" ? "failed" : run ? (run.passed ? "passed" : "failed") : "passed";
+  return (
+    <li className={`test-run test-run-${state}`}>
+      <div className="change-card-head">
+        <strong>{job.kind === "verify" ? "Re-verification by Squasher" : "Recorded test commands"} · {job.revision === 0 ? "original patch" : `revision ${job.revision}`}</strong>
+        <span className={`result-badge ${state === "running" ? "pending" : state}`}>{state === "running" ? job.stage : state === "passed" ? "passed" : "failed"}</span>
+      </div>
+      <p className="workspace-small"><time dateTime={job.updatedAt}>{new Date(job.updatedAt).toLocaleString()}</time>{job.producedRevision ? ` · recorded as revision ${job.producedRevision}` : ""}</p>
+      {job.error ? <p className="workspace-action-note error">{job.error}</p> : undefined}
+      {run ? (
         <ul className="command-list">
-          {commands.map((event) => (
-            <li key={event.id}><code>{event.command}</code><SourceTag source="trace" /></li>
+          {run.commands.map((command, index) => (
+            <li key={`${command.command}-${index}`} className="command-result">
+              <div className="change-card-head">
+                <code>{command.command}</code>
+                <span className={`result-badge ${command.exitCode === 0 ? "passed" : "failed"}`}>{command.exitCode === 0 ? "exit 0" : command.exitCode === null ? "did not finish" : `exit ${command.exitCode}`}</span>
+              </div>
+              {command.stdout || command.stderr ? (
+                <details className="raw-evidence">
+                  <summary><TestTube2 size={14} aria-hidden="true" />Output ({Math.round(command.durationMs / 1000)}s)</summary>
+                  <pre>{[command.stdout, command.stderr].filter(Boolean).join("\n")}</pre>
+                </details>
+              ) : undefined}
+            </li>
           ))}
         </ul>
-      ) : (
-        <p className="unavailable">No test commands are in the retained trace.</p>
-      )}
-    </>
+      ) : undefined}
+    </li>
   );
 }
 
@@ -567,6 +709,13 @@ function AskView({ run, ask }: { run: DashboardRun; ask: WorkspaceActions["ask"]
   );
 }
 
+const changeRequestStatus: Record<ChangeRequestView["status"], string> = {
+  recorded: "Recorded, not applied",
+  "in-progress": "Squasher is applying it",
+  implemented: "Applied",
+  failed: "Could not be applied"
+};
+
 function FinalReview({ run, model, goTo }: { run: DashboardRun; model: WorkspaceModel; goTo: (tab: TabId) => void }) {
   const [copied, setCopied] = useState<string | undefined>();
   const exportable = model.files.filter((file) => file.change !== "unknown");
@@ -575,6 +724,8 @@ function FinalReview({ run, model, goTo }: { run: DashboardRun; model: Workspace
     ? unifiedPatch(exportable.map((file) => ({ path: file.path, before: file.before ?? "", after: file.after, added: file.change === "added" })))
     : undefined;
   const prohibited = model.policy && !model.policy.automaticContributionAllowed;
+  const applied = model.versions.filter((version) => version.source === "requested-change").length;
+  const lastRun = model.latestTestRun?.testRun;
 
   async function copyPatch() {
     if (!patchText) return;
@@ -591,13 +742,20 @@ function FinalReview({ run, model, goTo }: { run: DashboardRun; model: Workspace
       <PanelTitle eyebrow="Final review" title="Before any contribution" icon={<ShieldCheck size={17} />} />
       <dl className="final-review">
         <div><dt>Implementation</dt><dd>{model.implementation?.label ?? "Not reported"}</dd></div>
+        <div><dt>Version under review</dt><dd>{model.current.number === 0 ? "Original Squasher patch" : `Revision ${model.current.number}`}</dd></div>
         <div><dt>Requirements</dt><dd>{model.requirements.counted ? `${model.requirements.satisfied} / ${model.requirements.counted} satisfied` : "Not recorded"}</dd></div>
-        <div><dt>Tests</dt><dd>{model.tests.passed !== undefined ? `${model.tests.passed} passed${model.tests.failed !== undefined ? `, ${model.tests.failed} failed` : ""} (agent-reported)` : "No structured count; see Tests"}</dd></div>
-        <div><dt>Files changed</dt><dd>{model.files.length}</dd></div>
         <div>
-          <dt>Human modifications</dt>
-          <dd>None applied.{model.changeRequests.length ? ` ${model.changeRequests.length} requested, not yet implemented by Squasher.` : ""}</dd>
+          <dt>Tests</dt>
+          <dd>
+            {lastRun
+              ? `Re-run in the workspace: ${lastRun.passed ? "passed" : "failed"}`
+              : model.tests.passed !== undefined
+                ? `${model.tests.passed} passed${model.tests.failed !== undefined ? `, ${model.tests.failed} failed` : ""} (agent-reported)`
+                : "No structured count; see Tests"}
+          </dd>
         </div>
+        <div><dt>Files changed</dt><dd>{model.files.length}</dd></div>
+        <div><dt>Requested changes applied</dt><dd>{applied || "None"}</dd></div>
         <div><dt>Contribution</dt><dd>{model.contribution ? `${model.contribution.label}: ${model.contribution.reason}` : "Not available"}</dd></div>
       </dl>
 
@@ -616,12 +774,27 @@ function FinalReview({ run, model, goTo }: { run: DashboardRun; model: Workspace
 
       {prohibited ? <p className="policy-verdict" role="note"><AlertTriangle size={16} aria-hidden="true" />Repository policy prohibits this contribution. Squasher will not create a pull request.</p> : undefined}
 
+      <h3 className="workspace-subheading"><History size={15} aria-hidden="true" /> Version history</h3>
+      <ol className="version-history">
+        {model.versions.map((version) => (
+          <li key={version.number} className={version.number === model.current.number ? "current" : undefined}>
+            <strong>{version.label}</strong>
+            <span>{version.files} file{version.files === 1 ? "" : "s"}{version.source === "verification" ? " · re-verified, unchanged" : ""}{version.submitted ? " · on GitHub" : ""}{version.number === model.current.number ? " · under review" : ""}</span>
+            {version.changeRequest ? <span className="workspace-small">Requested: {version.changeRequest}</span> : undefined}
+          </li>
+        ))}
+      </ol>
+
       {model.changeRequests.length ? (
         <>
           <h3 className="workspace-subheading">Requested changes</h3>
           <ul className="change-requests">
             {model.changeRequests.map((request) => (
-              <li key={request.id}><MarkdownContent value={request.text} /><span className="requirement-owner">Recorded · not yet implemented</span></li>
+              <li key={request.id} className={`change-request-${request.status}`}>
+                <MarkdownContent value={request.text} />
+                <span className="requirement-owner">{changeRequestStatus[request.status]}{request.revision ? ` · revision ${request.revision}` : ""}</span>
+                {request.error ? <p className="workspace-action-note error">{request.error}</p> : undefined}
+              </li>
             ))}
           </ul>
         </>
@@ -659,18 +832,19 @@ function Dialog({ title, onClose, children }: { title: string; onClose: () => vo
   );
 }
 
-function RequestChangesDialog({ onClose, onSubmit }: { onClose: () => void; onSubmit: (text: string) => Promise<void> }) {
+function RequestChangesDialog({ onClose, onSubmit }: { onClose: () => void; onSubmit: (text: string) => Promise<ChangeRequestSubmission> }) {
   const [text, setText] = useState("");
-  const [state, setState] = useState<"editing" | "saving" | "recorded" | "error">("editing");
+  const [state, setState] = useState<"editing" | "saving" | "done" | "error">("editing");
   const [error, setError] = useState<string | undefined>();
+  const [submission, setSubmission] = useState<ChangeRequestSubmission | undefined>();
   const inputId = useId();
 
   async function submit() {
     setState("saving");
     setError(undefined);
     try {
-      await onSubmit(text.trim());
-      setState("recorded");
+      setSubmission(await onSubmit(text.trim()));
+      setState("done");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The change request was not recorded");
       setState("error");
@@ -679,32 +853,37 @@ function RequestChangesDialog({ onClose, onSubmit }: { onClose: () => void; onSu
 
   return (
     <Dialog title="Request changes" onClose={onClose}>
-      {state === "recorded" ? (
+      {state === "done" ? (
         <div role="status">
           <p><strong>Requested change:</strong> {text}</p>
-          <p><strong>Status:</strong> Recorded, awaiting implementation. Squasher does not apply requested changes automatically yet, so the patch is unchanged.</p>
+          {submission?.job ? (
+            <p><strong>Status:</strong> Squasher is applying it now in a fresh session, then re-running the tests. It appears as a new revision when its evidence holds; the current patch is unchanged until then.</p>
+          ) : (
+            <p><strong>Status:</strong> Recorded, but not applied: {submission?.jobError ?? "Squasher could not start on it."}</p>
+          )}
           <button type="button" className="button" onClick={onClose}><Check size={15} aria-hidden="true" />Done</button>
         </div>
       ) : (
         <form onSubmit={(event) => { event.preventDefault(); void submit(); }}>
           <label htmlFor={inputId}>Describe the change you want</label>
           <textarea id={inputId} rows={4} maxLength={2000} autoFocus value={text} onChange={(event) => setText(event.target.value)} placeholder="For example: Don't modify CHANGELOG.md." />
-          <p className="workspace-small">The request is recorded against this run. It is not yet implemented automatically: nothing in the patch changes until it is.</p>
+          <p className="workspace-small">Squasher applies it in a fresh session, re-runs the tests and checks the requirements. The result is a new revision for you to review; nothing reaches GitHub until you approve it.</p>
           {error ? <p className="workspace-action-note error" role="alert">{error}</p> : undefined}
-          <button type="submit" className="button button-primary" disabled={state === "saving" || text.trim().length < 3}>{state === "saving" ? "Recording" : "Record request"}</button>
+          <button type="submit" className="button button-primary" disabled={state === "saving" || text.trim().length < 3}>{state === "saving" ? "Sending" : "Request change"}</button>
         </form>
       )}
     </Dialog>
   );
 }
 
-function ApproveDialog({ model, onClose, onConfirm }: { model: WorkspaceModel; onClose: () => void; onConfirm: () => Promise<void> }) {
+function ApproveDialog({ run, model, onClose, onConfirm }: { run: DashboardRun; model: WorkspaceModel; onClose: () => void; onConfirm: () => Promise<void> }) {
   return (
-    <Dialog title="Approve contribution" onClose={onClose}>
-      <p>You are confirming that you reviewed this patch and want Squasher to continue with the contribution.</p>
+    <Dialog title={model.approval.label} onClose={onClose}>
+      <p>You are confirming that you reviewed {model.current.number === 0 ? "this patch" : `revision ${model.current.number}`} and want Squasher to continue with the contribution.</p>
       <ul className="plain-list">
         <li>The patch was generated by Squasher, an automated agent. Approving does not make it human-authored.</li>
-        <li>{model.contribution?.reason ?? "The paused write resumes through the existing approval checkpoint."}</li>
+        <li>{model.approval.reason}</li>
+        {run.pullRequest ? <li>Pull request #{run.pullRequest.number} is already open; this adds one commit to its branch.</li> : undefined}
         {model.policy ? <li>Repository policy: {model.policy.label}. {model.policy.nextStep}</li> : undefined}
       </ul>
       <div className="technical-links">

@@ -112,11 +112,27 @@ function record(overrides: {
   } as unknown as WebhookRecord;
 }
 
+const runningJob = {
+  id: "job-1",
+  kind: "apply-change" as const,
+  status: "running" as const,
+  stage: "Applying the change and re-running tests",
+  createdAt: "2026-09-30T01:00:00Z",
+  updatedAt: "2026-09-30T01:00:00Z",
+  revision: 0,
+  changeRequestId: "change-1"
+};
+
 function actions(overrides: Partial<WorkspaceActions> = {}): WorkspaceActions {
   return {
     approve: vi.fn().mockResolvedValue(undefined),
+    approveRevision: vi.fn().mockResolvedValue({ pullRequest: { number: 176 }, updated: false, revision: 1 }),
     ask: vi.fn().mockResolvedValue({ question: "q", answer: "It adds weekly updates.", contextSections: ["Patch"], missingSections: [], answeredAt: "t" }),
-    requestChange: vi.fn().mockResolvedValue({ id: "change-1", runId: "r", text: "Don't modify CHANGELOG.md.", createdAt: "t", status: "recorded" }),
+    requestChange: vi.fn().mockResolvedValue({
+      changeRequest: { id: "change-1", runId: "r", text: "Don't modify CHANGELOG.md.", createdAt: "t", status: "recorded" },
+      job: runningJob
+    }),
+    runTests: vi.fn().mockResolvedValue({ ...runningJob, id: "job-2", kind: "verify", changeRequestId: undefined, stage: "Re-running the checks" }),
     ...overrides
   };
 }
@@ -195,17 +211,59 @@ describe("contribution workspace", () => {
     expect(host!.querySelectorAll("tr.diff-added")).toHaveLength(0);
   });
 
-  it("shows the recorded tests and says re-running is not connected", () => {
+  it("shows the recorded verification, and re-verifies with Squasher when no test commands were recorded", async () => {
     const view = render(record());
     click(/^Tests$/);
     expect(view.text()).toContain("The validator passed 3/3.");
     expect(view.text()).toContain("python3 -m pytest -q --cov=app");
-    expect(view.text()).toContain("Re-running tests from the workspace is not connected yet");
-    const runTests = [...host!.querySelectorAll("button")].find((button) => button.textContent?.includes("Run tests"))!;
-    expect(runTests.disabled).toBe(true);
+    expect(view.text()).toContain("None recorded. Run tests will re-verify the patch with Squasher");
+    expect(view.text()).toContain("No test commands were recorded for this version");
+
+    await act(async () => {
+      click(/Run tests/);
+    });
+    expect(view.workspaceActions.runTests).toHaveBeenCalledWith("github-drkrillo-good-first-issues-174-ws");
+    expect(view.text()).toContain("Re-verifying the patch:");
   });
 
-  it("records a requested change without claiming it was applied", async () => {
+  it("shows a recorded test run's commands, exit codes and output, and blocks approval when it failed", () => {
+    const view = render(
+      record({
+        extra: {
+          workspaceJobs: [
+            {
+              id: "job-t",
+              kind: "test-run",
+              status: "succeeded",
+              stage: "Tests failed",
+              createdAt: "2026-09-30T02:00:00Z",
+              updatedAt: "2026-09-30T02:00:00Z",
+              revision: 0,
+              testRun: {
+                passed: false,
+                source: "recorded-commands",
+                commands: [
+                  { command: "pip install -r requirements.txt", exitCode: 0, durationMs: 4000, stdout: "installed", stderr: "" },
+                  { command: "python3 -m pytest -q", exitCode: 1, durationMs: 9000, stdout: "1 failed, 82 passed", stderr: "" }
+                ]
+              }
+            }
+          ]
+        }
+      })
+    );
+
+    expect(host!.querySelector(".summary-card.status-danger")?.textContent).toContain("Failed · 1 / 2 commands");
+    click(/^Tests$/);
+    expect(view.text()).toContain("python3 -m pytest -q");
+    expect(view.text()).toContain("exit 1");
+    expect(view.text()).toContain("1 failed, 82 passed");
+    const approve = [...host!.querySelectorAll(".workspace-actions button")].at(-1) as HTMLButtonElement;
+    expect(approve.disabled).toBe(true);
+    expect(view.text()).toContain("The latest test run of this version failed");
+  });
+
+  it("starts applying a requested change and shows Squasher working, without claiming it is done", async () => {
     const view = render(record());
     click("Request changes");
     const dialog = host!.querySelector('[role="dialog"]')!;
@@ -216,8 +274,34 @@ describe("contribution workspace", () => {
     });
 
     expect(view.workspaceActions.requestChange).toHaveBeenCalledWith("github-drkrillo-good-first-issues-174-ws", "Don't modify CHANGELOG.md.");
-    expect(view.text()).toContain("Recorded, awaiting implementation");
-    expect(view.text()).toContain("the patch is unchanged");
+    expect(view.text()).toContain("Squasher is applying it now in a fresh session");
+    expect(view.text()).toContain("the current patch is unchanged until then");
+    expect(view.text()).toContain("Squasher is working");
+    expect(host!.querySelector('[role="status"][aria-live="polite"]')?.textContent).toContain("Applying the requested change:");
+    // Nothing else can start, and nothing can be approved, while it works.
+    const buttons = [...host!.querySelectorAll(".workspace-actions button")] as HTMLButtonElement[];
+    expect(buttons.find((button) => button.textContent?.includes("Request changes"))!.disabled).toBe(true);
+    expect(buttons.find((button) => button.textContent?.includes("Run tests"))!.disabled).toBe(true);
+  });
+
+  it("says when a requested change was recorded but could not be started", async () => {
+    const view = render(
+      record(),
+      actions({
+        requestChange: vi.fn().mockResolvedValue({
+          changeRequest: { id: "change-2", runId: "r", text: "Rename the file.", createdAt: "t", status: "recorded" },
+          jobError: "Squasher's agent is not configured on this server"
+        })
+      })
+    );
+    click("Request changes");
+    const dialog = host!.querySelector('[role="dialog"]')!;
+    type(dialog.querySelector("textarea")!, "Rename the file.");
+    await act(async () => {
+      (dialog.querySelector('button[type="submit"]') as HTMLButtonElement).click();
+    });
+
+    expect(view.text()).toContain("Recorded, but not applied: Squasher's agent is not configured on this server");
     expect(view.text()).toContain("Changes requested");
   });
 
@@ -297,6 +381,68 @@ describe("contribution workspace", () => {
     // Without a status, a failed run with a patch is not presented as reviewable.
     const failed = render(record({ statuses: null, status: "failed", omitOptional: true }));
     expect(failed.text()).toContain("Nothing to review");
+  });
+
+  const revision = {
+    number: 1,
+    source: "requested-change",
+    basedOn: 0,
+    createdAt: "2026-09-30T03:00:00Z",
+    hash: "r".repeat(64),
+    title: "Add Dependabot (monthly)",
+    summary: "Switched both schedules to monthly as requested.",
+    changeRequestText: "Use a monthly schedule.",
+    files: [{ path: ".github/dependabot.yml", content: dependabot.replace("weekly", "monthly") }],
+    requirements: [{ requirement: "A pip entry, monthly", verdict: "pass", evidence: "Validator OK 3/3." }],
+    testCommands: [{ command: "python3 -m pytest -q", purpose: "suite" }]
+  };
+
+  it("reviews the latest revision against the original patch and approves that exact revision", async () => {
+    const view = render(record({ status: "patch-ready", statuses: { ...verified, contribution: { status: "blocked", label: "Blocked", reason: "No approval checkpoint is held" } }, extra: { revisions: [revision], changeRequests: [{ id: "change-1", runId: "r", text: "Use a monthly schedule.", createdAt: "t", status: "implemented", revision: 1 }], contribution: { mode: "fork", writable: true, headOwner: "me", reason: "fork" } } }));
+
+    expect(view.text()).toContain("Contribution workspace · Revision 1");
+    expect(view.text()).toContain("Add Dependabot (monthly)");
+    expect(view.text()).toContain("1 / 1 satisfied");
+
+    click(/^Diff$/);
+    expect(view.text()).toContain("Current proposed patch revision 1");
+    click("Against the original Squasher patch");
+    expect(host!.querySelector("tr.diff-removed")?.textContent).toContain('interval: "weekly"');
+    expect(host!.querySelector("tr.diff-added")?.textContent).toContain('interval: "monthly"');
+
+    click(/^Final review$/);
+    expect(view.text()).toContain("Revision 1");
+    expect(view.text()).toContain("Requested: Use a monthly schedule.");
+    expect(view.text()).toContain("Applied · revision 1");
+
+    click("Approve revision 1");
+    await act(async () => {
+      click("Approve and continue");
+    });
+    expect(view.workspaceActions.approveRevision).toHaveBeenCalledWith("github-drkrillo-good-first-issues-174-ws", 1, "r".repeat(64));
+    expect(view.workspaceActions.approve).not.toHaveBeenCalled();
+    expect(view.text()).toContain("Pull request #176 opened with revision 1.");
+  });
+
+  it("offers to update an open pull request with a newer revision, and not with the one it already has", () => {
+    const withPr = (submittedRevision: number) =>
+      record({
+        status: "pr-created",
+        statuses: { ...verified, contribution: { status: "submitted", label: "Submitted", reason: "Pull request #176 is open" } },
+        result: { pullRequest: { number: 176, url: "https://github.test/pull/176" } },
+        extra: { revisions: [revision], submittedRevision, contribution: { mode: "fork", writable: true, headOwner: "me", reason: "fork" } }
+      });
+
+    const newer = render(withPr(0));
+    const update = [...host!.querySelectorAll(".workspace-actions button")].at(-1) as HTMLButtonElement;
+    expect(update.textContent).toContain("Update pull request #176 with revision 1");
+    expect(update.disabled).toBe(false);
+    expect(newer.text()).toContain("Awaiting human review");
+
+    const same = render(withPr(1));
+    const done = [...host!.querySelectorAll(".workspace-actions button")].at(-1) as HTMLButtonElement;
+    expect(done.disabled).toBe(true);
+    expect(same.text()).toContain("This version is already in pull request #176.");
   });
 
   it("does not open for an unverified change", () => {

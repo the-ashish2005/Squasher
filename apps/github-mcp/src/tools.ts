@@ -38,8 +38,9 @@ export interface GitHubRestClientLike {
   createTree(
     owner: string,
     repo: string,
-    input: { baseTree: string; files: Array<{ path: string; content: string }> }
+    input: { baseTree: string; files: Array<{ path: string; content: string }>; deletions?: string[] }
   ): Promise<{ sha: string }>;
+  updateBranch?(owner: string, repo: string, branch: string, sha: string): Promise<void>;
   createCommit(
     owner: string,
     repo: string,
@@ -919,6 +920,7 @@ function expectSquasherResult(args: Record<string, unknown>): void {
   expectRequirements(args.requirements, args.status);
   expectDiscussionClaims(args.discussionClaims);
   expectFileChanges(args.fileChanges, args.candidatePatch, args.requirements);
+  expectTestCommands(args.testCommands);
   if (args.candidatePatch === null) return;
   if (!args.candidatePatch || typeof args.candidatePatch !== "object" || Array.isArray(args.candidatePatch)) {
     throw new Error("Expected candidatePatch object or null");
@@ -1073,6 +1075,25 @@ function expectFileChanges(value: unknown, candidatePatch: unknown, requirements
         }
       }
     }
+  });
+}
+
+/**
+ * Commands that re-verify the change from a fresh clone of the repository with the patch
+ * applied, run from the repository root. The workspace runs them again on request, so each
+ * must be self-contained: setup included, nothing assumed from the agent's own sandbox.
+ */
+function expectTestCommands(value: unknown): void {
+  if (value === undefined || value === null) return;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 8) {
+    throw new Error("Expected testCommands to be an array of 1 to 8 commands");
+  }
+  value.forEach((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`Expected testCommands[${index}] to be an object`);
+    const command = entry as Record<string, unknown>;
+    const text = expectMeaningfulText(command.command, `testCommands[${index}].command`, 3);
+    if (text.length > 1_000) throw new Error(`testCommands[${index}].command is too long; keep it to one runnable command`);
+    expectMeaningfulText(command.purpose, `testCommands[${index}].purpose`, 4);
   });
 }
 

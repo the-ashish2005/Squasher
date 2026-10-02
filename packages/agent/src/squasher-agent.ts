@@ -15,7 +15,10 @@ export function resolveIterationLimit(env: NodeJS.ProcessEnv = process.env): num
   return Number.isInteger(parsed) && parsed > 0 ? parsed : defaultAgentIterationLimit;
 }
 
-export function buildSquasherAgentSpec(config: TrueForgeRuntimeConfig) {
+/** Tools a revision session may use: everything but the GitHub write. */
+export const revisionSessionTools = ["read_issue", "read_file", "read_repository_instructions", "submit_squasher_result"];
+
+export function buildSquasherAgentSpec(config: TrueForgeRuntimeConfig, options: { revision?: boolean } = {}) {
   return {
     model: {
       name: `${config.modelProvider ?? "custom"}/${config.modelName}`
@@ -39,7 +42,7 @@ export function buildSquasherAgentSpec(config: TrueForgeRuntimeConfig) {
       "WORK IN A LOCAL CLONE for anything beyond a small change: `git clone --depth 1` the repository into the sandbox and use grep, file inspection, editing and the project's own build and test commands there. Use the GitHub tools for the issue, its discussion and targeted reads; do not pull whole large files through read_file repeatedly. The sandbox has limited memory, so build and test the narrowest target that covers the change (one package, one test file) before trying the whole suite.",
       "ITERATE: inspect, implement, test, diagnose, repair, retest. A failing test is information, not a stopping point: repair and rerun while the failure is reasonably repairable. Code that compiles is not a verified change.",
       "TESTS MUST BE NON-VACUOUS: a new or changed test must fail against the original code where that is feasible and pass against the change; show both in proof.before and proof.after. Never write a test that only restates your implementation's assumptions. In proof.regressions distinguish newly passing tests, pre-existing passing tests, and pre-existing unrelated failures; never claim the whole suite passes while unrelated failures remain.",
-      "VERIFY EVERY REQUIREMENT against the final code and record it in `requirements`: one entry per concrete capability, with verdict pass, fail, already-implemented, missing or out-of-scope, and concrete evidence (observed output, a named test, or a file and line). Your own statement is not evidence, and neither is a comment. When there is a candidatePatch, also give `fileChanges`: one entry per changed file saying what changed, why, and which requirements (their exact text) it satisfies; a maintainer reviews the patch through it. already-implemented requires `codeEvidence` (a path and an excerpt quoted from it) or an `executedCommand` you ran; both are checked against the repository and the sandbox, and a citation that does not hold is sent back to you. A change with any failed requirement is not verified: keep repairing, or submit the status that honestly describes the result. requirements is mandatory for implemented-feature and implemented-improvement.",
+      "VERIFY EVERY REQUIREMENT against the final code and record it in `requirements`: one entry per concrete capability, with verdict pass, fail, already-implemented, missing or out-of-scope, and concrete evidence (observed output, a named test, or a file and line). Your own statement is not evidence, and neither is a comment. When there is a candidatePatch, also give `fileChanges`: one entry per changed file saying what changed, why, and which requirements (their exact text) it satisfies; a maintainer reviews the patch through it. Also give `testCommands`: the commands that re-verify the patch from a FRESH clone of the repository with the patch applied, run from the repository root, setup included (installing dependencies), relying on nothing that exists only in your sandbox; the maintainer re-runs them later. already-implemented requires `codeEvidence` (a path and an excerpt quoted from it) or an `executedCommand` you ran; both are checked against the repository and the sandbox, and a citation that does not hold is sent back to you. A change with any failed requirement is not verified: keep repairing, or submit the status that honestly describes the result. requirements is mandatory for implemented-feature and implemented-improvement.",
       "Use GitHub MCP tools (read_issue, read_file, read_repository_instructions) for GitHub context. Do not query the GitHub REST API with curl in the sandbox; cloning the public repository with git is fine.",
       "read_file returns decoded text in bounded windows. It accepts startLine, endLine and maxBytes, and reports totalLines, the range it returned, complete, truncated and nextStartLine. Inspect large files progressively: start with a small range, use what you learn to pick the next one, and request further ranges only where the relevant code actually is. Do not re-read the same large file whole, and do not assume the first window holds the part you need — check totalLines and move to the region the issue points at.",
       "When a response has complete=false or truncated=true, you have seen only part of that file: the visible end is not the end of the file. Continue from nextStartLine to see more. Never reconstruct a partially read file from what you were shown, and never use one as candidatePatch content — candidatePatch needs the exact full final text, so materialise the whole file in the sandbox and verify it against the sha the response reports before patching it. Every window you read stays in the conversation for the rest of the run, so read the narrowest range that answers the question.",
@@ -78,13 +81,15 @@ export function buildSquasherAgentSpec(config: TrueForgeRuntimeConfig) {
       {
         name: config.mcpServerName ?? "squasher-github",
         preload: true,
-        enableTools: [
-          "read_issue",
-          "read_file",
-          "read_repository_instructions",
-          "submit_squasher_result",
-          "create_fix_pull_request"
-        ],
+        enableTools: options.revision
+          ? revisionSessionTools
+          : [
+              "read_issue",
+              "read_file",
+              "read_repository_instructions",
+              "submit_squasher_result",
+              "create_fix_pull_request"
+            ],
         requireApprovalForTools: ["create_fix_pull_request"]
       }
     ]
@@ -92,6 +97,7 @@ export function buildSquasherAgentSpec(config: TrueForgeRuntimeConfig) {
 }
 
 export function buildInitialUserMessage(input: StartSquasherSessionInput): string {
+  if (input.revision) return buildRevisionMessage(input);
   return [
     "Solve this GitHub issue and verify the result with executed evidence.",
     "",
@@ -128,6 +134,59 @@ export function buildInitialUserMessage(input: StartSquasherSessionInput): strin
     "8. Call the read-only submit_squasher_result MCP tool with one schema-valid object before requesting the gated write. Use only concrete values observed in this run: name the actual failure, executed reproducer, passing validation, regression command, issue-relevant repository paths, and complete final file contents. Never use ellipses, TODO text, generic paths, or example content. After the write is approved and completes, finish with the same object as the final response without a markdown fence.",
     "Use status=not-reproduced, not-actionable, blocked, or failed and set candidatePatch to null when no verified change exists.",
     "0. First classify the report. If it describes an observable failure, follow the reproduction path above. If it instead asks for behaviour that does not exist yet, do not author a test for the requested behaviour and present its failure as a reproduction: implement the change, verify it with tests plus the repository's existing checks, and submit status=implemented-feature or implemented-improvement. If the request cannot be built as described, or is ambiguous, unrelated, or out of scope for this repository, submit status=not-actionable with candidatePatch=null and say which."
+  ].join("\n");
+}
+
+/**
+ * The opening message for a revision session. It keeps the Title and Issue body lines the
+ * harness reads for its scope check, then states the patch under review in full and what
+ * the human asked for.
+ */
+function buildRevisionMessage(input: StartSquasherSessionInput): string {
+  const revision = input.revision!;
+  const files = revision.files.map((file) => [`--- FILE ${file.path}`, file.content, `--- END ${file.path}`].join("\n")).join("\n\n");
+  const task =
+    revision.mode === "apply-change"
+      ? [
+          "A maintainer reviewed the patch below and requested a change to it:",
+          "",
+          `REQUESTED CHANGE: ${revision.changeRequest ?? ""}`,
+          "",
+          "Apply exactly that change, keeping everything else in the patch that the request does not touch."
+        ]
+      : [
+          "A maintainer asked for the patch below to be re-verified. Do NOT change it: candidatePatch must contain exactly these files with exactly this content.",
+          "Re-run the checks that prove it works and record the commands that do so."
+        ];
+  return [
+    "Revise and re-verify a patch under human review.",
+    "",
+    `Repository: ${input.repository}`,
+    `Issue: ${input.issueUrl}`,
+    `Title: ${input.issueTitle}`,
+    `Base branch: ${input.baseBranch}`,
+    "",
+    "Issue body:",
+    input.issueBody,
+    "",
+    ...(input.issueDiscussion !== undefined ? ["Issue discussion:", input.issueDiscussion, ""] : []),
+    "Required proof path:",
+    ...task,
+    ...(revision.previousChanges?.length
+      ? ["", "Changes already requested and applied earlier, which must stay applied:", ...revision.previousChanges.map((change) => `- ${change}`)]
+      : []),
+    ...(revision.requirements?.length
+      ? ["", "Requirements the patch was verified against:", ...revision.requirements.map((entry) => `- [${entry.verdict}] ${entry.requirement}`)]
+      : []),
+    "",
+    "Work in the sandbox: clone the repository at the base branch (git clone --depth 1), write the files below over it, and work from there.",
+    "Then verify: re-run the repository's own tests and checks, and anything needed to show the requested behaviour, at least 3 times with matching results.",
+    "Submit with submit_squasher_result: the same status as the original work (implemented-feature, implemented-improvement or patch-ready), a candidatePatch holding EVERY file of the patch in full (changed or not, and without files the request removes), requirements re-checked against the final code, fileChanges, and testCommands that re-verify the patch from a fresh clone.",
+    "There is no GitHub write in this session. Do not try to open or update a pull request; a human submits the revision after reviewing it.",
+    "If the requested change cannot be made safely or contradicts the issue or the repository's rules, submit status=not-actionable with candidatePatch=null and explain why.",
+    "",
+    "The patch as it stands now:",
+    files
   ].join("\n");
 }
 

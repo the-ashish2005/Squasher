@@ -36,6 +36,12 @@ export interface StartSquasherSessionInput {
    * elides tool results.
    */
   issueDiscussion?: string;
+  /**
+   * Set when this session revises a patch a human is reviewing, rather than solving the
+   * issue from scratch. The session gets no GitHub write tool: a revision is only ever
+   * submitted later, by a human's approval in the Contribution Workspace.
+   */
+  revision?: PatchRevisionRequest;
   repository: string;
   baseBranch: string;
   branchName: string;
@@ -73,4 +79,17 @@ export interface TrueForgeClientLike {
     listEvents(sessionId: string, request?: unknown): Promise<unknown>;
     subscribeToTurn?(sessionId: string, turnId: string, request?: unknown): Promise<AsyncIterable<unknown>>;
   };
+}
+
+export interface PatchRevisionRequest {
+  /** "apply-change" edits the patch; "verify" leaves it alone and re-verifies it. */
+  mode: "apply-change" | "verify";
+  /** The patch as it stands now: every file in full. */
+  files: Array<{ path: string; content: string }>;
+  /** The human's request, for "apply-change". */
+  changeRequest?: string;
+  /** The requirements the patch was verified against, as the reviewer saw them. */
+  requirements?: Array<{ requirement: string; verdict: string }>;
+  /** Earlier requested changes already applied, oldest first, so they are kept. */
+  previousChanges?: string[];
 }

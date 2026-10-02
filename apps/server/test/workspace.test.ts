@@ -113,7 +113,7 @@ describe("contribution workspace endpoints", () => {
     };
   }
 
-  it("records a change request against the run, without changing the patch", async () => {
+  it("records a change request against the run, and says why it was not applied when no agent is configured", async () => {
     const api = await serve();
     try {
       expect((await api.post("/change-requests", { text: "Don't modify CHANGELOG.md." }, null)).status).toBe(401);
@@ -121,7 +121,11 @@ describe("contribution workspace endpoints", () => {
 
       const created = await api.post("/change-requests", { text: "Don't modify CHANGELOG.md." });
       expect(created.status).toBe(201);
-      expect(await created.json()).toMatchObject({ text: "Don't modify CHANGELOG.md.", status: "recorded", patchHash: "a".repeat(64) });
+      const body = await created.json();
+      expect(body.changeRequest).toMatchObject({ text: "Don't modify CHANGELOG.md.", status: "recorded", patchHash: "a".repeat(64) });
+      // This server has no agent configured, so the request is recorded and says why it was not applied.
+      expect(body.job).toBeUndefined();
+      expect(body.jobError).toContain("not configured");
 
       const run = await api.read();
       expect(run.changeRequests).toEqual([expect.objectContaining({ text: "Don't modify CHANGELOG.md.", status: "recorded" })]);

@@ -28,7 +28,15 @@ import {
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import type { RunEvent, RunStatus } from "@squasher/core";
-import { askSquasher, readApprovalSubmission, submitApprovalAction, submitChangeRequest, type ApprovalSubmission } from "./approval-client";
+import {
+  approveRevision,
+  askSquasher,
+  readApprovalSubmission,
+  startTestRun,
+  submitApprovalAction,
+  submitChangeRequest,
+  type ApprovalSubmission
+} from "./approval-client";
 import { ContributionWorkspace } from "./Workspace";
 import { MarkdownContent } from "./MarkdownContent";
 import { ChangeSummary, OutcomeEvidence, OutcomePanel, PanelTitle, RunStatusPills } from "./Outcome";
@@ -166,7 +174,14 @@ function App() {
       {workspaceRoute ? (
         <ContributionWorkspace
           run={run}
-          actions={{ approve: handleApproval, ask: askSquasher, requestChange: submitChangeRequest }}
+          actions={{
+            approve: handleApproval,
+            approveRevision,
+            ask: askSquasher,
+            requestChange: submitChangeRequest,
+            runTests: startTestRun,
+            refresh: loadRun
+          }}
           pendingAction={pendingAction}
           approvalError={approvalError}
           approvalMessage={approval?.message}

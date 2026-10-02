@@ -740,3 +740,25 @@ button:focus-visible, a:focus-visible, summary:focus-visible {
   .workspace-actions .workspace-action-note:not(.error) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
   .diff-scroll { max-height: 460px; }
 }
+
+/* Workspace revisions, jobs and test runs. */
+.workspace-progress { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; padding: 10px 12px; border: 2px solid #83a9e6; background: #e9f1ff; color: #123d82; font-size: 0.82rem; }
+.workspace-progress svg { flex: 0 0 auto; }
+.segmented { display: inline-flex; flex-wrap: wrap; gap: 0; margin: 0 0 12px; border: 2px solid #7f91a8; }
+.segmented button { min-height: 34px; padding: 0 12px; border: 0; background: #ffffff; color: #243a56; font-size: 0.76rem; font-weight: 700; cursor: pointer; }
+.segmented button[aria-pressed="true"] { background: #1554b6; color: #ffffff; }
+.test-runs { display: grid; gap: 10px; margin: 0 0 8px; padding: 0; list-style: none; }
+.test-run { padding: 12px; border: 1px solid #b8c4d3; border-left: 4px solid #7892b1; background: #ffffff; }
+.test-run-passed { border-left-color: #168b75; }
+.test-run-failed { border-left-color: var(--red); }
+.test-run-running { border-left-color: #1554b6; }
+.command-result { display: grid !important; gap: 4px; }
+.command-result .raw-evidence { margin-top: 2px; }
+.version-history { display: grid; gap: 6px; margin: 0 0 8px; padding: 0; list-style: none; }
+.version-history li { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid #d3dce7; background: #ffffff; font-size: 0.8rem; }
+.version-history li.current { border: 2px solid #1554b6; background: #e8f0ff; }
+.version-history span { color: var(--muted); }
+.change-request-implemented { border-color: #5ab89e !important; background: #e8f7f3 !important; }
+.change-request-failed { border-color: #e08a81 !important; background: #fff0ee !important; }
+.change-request-in-progress { border-color: #83a9e6 !important; background: #e9f1ff !important; }
+.workspace-subheading svg { vertical-align: -2px; }

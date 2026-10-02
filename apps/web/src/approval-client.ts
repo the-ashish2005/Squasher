@@ -2,7 +2,7 @@ const approvalTokenKey = "squasher:approval-token";
 const legacyApprovalTokenKey = "byter:approval-token";
 
 import type { RunStatus } from "@squasher/core";
-import { apiUrl, type ApprovalActionId, type ChangeRequestView } from "./data";
+import { apiUrl, type ApprovalActionId, type ChangeRequestView, type WorkspaceJobView } from "./data";
 
 export interface ApprovalSubmission {
   id: string;
@@ -64,16 +64,38 @@ export async function askSquasher(runId: string, question: string): Promise<AskA
   return body as unknown as AskAnswer;
 }
 
-/** Records a requested change against the run. Squasher does not apply it yet. */
-export async function submitChangeRequest(runId: string, text: string): Promise<ChangeRequestView> {
-  const response = await fetch(apiUrl(`/api/runs/${encodeURIComponent(runId)}/change-requests`), {
+export interface ChangeRequestSubmission {
+  changeRequest: ChangeRequestView;
+  /** Squasher's job applying it, when one started. */
+  job?: WorkspaceJobView;
+  /** Why no job started, when the request was recorded but cannot be applied now. */
+  jobError?: string;
+}
+
+async function postWorkspace<T>(runId: string, path: string, body: unknown, label: string): Promise<T> {
+  const response = await fetch(apiUrl(`/api/runs/${encodeURIComponent(runId)}/${path}`), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...approvalAuthHeader() },
-    body: JSON.stringify({ text })
+    body: JSON.stringify(body)
   });
-  const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!response.ok) throw new Error(typeof body.error === "string" ? body.error : `Change request API returned ${response.status}`);
-  return body as unknown as ChangeRequestView;
+  const parsed = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) throw new Error(typeof parsed.error === "string" ? parsed.error : `${label} returned ${response.status}`);
+  return parsed as T;
+}
+
+/** Records a requested change and asks Squasher to apply it as a new revision. */
+export function submitChangeRequest(runId: string, text: string): Promise<ChangeRequestSubmission> {
+  return postWorkspace(runId, "change-requests", { text }, "Change request API");
+}
+
+/** Re-runs the current patch's tests in a fresh sandbox, or re-verifies it when no commands were recorded. */
+export async function startTestRun(runId: string): Promise<WorkspaceJobView> {
+  return (await postWorkspace<{ job: WorkspaceJobView }>(runId, "test-runs", {}, "Test run API")).job;
+}
+
+/** Submits an approved revision: opens the pull request, or updates the open one. */
+export function approveRevision(runId: string, revision: number, hash: string): Promise<{ pullRequest: { number: number; url: string }; updated: boolean; revision: number }> {
+  return postWorkspace(runId, `revisions/${revision}/approve`, { hash }, "Revision approval API");
 }
 
 function approvalAuthHeader(): Record<string, string> {
